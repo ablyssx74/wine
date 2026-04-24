@@ -97,6 +97,10 @@
 
 #ifdef __HAIKU__
 #define SIGIO SIGPOLL
+#if B_HAIKU_VERSION <= B_HAIKU_VERSION_1_BETA_5
+#undef AF_BLUETOOTH
+#undef HAS_BLUETOOTH
+#endif
 #endif
 
 #include "ntstatus.h"
