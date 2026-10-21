@@ -165,6 +165,11 @@ typedef struct
 
 #endif  /* linux */
 
+#ifdef __HAIKU__
+//#include <sys/xattr.h>
+#undef HAVE_SYS_XATTR_H
+#endif
+
 #define IS_SEPARATOR(ch)   ((ch) == '\\' || (ch) == '/')
 
 #define INVALID_NT_CHARS   '*','?','<','>','|','"'
@@ -7192,6 +7197,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         }
 
         if (!get_mountmgr_fs_info( handle, fd, &drive, sizeof(drive) )) fs_type = drive.fs_type;
+#ifndef __HAIKU__
         else
         {
             struct statfs stfs;
@@ -7223,6 +7229,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
 #endif
             }
         }
+#endif
 
         switch (fs_type)
         {

@@ -36,6 +36,9 @@
 #ifdef HAVE_SYS_INOTIFY_H
 #include <sys/inotify.h>
 #endif
+#ifdef __HAIKU__
+#define SIGIO SIGPOLL
+#endif
 
 #include "ntstatus.h"
 #include "windef.h"

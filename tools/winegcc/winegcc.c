@@ -1409,6 +1409,9 @@ static void build(struct strarray input_files, const char *output)
 	strarray_add(&link_args, "-ldl");
 	strarray_add(&link_args, "-lm");
 	strarray_add(&link_args, "-lc");
+#ifdef __HAIKU__
+	strarray_add(&link_args, "-lnetwork");
+#endif
     }
 
     atexit( cleanup_output_files );

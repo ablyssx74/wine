@@ -86,6 +86,10 @@
 #ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
 #endif
+#ifdef __HAIKU__
+#undef ioctl
+#undef HAVE_SYS_XATTR_H
+#endif
 #ifdef HAVE_SYS_XATTR_H
 #include <sys/xattr.h>
 #endif

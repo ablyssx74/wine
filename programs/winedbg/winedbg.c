@@ -704,6 +704,9 @@ static void restart_if_wow64(void)
 
 int main(int argc, char** argv)
 {
+#ifdef __HAIKU__
+    return 0;
+#endif
     int 	        retv = 0;
     HANDLE              hFile = INVALID_HANDLE_VALUE;
     enum dbg_start      ds;

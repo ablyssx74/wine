@@ -26,7 +26,11 @@
 #include "config.h"
 #include <stdlib.h>
 
+#ifdef __HAIKU__
+#include "input-event-codes.h"
+#else
 #include <linux/input.h>
+#endif
 #undef SW_MAX /* Also defined in winuser.rh */
 #include <sys/mman.h>
 #include <unistd.h>

@@ -87,6 +87,7 @@
 # include <linux/irda.h>
 # define HAS_IRDA
 #endif
+#define HAVE_GETADDRINFO
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -165,7 +166,9 @@ static const int ip_protocol_map[][2] =
     MAP( IPPROTO_ICMP ),
     MAP( IPPROTO_IGMP ),
     MAP( IPPROTO_RAW ),
+#ifndef __HAIKU__
     {WS_IPPROTO_IPV4, IPPROTO_IPIP},
+#endif
 };
 
 #undef MAP
@@ -382,7 +385,9 @@ static unsigned int errno_from_unix( int err )
         case EPROTOTYPE:        return WSAEPROTOTYPE;
         case ENOPROTOOPT:       return WSAENOPROTOOPT;
         case EPROTONOSUPPORT:   return WSAEPROTONOSUPPORT;
+#ifndef __HAIKU__
         case ESOCKTNOSUPPORT:   return WSAESOCKTNOSUPPORT;
+#endif
         case EOPNOTSUPP:        return WSAEOPNOTSUPP;
         case EPFNOSUPPORT:      return WSAEPFNOSUPPORT;
         case EAFNOSUPPORT:      return WSAEAFNOSUPPORT;
@@ -398,7 +403,9 @@ static unsigned int errno_from_unix( int err )
         case EISCONN:           return WSAEISCONN;
         case ENOTCONN:          return WSAENOTCONN;
         case ESHUTDOWN:         return WSAESHUTDOWN;
+#ifndef __HAIKU__
         case ETOOMANYREFS:      return WSAETOOMANYREFS;
+#endif
         case ETIMEDOUT:         return WSAETIMEDOUT;
         case ECONNREFUSED:      return WSAECONNREFUSED;
         case ELOOP:             return WSAELOOP;

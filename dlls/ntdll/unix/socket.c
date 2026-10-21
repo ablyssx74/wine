@@ -108,6 +108,11 @@ union unix_sockaddr
 #endif
 };
 
+#ifdef __HAIKU__
+#define TCP_KEEPCNT WS_TCP_KEEPCNT
+#define TCP_KEEPINTVL WS_TCP_KEEPINTVL
+#endif
+
 struct async_recv_ioctl
 {
     struct async_fileio io;
@@ -176,7 +181,9 @@ static NTSTATUS sock_errno_to_status( int err )
         case EDESTADDRREQ:      return STATUS_INVALID_CONNECTION;
         case EMSGSIZE:          return STATUS_BUFFER_OVERFLOW;
         case EPROTONOSUPPORT:
+#ifndef __HAIKU__
         case ESOCKTNOSUPPORT:
+#endif
         case EPFNOSUPPORT:
         case EAFNOSUPPORT:
         case EPROTOTYPE:        return STATUS_NOT_SUPPORTED;
@@ -803,9 +810,12 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
     }
     hdr.msg_iov = async->iov;
     hdr.msg_iovlen = async->count;
+#if 0
     hdr.msg_control = control_buffer;
     hdr.msg_controllen = sizeof(control_buffer);
+#endif
 
+	TRACE("async->unix_flags: %#x\n", async->unix_flags);
     while ((ret = virtual_locked_recvmsg( fd, &hdr, async->unix_flags )) < 0 && errno == EINTR);
 
     if (ret < 0)
@@ -1920,11 +1930,16 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             }
             else
             {
+#ifdef __HAIKU__
+                status = sock_errno_to_status( -1 );
+                break;
+#else
                 if (ioctl( fd, SIOCATMARK, &value ) < 0)
                 {
                     status = sock_errno_to_status( errno );
                     break;
                 }
+#endif
                 /* windows is reversed with respect to unix */
                 *(int *)out_buffer = !value;
             }

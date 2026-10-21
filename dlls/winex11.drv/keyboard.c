@@ -2565,6 +2565,7 @@ INT X11DRV_GetKeyNameText( LONG lParam, LPWSTR lpBuffer, INT nSize )
   KeySym keys;
   char *name;
 
+#if 0
   scanCode = lParam >> 16;
   scanCode &= 0x1ff;  /* keep "extended-key" flag with code */
   if (scanCode == 0x145) return -1; /* use default implementation for VK_PAUSE */
@@ -2662,6 +2663,7 @@ INT X11DRV_GetKeyNameText( LONG lParam, LPWSTR lpBuffer, INT nSize )
           return rc;
       }
   }
+#endif
 
   /* Finally issue WARN for unknown keys   */
 

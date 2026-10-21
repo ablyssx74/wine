@@ -646,7 +646,15 @@ static NTSTATUS map_so_dll( const IMAGE_NT_HEADERS *nt_descr, HMODULE module )
                   + nb_sections * sizeof(IMAGE_SECTION_HEADER)
                   + align_mask) & ~align_mask;
 
+#ifdef __HAIKU__
+    DWORD size = (sizeof(IMAGE_DOS_HEADER)
+                  + sizeof(builtin_signature)
+                  + sizeof(IMAGE_NT_HEADERS)
+                  + nb_sections * sizeof(IMAGE_SECTION_HEADER));
+    mprotect(addr, size, PROT_READ | PROT_WRITE);
+#else
     if (anon_mmap_fixed( addr, code_start, PROT_READ | PROT_WRITE, 0 ) != addr) return STATUS_NO_MEMORY;
+#endif
 
     dos = (IMAGE_DOS_HEADER *)addr;
     nt  = (IMAGE_NT_HEADERS *)((BYTE *)(dos + 1) + sizeof(builtin_signature));
