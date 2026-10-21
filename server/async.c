@@ -278,8 +278,13 @@ void free_async_queue( struct async_queue *queue )
         if (!async->completion) async->completion = fd_get_completion( async->fd, &async->comp_key );
         async->fd = NULL;
         async_terminate( async, STATUS_HANDLES_CLOSED );
-        async->queue = NULL;
-        release_object( &async->obj );
+        /* async_terminate() may already have taken the async out of the queue and dropped the queue's reference
+         * (thread_queue_apc() can end in async_set_result() when the thread is gone) */
+        if (async->queue)
+        {
+            async->queue = NULL;
+            release_object( &async->obj );
+        }
     }
 }
 
