@@ -1311,9 +1311,9 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
 
 
 /***********************************************************************
- *           spawn_thread
+ *           wine_spawn_thread
  */
-static NTSTATUS spawn_thread( struct thread_data *data )
+static NTSTATUS wine_spawn_thread( struct thread_data *data )
 {
     sigset_t sigset;
     pthread_t pthread_id;
@@ -1459,7 +1459,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         wow_teb->SkipLoaderInit = teb->SkipLoaderInit;
     }
 
-    status = spawn_thread( data );
+    status = wine_spawn_thread( data );
 
 done:
     if (status)
@@ -1487,7 +1487,7 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     if ((status = create_server_thread( handle, &data, access, attr, start, param, flags, TRUE )))
         return status;
 
-    if ((status = spawn_thread( data )))
+    if ((status = wine_spawn_thread( data )))
     {
         NtClose( *handle );
         virtual_free_thread_data( data );
