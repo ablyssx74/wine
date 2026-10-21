@@ -30,7 +30,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#ifdef __HAIKU__
+#include <audio/soundcard.h>
+#else
 #include <sys/soundcard.h>
+#endif
 #include <pthread.h>
 
 #include "ntstatus.h"

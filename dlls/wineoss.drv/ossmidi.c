@@ -39,7 +39,11 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#ifdef __HAIKU__
+#include <audio/soundcard.h>
+#else
 #include <sys/soundcard.h>
+#endif
 #include <pthread.h>
 
 #include "ntstatus.h"

@@ -1779,14 +1779,14 @@ then
     then
         . /etc/oss.conf
     fi
-    ac_oss_incl="-I${OSSLIBDIR:-/usr/lib/oss}/include"
+    ac_oss_incl="-I${OSSLIBDIR:-/system/develop/headers}/private"
     CPPFLAGS="$CPPFLAGS $ac_oss_incl"
-    AC_CHECK_HEADER([sys/soundcard.h],
+    AC_CHECK_HEADER([audio/soundcard.h],
         [AC_CHECK_MEMBER([oss_sysinfo.numaudioengines],
             [AC_SUBST(OSS4_CFLAGS,"$ac_oss_incl")
              AC_CHECK_LIB(ossaudio,_oss_ioctl,
                  [AC_SUBST(OSS4_LIBS,"-lossaudio")])],,
-            [#include <sys/soundcard.h>])])
+            [#include <audio/soundcard.h>])])
     CPPFLAGS="$ac_save_CPPFLAGS"
 fi
 WINE_NOTICE_WITH(oss,[test "x$ac_cv_member_oss_sysinfo_numaudioengines" != xyes],
