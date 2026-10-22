@@ -590,6 +590,12 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
         features[PF_MOVDIR64B_INSTRUCTION_AVAILABLE]= !!(regs[2] & (1 << 28));
 #if defined(__linux__)
         features[PF_RDWRFSGSBASE_AVAILABLE] &= !!(getauxval( AT_HWCAP2 ) & 2);
+#elif defined(__HAIKU__)
+        /* the CPUID bit alone only says the CPU can do it, not that the kernel has turned CR4.FSGSBASE on for
+         * userspace -- Haiku does not enable it (confirmed: WRFSBASE/RDFSBASE fault with SIGSEGV here), and there
+         * is no Haiku equivalent of Linux's AT_HWCAP2 check to tell the two apart, so always take the slower,
+         * syscall-based path instead of trusting the raw CPUID bit */
+        features[PF_RDWRFSGSBASE_AVAILABLE] = 0;
 #endif
     }
 
