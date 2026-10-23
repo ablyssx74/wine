@@ -17,6 +17,7 @@ SOURCES = \
 	fd.c \
 	file.c \
 	handle.c \
+	haiku.c \
 	hook.c \
 	inproc_sync.c \
 	mach.c \

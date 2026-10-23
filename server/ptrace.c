@@ -52,6 +52,7 @@
 #include "winternl.h"
 
 #include "file.h"
+#include "haiku.h"
 #include "process.h"
 #include "thread.h"
 
@@ -490,6 +491,17 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
         return 0;
     }
 
+#ifdef __HAIKU__
+    if (!is_process_init_done( process ))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return 0;
+    }
+    ret = haiku_team_memory( process->unix_pid, 0, ptr, size, dest );
+    if (ret == size) return 1;
+    set_error( ret < 0 ? STATUS_ACCESS_DENIED : STATUS_PARTIAL_COPY );
+    return 0;
+#endif
     if ((ret = read_process_memory_vm( thread, ptr, size, dest )) != -1) return ret;
     return read_process_memory_ptrace( thread, ptr, size, dest );
 }
@@ -605,6 +617,18 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
         return 0;
     }
 
+#ifdef __HAIKU__
+    if (!is_process_init_done( process ))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return 0;
+    }
+    ret = haiku_team_memory( process->unix_pid, 1, ptr, size, (char *)src );
+    if (written) *written = max( ret, 0 );
+    if (ret == size) return 1;
+    set_error( ret < 0 ? STATUS_ACCESS_DENIED : STATUS_PARTIAL_COPY );
+    return 0;
+#endif
     if ((ret = write_process_memory_vm( thread, ptr, size, src, written )) != -1) return ret;
     return write_process_memory_ptrace( thread, ptr, size, src, written );
 }
