@@ -231,6 +231,10 @@ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, c
         return STATUS_INVALID_PARAMETER;
     }
 
+#ifdef __HAIKU__
+    if (wayland_haiku_opengl_init(opengl_funcs, driver_funcs)) return STATUS_SUCCESS;
+#endif
+
     if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
     funcs = opengl_funcs;
 
