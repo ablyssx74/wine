@@ -3259,7 +3259,14 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     if (res == STATUS_SUCCESS)
     {
         /* file mappings must always be accessible */
+#ifdef __HAIKU__
+        /* mmap() has made them accessible already. A shared file mapping that is mprotect()ed on Haiku, even to the protection
+         * it has, becomes a private copy: another process' writes into the section are not seen any more (and its own are
+         * not seen by the others). Only the bookkeeping is brought up to date. */
+        set_page_vprot_bits( view->base, view->size, VPROT_COMMITTED, 0 );
+#else
         mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
+#endif
 
         SERVER_START_REQ( map_view )
         {
