@@ -808,7 +808,14 @@ static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontex
 
 static inline BOOL is_16bit( const ucontext_t *sigcontext )
 {
+#ifdef __HAIKU__
+    /* Haiku's user stack segment selector is not the one Wine reads from %ds at start-up, so every fault looked like one in
+     * 16-bit code: setup_raise_exception() then took the stack pointer from a WoW TEB that does not exist, faulted again
+     * inside the signal handler with SIGSEGV blocked, and the thread spun in that fault for ever (and could not be killed). */
+    return FALSE;
+#else
     return SS_sig(sigcontext) != ds64_sel;
+#endif
 }
 
 
@@ -2339,6 +2346,18 @@ NTSTATUS static LdrFindEntryForAddress2( const void *addr, PLDR_DATA_TABLE_ENTRY
     return STATUS_NO_MORE_ENTRIES;
 }
 
+#ifdef __HAIKU__
+/* The signal handlers print what they got when WINE_HAIKU_TRACE_SEGV is set in the environment. (This used to be on all the
+ * time and waited for a key on stdin after printing, so any page fault Wine handles itself, such as a guard page, stack growth
+ * or a hardware exception, hung until Enter was pressed.) */
+static int haiku_trace_segv(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv( "WINE_HAIKU_TRACE_SEGV" ) != NULL;
+    return enabled;
+}
+#endif
+
 static void WriteRtlString(UNICODE_STRING str)
 {
 	for (int i = 0; i < str.Length; i++) {
@@ -2373,17 +2392,19 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
 #ifdef __HAIKU__
-	printf("segv_handler\n");
-    printf("&segv_handler: %p\n", &segv_handler);
-    printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
-    printf("  thread: %" PRId32 "\n", find_thread(NULL));
-    printf("  IP: %#" PRIx64 "\n", RIP_sig(sigcontext));
-    printf("  SP: %#" PRIx64 "\n", RSP_sig(sigcontext));
-    printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
-    printf("  address: %#" PRIx64 "\n", siginfo->si_addr);
-    WriteModuleName(RIP_sig(sigcontext));
-    fgetc(stdin);
-    //_exit(1);
+    if (haiku_trace_segv())
+    {
+        printf("segv_handler\n");
+        printf("&segv_handler: %p\n", &segv_handler);
+        printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
+        printf("  thread: %" PRId32 "\n", find_thread(NULL));
+        printf("  IP: %#" PRIx64 "\n", RIP_sig(sigcontext));
+        printf("  SP: %#" PRIx64 "\n", RSP_sig(sigcontext));
+        printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
+        printf("  address: %#" PRIx64 "\n", (uint64_t)(ULONG_PTR)siginfo->si_addr);
+        WriteModuleName(RIP_sig(sigcontext));
+        fflush(stdout);
+    }
 #endif
 
     save_context( data, &context, sigcontext );
@@ -2618,16 +2639,17 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     ucontext_t *sigcontext = _sigcontext;
 
 #ifdef __HAIKU__
-    printf("abrt_handler\n");
-    printf("&abrt_handler: %p\n", &segv_handler);
-    printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
-    printf("  thread: %" PRId32 "\n", find_thread(NULL));
-    printf("  IP: %#" PRIx64 "\n", RIP_sig(sigcontext));
-    printf("  SP: %#" PRIx64 "\n", RSP_sig(sigcontext));
-    printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
-    printf("  address: %#" PRIx64 "\n", siginfo->si_addr);
-    //fgetc(stdin);
-    //_exit(1);
+    if (haiku_trace_segv())
+    {
+        printf("abrt_handler\n");
+        printf("pKiUserExceptionDispatcher: %p\n", pKiUserExceptionDispatcher);
+        printf("  thread: %" PRId32 "\n", find_thread(NULL));
+        printf("  IP: %#" PRIx64 "\n", RIP_sig(sigcontext));
+        printf("  SP: %#" PRIx64 "\n", RSP_sig(sigcontext));
+        printf("  FP: %#" PRIx64 "\n", RBP_sig(sigcontext));
+        printf("  address: %#" PRIx64 "\n", (uint64_t)(ULONG_PTR)siginfo->si_addr);
+        fflush(stdout);
+    }
 #endif
 
     struct thread_data *data = init_handler( sigcontext );
