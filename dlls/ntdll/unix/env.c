@@ -209,7 +209,7 @@ static void init_unix_codepage(void)
     nfc_table = read_nls_file( "normnfc.nls" );
 }
 
-#elif defined(__ANDROID__)  /* Android always uses UTF-8 */
+#elif defined(__ANDROID__) || defined(__HAIKU__)  /* Android and Haiku always use UTF-8 (Haiku's locale says "US-ASCII") */
 
 static void init_unix_codepage(void) { }
 
