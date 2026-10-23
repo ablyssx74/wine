@@ -3131,6 +3131,11 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     bias = (LONG)(mktime(tm) - year_start) / 60;
 
     tm = localtime(&year_start);
+#ifdef __HAIKU__
+    /* Haiku's mktime() ignores the tm_isdst it is given, so the difference above is the offset in force now, daylight saving
+     * included. The bias of a Windows time zone is the standard one. */
+    bias = -(int)(tm->tm_gmtoff / 60) + (tm->tm_isdst > 0 ? 60 : 0);
+#endif
     if (current_year == tm->tm_year && current_bias == bias)
     {
         *tzi = cached_tzi;

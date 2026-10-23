@@ -341,6 +341,11 @@ static void set_user_shared_data_time(void)
                 adjusted_timezone_bias += mktime(&tm1) < mktime(&tm2) ? 3600 : -3600;
             }
         }
+#ifdef __HAIKU__
+        /* Haiku's mktime() ignores the tm_isdst it is given, so the adjustment above is wrong; the offset in force now is
+         * what the bias should be */
+        adjusted_timezone_bias = -tm->tm_gmtoff;
+#endif
         timezone_bias = adjusted_timezone_bias;
         timezone_bias *= TICKS_PER_SEC;
 
