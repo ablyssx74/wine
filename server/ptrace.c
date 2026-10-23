@@ -226,6 +226,12 @@ static inline int tkill( int tgid, int pid, int sig )
     return ret;
 #elif (defined(__FreeBSD__) || defined (__FreeBSD_kernel__)) && defined(HAVE_THR_KILL2)
     return thr_kill2( tgid, pid, sig );
+#elif defined(__HAIKU__)
+    /* a signal for one thread (kill() would give it to the team's first thread that does not block it) */
+    extern int send_signal( int thread, unsigned int signal );    /* <OS.h> clashes with the server's own names */
+    if (send_signal( pid, sig ) == 0) return 0;
+    errno = ESRCH;    /* the thread is gone */
+    return -1;
 #else
     errno = ENOSYS;
     return -1;

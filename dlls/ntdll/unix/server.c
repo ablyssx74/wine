@@ -72,6 +72,7 @@
 #endif
 #ifdef __HAIKU__
 #define SIGIO SIGPOLL
+#include <OS.h>
 #endif
 
 #include "ntstatus.h"
@@ -1549,6 +1550,8 @@ static int get_unix_tid(void)
     ret = lwpid;
 #elif defined(__DragonFly__)
     ret = lwp_gettid();
+#elif defined(__HAIKU__)
+    ret = find_thread( NULL );    /* the server signals a thread with send_signal() */
 #endif
     return ret;
 }
