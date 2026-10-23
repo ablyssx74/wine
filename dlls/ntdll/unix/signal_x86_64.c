@@ -2347,6 +2347,27 @@ NTSTATUS static LdrFindEntryForAddress2( const void *addr, PLDR_DATA_TABLE_ENTRY
 }
 
 #ifdef __HAIKU__
+/* Haiku's ucontext has no trap number (TRAP_sig is always "page fault"), so every signal looked like a page fault: an illegal
+ * instruction, a privileged one and int3 all arrived as access violations (int3 never came back at all). The trap is worked
+ * out from the signal and its code instead. */
+static int haiku_trap( int signal, const siginfo_t *siginfo )
+{
+    switch (signal)
+    {
+    case SIGILL:  return siginfo->si_code == ILL_PRVOPC ? TRAP_x86_PROTFLT : TRAP_x86_PRIVINFLT;
+    case SIGTRAP: return siginfo->si_code == TRAP_TRACE ? TRAP_x86_TRCTRAP : TRAP_x86_BPTFLT;
+    case SIGBUS:  /* a general protection fault (hlt, a non canonical address) arrives as SIGBUS with BUS_OBJERR */
+                  return siginfo->si_code == BUS_ADRALN ? TRAP_x86_ALIGNFLT
+                       : siginfo->si_code == BUS_OBJERR ? TRAP_x86_PROTFLT : TRAP_x86_PAGEFLT;
+    default:      return TRAP_x86_PAGEFLT;
+    }
+}
+#define HANDLER_TRAP(signal, siginfo, context) haiku_trap( signal, siginfo )
+#else
+#define HANDLER_TRAP(signal, siginfo, context) TRAP_sig( context )
+#endif
+
+#ifdef __HAIKU__
 /* The signal handlers print what they got when WINE_HAIKU_TRACE_SEGV is set in the environment. (This used to be on all the
  * time and waited for a key on stdin after printing, so any page fault Wine handles itself, such as a guard page, stack growth
  * or a hardware exception, hung until Enter was pressed.) */
@@ -2409,7 +2430,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     save_context( data, &context, sigcontext );
 
-    switch(TRAP_sig(sigcontext))
+    switch(HANDLER_TRAP( signal, siginfo, sigcontext ))
     {
     case TRAP_x86_OFLOW:   /* Overflow exception */
         rec.ExceptionCode = EXCEPTION_INT_OVERFLOW;
@@ -2470,7 +2491,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
         break;
     default:
-        ERR_(seh)( "Got unexpected trap %ld\n", (ULONG_PTR)TRAP_sig(sigcontext) );
+        ERR_(seh)( "Got unexpected trap %ld\n", (ULONG_PTR)HANDLER_TRAP( signal, siginfo, sigcontext ) );
         /* fall through */
     case TRAP_x86_NMI:       /* NMI interrupt */
     case TRAP_x86_DNA:       /* Device not available exception */
@@ -2502,7 +2523,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     save_context( data, &context, sigcontext );
 
-    switch (TRAP_sig(sigcontext))
+    switch (HANDLER_TRAP( signal, siginfo, sigcontext ))
     {
     case TRAP_x86_TRCTRAP:
         rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
