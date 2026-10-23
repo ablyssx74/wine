@@ -2040,6 +2040,16 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
        and if alignment is correct */
     if ((!removable || (flags & MAP_SHARED)) && host_addr == map_addr && host_size == map_size)
     {
+        if (TRACE_ON(virtual))
+        {
+            struct stat st;
+            if (fstat( fd, &st )) st.st_dev = st.st_ino = 0, st.st_size = -1;
+            int fl = fcntl( fd, F_GETFL );
+            TRACE( "mmap %p size %#zx prot %#x flags %#x (%s) fd %d (%s) offset %#jx vprot %#x file dev %jd ino %jd size %jd\n",
+                   host_addr, host_size, prot, flags, (flags & MAP_SHARED) ? "shared" : "private", fd,
+                   fl == -1 ? "?" : (fl & O_ACCMODE) == O_RDONLY ? "read only" : (fl & O_ACCMODE) == O_WRONLY ? "write only" : "read write",
+                   (intmax_t)offset, vprot, (intmax_t)st.st_dev, (intmax_t)st.st_ino, (intmax_t)st.st_size );
+        }
         if (mmap( host_addr, host_size, prot, flags, fd, offset ) != MAP_FAILED)
             return STATUS_SUCCESS;
 
