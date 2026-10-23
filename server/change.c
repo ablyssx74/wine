@@ -71,6 +71,7 @@
 struct inode;
 
 static void free_inode( struct inode *inode );
+static void poll_release( struct dir *dir );
 
 static struct fd *inotify_fd;
 
@@ -97,6 +98,7 @@ struct dir
     struct process *client_process;  /* client process that has a cache for this directory */
     int             client_entry;    /* entry in client process cache */
     struct list    kernel_object;    /* list of kernel object pointers */
+    void          *poll_snapshot;    /* the entries as they were when the directory was last looked at (no inotify) */
 };
 
 static struct fd *dir_get_fd( struct object *obj );
@@ -420,6 +422,7 @@ static void dir_destroy( struct object *obj )
 
     if (dir->filter)
         remove_change( dir );
+    poll_release( dir );
 
     if (dir->inode)
     {
@@ -461,6 +464,10 @@ static enum server_fd_type dir_get_fd_type( struct fd *fd )
 }
 
 #ifdef HAVE_SYS_INOTIFY_H
+
+static void poll_release( struct dir *dir )
+{
+}
 
 #define HASH_SIZE 31
 
@@ -1101,6 +1108,240 @@ static void dir_add_to_existing_notify( struct dir *dir )
 
 #else
 
+/* Without inotify (Haiku has nothing like it that a plain C program can use) the watched directories are looked at again every
+ * 250 ms, and what is different from the last look is reported: names that appeared, went, or moved (same inode), files whose
+ * size or time changed, and changed modes. */
+
+struct poll_entry
+{
+    char   *name;        /* path relative to the watched directory, with '/' */
+    dev_t   dev;
+    ino_t   ino;
+    off_t   size;
+    time_t  mtime;
+    long    mtime_nsec;
+    mode_t  mode;
+};
+
+struct poll_snapshot
+{
+    struct poll_entry *entries;     /* sorted by name */
+    unsigned int       count, size;
+};
+
+#define POLL_INTERVAL (TICKS_PER_SEC / 4)
+#define POLL_MAX_DEPTH 16
+#define POLL_MAX_ENTRIES 20000
+
+static struct timeout_user *poll_timer;
+
+static void poll_free_snapshot( struct poll_snapshot *snap )
+{
+    unsigned int i;
+    if (!snap) return;
+    for (i = 0; i < snap->count; i++) free( snap->entries[i].name );
+    free( snap->entries );
+    free( snap );
+}
+
+static void poll_release( struct dir *dir )
+{
+    poll_free_snapshot( dir->poll_snapshot );
+    dir->poll_snapshot = NULL;
+}
+
+static int poll_add( struct poll_snapshot *snap, const char *name, const struct stat *st )
+{
+    struct poll_entry *e;
+
+    if (snap->count >= POLL_MAX_ENTRIES) return 0;
+    if (snap->count == snap->size)
+    {
+        unsigned int new_size = snap->size ? snap->size * 2 : 64;
+        struct poll_entry *new = realloc( snap->entries, new_size * sizeof(*new) );
+        if (!new) return 0;
+        snap->entries = new;
+        snap->size = new_size;
+    }
+    e = &snap->entries[snap->count];
+    if (!(e->name = strdup( name ))) return 0;
+    e->dev = st->st_dev;
+    e->ino = st->st_ino;
+    e->size = st->st_size;
+    e->mtime = st->st_mtime;
+#ifdef __HAIKU__
+    e->mtime_nsec = st->st_mtim.tv_nsec;
+#else
+    e->mtime_nsec = 0;
+#endif
+    e->mode = st->st_mode;
+    snap->count++;
+    return 1;
+}
+
+static int poll_scan( int unix_fd, const char *prefix, int subtree, int depth, struct poll_snapshot *snap )
+{
+    DIR *d;
+    struct dirent *de;
+    int fd = dup( unix_fd );
+
+    if (fd == -1) return 0;
+    if (!(d = fdopendir( fd ))) { close( fd ); return 0; }
+    rewinddir( d );
+    while ((de = readdir( d )))
+    {
+        char name[PATH_MAX];
+        struct stat st;
+
+        if (!strcmp( de->d_name, "." ) || !strcmp( de->d_name, ".." )) continue;
+        if (fstatat( dirfd( d ), de->d_name, &st, AT_SYMLINK_NOFOLLOW )) continue;
+        snprintf( name, sizeof(name), "%s%s", prefix, de->d_name );
+        if (!poll_add( snap, name, &st )) continue;
+        if (subtree && depth < POLL_MAX_DEPTH && S_ISDIR( st.st_mode ))
+        {
+            int sub = openat( dirfd( d ), de->d_name, O_RDONLY );
+            if (sub != -1)
+            {
+                char sub_prefix[PATH_MAX];
+                if (snprintf( sub_prefix, sizeof(sub_prefix), "%s/", name ) < (int)sizeof(sub_prefix))
+                    poll_scan( sub, sub_prefix, subtree, depth + 1, snap );
+                close( sub );
+            }
+        }
+    }
+    closedir( d );
+    return 1;
+}
+
+static int poll_compare( const void *a, const void *b )
+{
+    return strcmp( ((const struct poll_entry *)a)->name, ((const struct poll_entry *)b)->name );
+}
+
+static struct poll_snapshot *poll_take( struct dir *dir )
+{
+    struct poll_snapshot *snap;
+    int unix_fd = get_unix_fd( dir->fd );
+
+    if (unix_fd == -1 || !(snap = calloc( 1, sizeof(*snap) ))) return NULL;
+    if (!poll_scan( unix_fd, "", dir->subtree, 0, snap ))
+    {
+        poll_free_snapshot( snap );
+        return NULL;
+    }
+    if (snap->count) qsort( snap->entries, snap->count, sizeof(*snap->entries), poll_compare );
+    return snap;
+}
+
+static void poll_notify( struct dir *dir, unsigned int action, unsigned int cookie, const char *relpath )
+{
+    struct change_record *record;
+
+    if (dir->want_data)
+    {
+        size_t len = strlen( relpath );
+        if (!(record = malloc( offsetof(struct change_record, event.name[len]) ))) return;
+        record->cookie = cookie;
+        record->event.action = action;
+        memcpy( record->event.name, relpath, len );
+        record->event.len = len;
+        list_add_tail( &dir->change_records, &record->entry );
+    }
+    fd_async_wake_up( dir->fd, ASYNC_TYPE_WAIT, STATUS_ALERTED );
+}
+
+/* report an event, if the directory's filter asks for it */
+static void poll_event( struct dir *dir, unsigned int action, unsigned int cookie, const struct poll_entry *e )
+{
+    unsigned int wanted;
+
+    switch (action)
+    {
+    case FILE_ACTION_ADDED:
+        wanted = (S_ISDIR( e->mode ) ? FILE_NOTIFY_CHANGE_DIR_NAME : FILE_NOTIFY_CHANGE_FILE_NAME) | FILE_NOTIFY_CHANGE_CREATION;
+        break;
+    case FILE_ACTION_MODIFIED:
+        wanted = FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_LAST_ACCESS;
+        break;
+    default:
+        wanted = S_ISDIR( e->mode ) ? FILE_NOTIFY_CHANGE_DIR_NAME : FILE_NOTIFY_CHANGE_FILE_NAME;
+        break;
+    }
+    if (dir->filter & wanted) poll_notify( dir, action, cookie, e->name );
+}
+
+static void poll_dir( struct dir *dir )
+{
+    static unsigned int cookie_counter;
+    struct poll_snapshot *old = dir->poll_snapshot, *new;
+    unsigned int i = 0, j = 0, n;
+    unsigned char *old_matched, *new_matched;
+
+    if (!old || !(new = poll_take( dir ))) return;
+    old_matched = calloc( old->count + 1, 1 );
+    new_matched = calloc( new->count + 1, 1 );
+    if (!old_matched || !new_matched) goto done;
+
+    /* what stayed: changes of size, time and mode */
+    while (i < old->count && j < new->count)
+    {
+        int cmp = strcmp( old->entries[i].name, new->entries[j].name );
+        if (cmp < 0) i++;
+        else if (cmp > 0) j++;
+        else
+        {
+            const struct poll_entry *o = &old->entries[i], *e = &new->entries[j];
+            old_matched[i] = new_matched[j] = 1;
+            if (o->ino == e->ino && !S_ISDIR( e->mode ) &&
+                (o->size != e->size || o->mtime != e->mtime || o->mtime_nsec != e->mtime_nsec))
+                poll_event( dir, FILE_ACTION_MODIFIED, 0, e );
+            else if (o->ino == e->ino && (o->mode & 07777) != (e->mode & 07777) && (dir->filter & (FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SECURITY)))
+                poll_notify( dir, FILE_ACTION_MODIFIED, 0, e->name );
+            else if (o->ino != e->ino)  /* the name now belongs to another file: it was replaced */
+            {
+                poll_event( dir, FILE_ACTION_REMOVED, 0, o );
+                poll_event( dir, FILE_ACTION_ADDED, 0, e );
+            }
+            i++; j++;
+        }
+    }
+
+    /* what went and what came: a name that went and an entry with the same inode that came is a rename */
+    for (i = 0; i < old->count; i++)
+    {
+        const struct poll_entry *o = &old->entries[i];
+        if (old_matched[i]) continue;
+        for (j = 0; j < new->count; j++)
+        {
+            if (new_matched[j] || new->entries[j].ino != o->ino || new->entries[j].dev != o->dev) continue;
+            n = ++cookie_counter;
+            poll_event( dir, FILE_ACTION_RENAMED_OLD_NAME, n, o );
+            poll_event( dir, FILE_ACTION_RENAMED_NEW_NAME, n, &new->entries[j] );
+            old_matched[i] = new_matched[j] = 1;
+            break;
+        }
+    }
+    for (i = 0; i < old->count; i++)
+        if (!old_matched[i]) poll_event( dir, FILE_ACTION_REMOVED, 0, &old->entries[i] );
+    for (j = 0; j < new->count; j++)
+        if (!new_matched[j]) poll_event( dir, FILE_ACTION_ADDED, 0, &new->entries[j] );
+
+done:
+    free( old_matched );
+    free( new_matched );
+    poll_free_snapshot( old );
+    dir->poll_snapshot = new;
+}
+
+static void poll_changes( void *private )
+{
+    struct dir *dir, *next;
+
+    poll_timer = NULL;
+    LIST_FOR_EACH_ENTRY_SAFE( dir, next, &change_list, struct dir, entry ) poll_dir( dir );
+    if (!list_empty( &change_list )) poll_timer = add_timeout_user( current_time + POLL_INTERVAL, poll_changes, NULL );
+}
+
 static int init_inotify( void )
 {
     return 0;
@@ -1108,7 +1349,9 @@ static int init_inotify( void )
 
 static int inotify_adjust_changes( struct dir *dir )
 {
-    return 0;
+    if (!dir->poll_snapshot && !(dir->poll_snapshot = poll_take( dir ))) return 0;
+    if (!poll_timer) poll_timer = add_timeout_user( current_time + POLL_INTERVAL, poll_changes, NULL );
+    return 1;
 }
 
 static void free_inode( struct inode *inode )
@@ -1141,6 +1384,7 @@ struct object *create_dir_obj( struct fd *fd, unsigned int access, mode_t mode )
     dir->mode = mode;
     dir->uid  = ~(uid_t)0;
     dir->client_process = NULL;
+    dir->poll_snapshot = NULL;
     set_fd_user( fd, &dir_fd_ops, &dir->obj );
 
     dir_add_to_existing_notify( dir );
