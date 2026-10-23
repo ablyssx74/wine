@@ -37,6 +37,9 @@
 #include <fcntl.h>
 #include <time.h>
 #include <errno.h>
+#ifdef __HAIKU__
+#include <image.h>
+#endif
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
 #endif
@@ -793,6 +796,17 @@ static inline char *get_bindir( const char *argv0 )
     if (!_NSGetExecutablePath( path, &path_size ))
         dir = realpath( path, NULL );
     free( path );
+#elif defined(__HAIKU__)
+    /* started by name from PATH, argv[0] is only "wine": the path of the program comes from its image, or the files of an
+     * installed Wine are looked for in the folder it was configured for, which another machine does not have */
+    image_info info;
+    int32 cookie = 0;
+    while (get_next_image_info( B_CURRENT_TEAM, &cookie, &info ) == B_OK)
+    {
+        if (info.type != B_APP_IMAGE) continue;
+        dir = realpath( info.name, NULL );
+        break;
+    }
 #endif
     if (!dir && !(dir = realpath( argv0, NULL ))) return NULL;
     return get_dirname( dir );

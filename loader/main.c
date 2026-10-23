@@ -31,6 +31,9 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <limits.h>
+#ifdef __HAIKU__
+#include <image.h>
+#endif
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
 #endif
@@ -139,6 +142,11 @@ static const char *get_self_exe(void)
     if (path && !_NSGetExecutablePath( path, &path_size ))
         return path;
     free( path );
+#elif defined(__HAIKU__)
+    image_info info;
+    int32 cookie = 0;
+    while (get_next_image_info( B_CURRENT_TEAM, &cookie, &info ) == B_OK)
+        if (info.type == B_APP_IMAGE) return strdup( info.name );
 #endif
     return NULL;
 }
