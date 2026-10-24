@@ -110,6 +110,39 @@ extern "C" void hgl_release_current(struct hgl_context *ctx)
     ctx->view->UnlockGL();
 }
 
+/* Make the context's surface at least width x height pixels (it only grows). The context must not be current in any thread;
+ * the new size is in effect when this returns. */
+extern "C" int hgl_context_resize(struct hgl_context *ctx, int width, int height)
+{
+    bigtime_t deadline = system_time() + 2000000;
+
+    if (width <= ctx->width && height <= ctx->height) return 1;
+    if (width < ctx->width) width = ctx->width;
+    if (height < ctx->height) height = ctx->height;
+    if (ctx->owner >= 0) return 0;
+
+    ctx->window->Lock();
+    ctx->window->ResizeTo(width - 1, height - 1);
+    ctx->window->Unlock();
+
+    /* the window's own thread applies the new size and tells the view (and so its renderer) */
+    for (;;)
+    {
+        BRect bounds;
+        ctx->window->Lock();
+        bounds = ctx->view->Bounds();
+        ctx->window->Unlock();
+        if ((int)bounds.Width() + 1 == width && (int)bounds.Height() + 1 == height) break;
+        if (system_time() > deadline) return 0;
+        snooze(2000);
+    }
+    ctx->window->Lock();    /* one more round trip, so the resize hook has run */
+    ctx->window->Unlock();
+    ctx->width = width;
+    ctx->height = height;
+    return 1;
+}
+
 extern "C" int hgl_context_size(struct hgl_context *ctx, int *width, int *height)
 {
     *width = ctx->width;

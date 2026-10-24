@@ -33,8 +33,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
-#define HGL_VIEW_WIDTH  2560   /* what a context can draw to: larger than any window we expect */
-#define HGL_VIEW_HEIGHT 1600
+#define HGL_INITIAL_SIZE 64    /* a context starts tiny and grows to the windows it is used with */
+#define HGL_SIZE_STEP    128
 #define BUFFER_POOL     4
 
 struct hgl_context;
@@ -48,6 +48,7 @@ static struct
     int (*make_current)(struct hgl_context *ctx);
     void (*release_current)(struct hgl_context *ctx);
     int (*context_size)(struct hgl_context *ctx, int *width, int *height);
+    int (*context_resize)(struct hgl_context *ctx, int width, int height);
     int (*read_pixels)(struct hgl_context *ctx, int width, int height, void *out, int stride);
     void *(*proc_address)(const char *name);
 } hgl;
@@ -112,7 +113,7 @@ static BOOL load_shim(void)
 
 #define LOAD(name) if (!(hgl.name = dlsym(handle, "hgl_" #name))) { WARN("Missing hgl_" #name "\n"); dlclose(handle); return FALSE; }
     LOAD(init) LOAD(context_create) LOAD(context_destroy) LOAD(make_current) LOAD(release_current)
-    LOAD(context_size) LOAD(read_pixels) LOAD(proc_address)
+    LOAD(context_size) LOAD(context_resize) LOAD(read_pixels) LOAD(proc_address)
 #undef LOAD
 
     if (!hgl.init())
@@ -230,6 +231,17 @@ static BOOL haiku_drawable_swap(struct opengl_drawable *base)
     width = base->virtual_size.cx;
     height = base->virtual_size.cy;
     hgl.context_size(gl->current, &ctx_width, &ctx_height);
+    if ((width > ctx_width || height > ctx_height) && thread_current == gl->current)
+    {
+        /* the window outgrew the context's surface since the context was made current: grow it (what was drawn is lost) */
+        int want_w = (width + HGL_SIZE_STEP - 1) / HGL_SIZE_STEP * HGL_SIZE_STEP;
+        int want_h = (height + HGL_SIZE_STEP - 1) / HGL_SIZE_STEP * HGL_SIZE_STEP;
+
+        hgl.release_current(gl->current);
+        if (!hgl.context_resize(gl->current, want_w, want_h)) WARN("Growing the context to %dx%d failed\n", want_w, want_h);
+        hgl.make_current(gl->current);
+        hgl.context_size(gl->current, &ctx_width, &ctx_height);
+    }
     if (width > ctx_width) width = ctx_width;
     if (height > ctx_height) height = ctx_height;
     if (width <= 0 || height <= 0) return TRUE;
@@ -304,7 +316,7 @@ static struct opengl_context *haiku_context_create(const struct opengl_context_a
 
     if (!(context = calloc(1, sizeof(*context)))) return NULL;
     context->alpha = alpha;
-    if (!(context->hgl = hgl.context_create(HGL_VIEW_WIDTH, HGL_VIEW_HEIGHT, alpha, TRUE, TRUE, TRUE)))
+    if (!(context->hgl = hgl.context_create(HGL_INITIAL_SIZE, HGL_INITIAL_SIZE, alpha, TRUE, TRUE, TRUE)))
     {
         WARN("Creating the Haiku GL context failed\n");
         free(context);
@@ -338,6 +350,21 @@ static BOOL haiku_context_activate(struct opengl_context *base, struct opengl_dr
     TRACE("context %p, draw %s, read %s\n", context, debugstr_opengl_drawable(draw), debugstr_opengl_drawable(read));
 
     if (thread_current && thread_current != context->hgl) hgl.release_current(thread_current);
+    if (draw && draw->virtual_size.cx > 0 && draw->virtual_size.cy > 0)
+    {
+        /* grow the context's surface to the window, in steps so that small resizes do not do it every time */
+        int width, height, want_w, want_h;
+
+        hgl.context_size(context->hgl, &width, &height);
+        want_w = (draw->virtual_size.cx + HGL_SIZE_STEP - 1) / HGL_SIZE_STEP * HGL_SIZE_STEP;
+        want_h = (draw->virtual_size.cy + HGL_SIZE_STEP - 1) / HGL_SIZE_STEP * HGL_SIZE_STEP;
+        if (want_w > width || want_h > height)
+        {
+            if (thread_current == context->hgl) { hgl.release_current(context->hgl); thread_current = NULL; }
+            if (!hgl.context_resize(context->hgl, want_w, want_h))
+                WARN("Growing the context %p to %dx%d failed\n", context, want_w, want_h);
+        }
+    }
     hgl.make_current(context->hgl);
     thread_current = context->hgl;
 
