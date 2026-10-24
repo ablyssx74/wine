@@ -1137,6 +1137,13 @@ static int get_unix_prot( BYTE vprot )
         if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
         if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
         if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+#ifdef __HAIKU__
+        /* Changing the protection of a part of a private mapping that already has copied pages (as the Firefox sandbox launcher
+         * does to the system call stubs of ntdll in a new process) makes Haiku's kernel leave other pages of the mapping with no
+         * access, which hangs the process. Executable and copy-on-write pages are therefore kept readable, writable and executable
+         * in the host, and only the protection recorded for the page changes. */
+        else if (vprot & (VPROT_EXEC | VPROT_WRITECOPY)) prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+#endif
     }
     if (!prot) prot = PROT_NONE;
     return prot;
