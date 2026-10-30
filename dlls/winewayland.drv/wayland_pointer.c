@@ -167,6 +167,34 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
           screen.x, screen.y);
 
     NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
+
+    /* A compositor without zwp_relative_pointer_v1 (Haiku's) gives no raw motion: make it from the change of position, so that
+     * programs reading the mouse through Raw Input (WM_INPUT) see it move */
+    if (!process_wayland.pointer.zwp_relative_pointer_v1)
+    {
+        struct wayland_pointer *pointer = &process_wayland.pointer;
+        POINT delta = {0};
+        BOOL have;
+
+        pthread_mutex_lock(&pointer->mutex);
+        have = pointer->have_last_pos;
+        if (have)
+        {
+            delta.x = screen.x - pointer->last_pos.x;
+            delta.y = screen.y - pointer->last_pos.y;
+        }
+        pointer->last_pos = screen;
+        pointer->have_last_pos = TRUE;
+        pthread_mutex_unlock(&pointer->mutex);
+
+        if (have && (delta.x || delta.y))
+        {
+            struct raw_mouse raw = { .count = 1, .data = { delta } };
+            INPUT raw_input = { .type = INPUT_MOUSE };
+
+            NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &raw_input, (LPARAM)&raw);
+        }
+    }
 }
 
 static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
@@ -227,6 +255,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
     pthread_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
+    pointer->have_last_pos = FALSE;
     pthread_mutex_unlock(&pointer->mutex);
 }
 
@@ -358,6 +387,29 @@ static void wayland_motion_delta_to_window(struct wayland_surface *surface,
     *window_y = surface_y * surface->window.scale;
 }
 
+struct raw_batch
+{
+    HWND hwnd;
+    int count, dx, dy, raw_x, raw_y;
+    BOOL relative;
+};
+static struct raw_batch pending_raw;
+
+/* WINE_HAIKU_ASYNC_INPUT: the batches are handed to a thread of their own, so that a send that waits for the program (which
+ * is what the server does while the program has a hook) does not stop the reading of the compositor's events */
+static pthread_mutex_t async_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t async_cond = PTHREAD_COND_INITIALIZER;
+static struct raw_batch async_raw;
+static int async_mode = -1;
+
+static BOOL raw_async_enabled(void)
+{
+    if (async_mode < 0) async_mode = getenv("WINE_HAIKU_ASYNC_INPUT") != NULL;
+    return async_mode;
+}
+
+void wayland_pointer_flush_relative(void);
+
 static void relative_pointer_v1_relative_motion(void *private,
                                                 struct zwp_relative_pointer_v1 *zwp_relative_pointer_v1,
                                                 uint32_t utime_hi, uint32_t utime_lo,
@@ -402,7 +454,109 @@ static void relative_pointer_v1_relative_motion(void *private,
           hwnd, wl_fixed_to_double(dx), wl_fixed_to_double(dy), input.mi.dx, input.mi.dy,
           wl_fixed_to_double(dx_unaccel), wl_fixed_to_double(dy_unaccel), raw_pos.x, raw_pos.y);
 
-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
+    /* A mouse reports hundreds of moves a second and every WM_INPUT is a round trip to the server, so the moves of one batch
+     * of events are added up and sent together (wayland_pointer_flush_relative) */
+    if (pending_raw.count && pending_raw.hwnd != hwnd) wayland_pointer_flush_relative();
+    pending_raw.hwnd = hwnd;
+    pending_raw.count++;
+    pending_raw.dx += input.mi.dx;
+    pending_raw.dy += input.mi.dy;
+    pending_raw.raw_x += raw_pos.x;
+    pending_raw.raw_y += raw_pos.y;
+    pending_raw.relative = input.mi.dwFlags != 0;
+}
+
+static void send_raw_batch(struct raw_batch *batch)
+{
+    INPUT input = { .type = INPUT_MOUSE };
+    struct raw_mouse raw;
+    POINT raw_pos;
+    static int trace = -1;
+    static ULONGLONG window_start, longest;
+    static int sent, merged;
+    static long long total_raw_x, total_raw_y, total_mi_x, total_mi_y;
+    ULONGLONG start = 0;
+    POINT cursor;
+
+    if (!batch->count) return;
+    raw_pos.x = batch->raw_x;
+    raw_pos.y = batch->raw_y;
+    raw.count = 1;
+    raw.data[0] = raw_pos;
+    if (batch->relative)
+    {
+        input.mi.dx = batch->dx;
+        input.mi.dy = batch->dy;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    }
+    if (trace < 0) trace = getenv("WINE_HAIKU_POINTER_TRACE") != NULL;
+    if (trace) start = NtGetTickCount();
+    NtUserSendHardwareInput(batch->hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
+    {
+        /* win32u keeps this motion until something flushes it, which a compositor does with wl_pointer.frame; the relative
+         * motion of Haiku's compositor has none, and it would sit there until 64 moves had piled up */
+        static const INPUT flush = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE };
+        NtUserSendHardwareInput(NULL, SEND_HWMSG_RAWINPUT, &flush, 0);
+    }
+    if (trace)
+    {
+        ULONGLONG now = NtGetTickCount();
+        if (now - start > longest) longest = now - start;
+        sent++;
+        merged += batch->count;
+        total_raw_x += raw_pos.x; total_raw_y += raw_pos.y;
+        total_mi_x += input.mi.dx; total_mi_y += input.mi.dy;
+        if (!window_start) window_start = now;
+        if (now - window_start >= 1000)
+        {
+            NtUserGetCursorPos(&cursor);
+            fprintf(stderr, "wine raw input: %d sent for %d moves, longest send %u ms, totals raw %lld,%lld move %lld,%lld, cursor %d,%d\n",
+                    sent, merged, (unsigned)longest, total_raw_x, total_raw_y, total_mi_x, total_mi_y, (int)cursor.x, (int)cursor.y);
+            window_start = now; sent = merged = 0; longest = 0;
+        }
+    }
+}
+
+void wayland_pointer_flush_relative(void)
+{
+    if (!pending_raw.count) return;
+    if (raw_async_enabled())
+    {
+        pthread_mutex_lock(&async_mutex);
+        if (async_raw.count && async_raw.hwnd != pending_raw.hwnd)
+        {
+            /* a window of another kind: the earlier motion goes first, as it was (it is rare enough to wait for the thread) */
+            while (async_raw.count) { pthread_mutex_unlock(&async_mutex); sched_yield(); pthread_mutex_lock(&async_mutex); }
+        }
+        async_raw.hwnd = pending_raw.hwnd;
+        async_raw.count += pending_raw.count;
+        async_raw.dx += pending_raw.dx;
+        async_raw.dy += pending_raw.dy;
+        async_raw.raw_x += pending_raw.raw_x;
+        async_raw.raw_y += pending_raw.raw_y;
+        async_raw.relative = pending_raw.relative;
+        pthread_cond_signal(&async_cond);
+        pthread_mutex_unlock(&async_mutex);
+    }
+    else send_raw_batch(&pending_raw);
+    memset(&pending_raw, 0, sizeof(pending_raw));
+}
+
+/* run by a thread of the PE side; returns at once unless WINE_HAIKU_ASYNC_INPUT is set */
+void wayland_pointer_send_loop(void)
+{
+    struct raw_batch batch;
+
+    if (!raw_async_enabled()) return;
+    for (;;)
+    {
+        pthread_mutex_lock(&async_mutex);
+        while (!async_raw.count) pthread_cond_wait(&async_cond, &async_mutex);
+        batch = async_raw;
+        memset(&async_raw, 0, sizeof(async_raw));
+        pthread_mutex_unlock(&async_mutex);
+        send_raw_batch(&batch);
+    }
 }
 
 static const struct zwp_relative_pointer_v1_listener relative_pointer_v1_listener =
@@ -421,7 +575,9 @@ void wayland_pointer_init(struct wl_pointer *wl_pointer)
     pthread_mutex_unlock(&pointer->mutex);
     wl_pointer_add_listener(pointer->wl_pointer, &pointer_listener, NULL);
 
-    if (!process_wayland.zwp_relative_pointer_manager_v1)
+    if (getenv("WINE_HAIKU_NO_RELATIVE"))
+        TRACE("relative pointer disabled by WINE_HAIKU_NO_RELATIVE\n");
+    else if (!process_wayland.zwp_relative_pointer_manager_v1)
         ERR("zwp_relative_pointer_manager_v1 isn't supported, skipping relative motion\n");
     else
     {
@@ -1018,7 +1174,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     struct wl_surface *wl_surface = NULL;
     struct wayland_surface *surface = NULL;
     struct wayland_win_data *data;
-    RECT confine_rect;
+    RECT confine_rect, window_clip;
     POINT cursor_pos, warp;
 
     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
@@ -1030,6 +1186,16 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     if ((surface = data->wayland_surface))
     {
         wl_surface = surface->wl_surface;
+#ifdef __HAIKU__
+        /* win32u hands the driver no clip when the program's is the whole screen, which is what a borderless window that covers
+         * the screen asks for: a program that hides the cursor in it expects the pointer to be held, so use the window */
+        if (!clip && !reset && surface->window.rect.right - surface->window.rect.left >= NtUserGetSystemMetrics(SM_CXSCREEN) &&
+            surface->window.rect.bottom - surface->window.rect.top >= NtUserGetSystemMetrics(SM_CYSCREEN))
+        {
+            window_clip = surface->window.rect;
+            clip = &window_clip;
+        }
+#endif
         if (clip) wayland_surface_calc_confine(surface, clip, &confine_rect);
         warp.x = cursor_pos.x - surface->window.rect.left;
         warp.y = cursor_pos.y - surface->window.rect.top;

@@ -108,7 +108,7 @@ static NTSTATUS waylanddrv_unix_read_events(void *arg)
 {
     while (wl_display_dispatch_queue(process_wayland.wl_display,
                                      process_wayland.wl_event_queue) != -1)
-        continue;
+        wayland_pointer_flush_relative();
     /* This function only returns on a fatal error, e.g., if our connection
      * to the Wayland server is lost. */
     return STATUS_UNSUCCESSFUL;
@@ -123,11 +123,18 @@ static NTSTATUS waylanddrv_unix_init_clipboard(void *arg)
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS waylanddrv_unix_send_input(void *arg)
+{
+    wayland_pointer_send_loop();
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     waylanddrv_unix_init,
     waylanddrv_unix_read_events,
     waylanddrv_unix_init_clipboard,
+    waylanddrv_unix_send_input,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
@@ -139,6 +146,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     waylanddrv_unix_init,
     waylanddrv_unix_read_events,
     waylanddrv_unix_init_clipboard,
+    waylanddrv_unix_send_input,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);

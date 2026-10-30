@@ -38,6 +38,12 @@ static DWORD WINAPI wayland_read_events_thread(void *arg)
     return 0;
 }
 
+static DWORD WINAPI wayland_send_input_thread(void *arg)
+{
+    WAYLANDDRV_UNIX_CALL(send_input, NULL);
+    return 0;
+}
+
 static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
@@ -107,6 +113,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 
     /* Read wayland events from a dedicated thread. */
     CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
+    /* Send the pointer's raw input from a thread of its own, only if asked for (WINE_HAIKU_ASYNC_INPUT) */
+    if (GetEnvironmentVariableA("WINE_HAIKU_ASYNC_INPUT", NULL, 0))
+        CloseHandle(CreateThread(NULL, 0, wayland_send_input_thread, NULL, 0, &tid));
     /* Handle clipboard events in a dedicated thread, if needed. */
     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));

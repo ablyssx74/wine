@@ -29,6 +29,12 @@
 #include "wine/debug.h"
 
 #include <stdlib.h>
+#ifdef __HAIKU__
+# include <dlfcn.h>
+# include <stdio.h>
+# include <string.h>
+# include <unistd.h>
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -163,7 +169,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wl_subcompositor =
             wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
     }
-    else if (strcmp(interface, "zwp_pointer_constraints_v1") == 0)
+    else if (strcmp(interface, "zwp_pointer_constraints_v1") == 0 && !getenv("WINE_HAIKU_NO_CONSTRAINTS"))
     {
         process_wayland.zwp_pointer_constraints_v1 =
             wl_registry_bind(registry, id, &zwp_pointer_constraints_v1_interface, 1);
@@ -283,10 +289,34 @@ static const struct wl_registry_listener registry_listener = {
  *  Initialise the per process wayland objects.
  *
  */
+#ifdef __HAIKU__
+/* Haiku's libwayland-client starts an in-process Wayland server (wayland-server-inproc.so, loaded by name) for the client to
+ * talk to. Wine ships its own copy of it, next to this library, with the pointer features programs need (hiding the cursor,
+ * relative motion and pointer lock); loading it by its path first makes it the one that is found. WINE_HAIKU_SYSTEM_WAYLAND
+ * set in the environment leaves the system's copy in use. */
+static void haiku_preload_wayland_server(void)
+{
+    Dl_info info;
+    char path[1024];
+    const char *slash;
+
+    if (getenv("WINE_HAIKU_SYSTEM_WAYLAND")) return;
+    if (!dladdr((void *)haiku_preload_wayland_server, &info) || !info.dli_fname) return;
+    if (!(slash = strrchr(info.dli_fname, '/'))) return;
+    snprintf(path, sizeof(path), "%.*s/wayland-server-inproc.so", (int)(slash - info.dli_fname), info.dli_fname);
+    if (access(path, R_OK)) return;
+    if (!dlopen(path, RTLD_NOW | RTLD_GLOBAL)) WARN("Failed to load %s: %s\n", path, dlerror());
+    else TRACE("using the Wayland server %s\n", path);
+}
+#endif
+
 BOOL wayland_process_init(void)
 {
     struct wl_display *wl_display_wrapper;
 
+#ifdef __HAIKU__
+    haiku_preload_wayland_server();
+#endif
     process_wayland.wl_display = wl_display_connect(NULL);
     if (!process_wayland.wl_display)
         return FALSE;

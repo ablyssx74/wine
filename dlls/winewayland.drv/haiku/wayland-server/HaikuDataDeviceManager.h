@@ -1,0 +1,100 @@
+#pragma once
+#include "Wayland.h"
+#include "WlGlobal.h"
+#include <set>
+#include <string>
+#include <vector>
+#include <Looper.h>
+#include <Handler.h>
+#include <Entry.h>
+#include <String.h>
+
+
+class HaikuSeat;
+class HaikuDataDevice;
+
+class HaikuDataSource: public WlDataSource {
+private:
+	friend class HaikuDataOffer;
+	friend class HaikuDataDevice;
+
+	HaikuDataDevice *fDataDevice{};
+	std::set<std::string> fMimeTypes;
+
+	static void ConvertToHaikuMessage(BMessage &dstMsg, const BMessage &srcMsg);
+
+public:
+	static HaikuDataSource *FromResource(struct wl_resource *resource) {return (HaikuDataSource*)WlResource::FromResource(resource);}
+	virtual ~HaikuDataSource();
+
+	std::set<std::string> &MimeTypes() {return fMimeTypes;}
+
+	status_t ReadData(std::vector<uint8> &data, const char *mimeType);
+	BMessage *ToMessage();
+
+	void HandleOffer(const char *mimeType) final;
+	void HandleSetActions(uint32_t dndActions) final;
+};
+
+class HaikuDataOffer: public WlDataOffer {
+private:
+	friend class HaikuDataDevice;
+
+	HaikuDataDevice *fDataDevice{};
+	BMessage fData;
+	uint32_t fLastAction{};
+
+public:
+	static HaikuDataOffer *Create(HaikuDataDevice *dataDevice, const BMessage &data);
+	static HaikuDataOffer *FromResource(struct wl_resource *resource) {return (HaikuDataOffer*)WlResource::FromResource(resource);}
+
+	void HandleAccept(uint32_t serial, const char *mime_type) final;
+	void HandleReceive(const char *mime_type, int32_t fd) final;
+	void HandleFinish() final;
+	void HandleSetActions(uint32_t dnd_actions, uint32_t preferred_action) final;
+};
+
+class HaikuDataDevice: public WlDataDevice {
+private:
+	friend class HaikuDataSource;
+	friend class HaikuDataOffer;
+
+	HaikuSeat *fSeat{};
+	HaikuDataSource *fDataSource{};
+	bool fDropPending = false;
+	BMessage fLastDragMessage;
+
+	class ClipboardWatcher: public BHandler {
+	private:
+		HaikuDataDevice *fDevice;
+	public:
+		ClipboardWatcher(HaikuDataDevice *device);
+		virtual ~ClipboardWatcher() = default;
+		inline HaikuDataDevice &Base() { return *fDevice; }
+		void MessageReceived(BMessage *msg) final;
+	} fClipboardWatcher;
+
+public:
+	HaikuDataDevice();
+	static HaikuDataDevice *Create(struct wl_client *client, uint32_t version, uint32_t id, struct wl_resource *seat);
+	static HaikuDataDevice *FromResource(struct wl_resource *resource) {return (HaikuDataDevice*)WlResource::FromResource(resource);}
+	virtual ~HaikuDataDevice();
+
+	bool HasDataSource() const { return fDataSource != NULL; }
+	bool IsDropPending() const { return fDropPending; }
+	void SetDropPending(bool pending) { fDropPending = pending; }
+
+	void CancelDrag();
+	void FinishDrag();
+	void HandleCopyTargetReply(BMessage *replyMsg, const entry_ref &dirRef, const BString &name);
+
+	void HandleStartDrag(struct wl_resource *source, struct wl_resource *origin, struct wl_resource *icon, uint32_t serial) final;
+	void HandleSetSelection(struct wl_resource *source, uint32_t serial) final;
+};
+
+class HaikuDataDeviceManagerGlobal: public WlGlocal {
+public:
+	static HaikuDataDeviceManagerGlobal *Create(struct wl_display *display);
+	virtual ~HaikuDataDeviceManagerGlobal() = default;
+	void Bind(struct wl_client *wl_client, uint32_t version, uint32_t id) override;
+};

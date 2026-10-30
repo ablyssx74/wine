@@ -121,6 +121,8 @@ struct wayland_pointer
     struct wayland_cursor cursor;
     double accum_x;
     double accum_y;
+    BOOL have_last_pos;    /* when there is no relative pointer: the last position, to make raw motion from the next */
+    POINT last_pos;
     pthread_mutex_t mutex;
 };
 
@@ -419,6 +421,8 @@ void activate_keyboard_hkl(HWND hwnd, BOOL ime);
 
 void wayland_pointer_init(struct wl_pointer *wl_pointer);
 void wayland_pointer_deinit(void);
+void wayland_pointer_flush_relative(void);
+void wayland_pointer_send_loop(void);
 void wayland_pointer_clear_constraint(void);
 
 /**********************************************************************
