@@ -72,6 +72,7 @@ struct haiku_context
     struct hgl_context *hgl;
     BOOL alpha;
     BOOL viewport_set;
+    int scissor_w, scissor_h;    /* size of the context's surface when its scissor box was last reset to the window */
 };
 
 struct haiku_drawable
@@ -241,6 +242,10 @@ static BOOL haiku_drawable_swap(struct opengl_drawable *base)
         if (!hgl.context_resize(gl->current, want_w, want_h)) WARN("Growing the context to %dx%d failed\n", want_w, want_h);
         hgl.make_current(gl->current);
         hgl.context_size(gl->current, &ctx_width, &ctx_height);
+        /* Mesa gave the scissor box the size of the surface when the context was first used (64x64 for a new one), and keeps
+         * it: a program that never sets it (but has the scissor test on) would only draw into that corner */
+        funcs->p_glScissor(0, 0, base->virtual_size.cx, base->virtual_size.cy);
+        if (gl->context) { gl->context->scissor_w = ctx_width; gl->context->scissor_h = ctx_height; }
     }
     if (width > ctx_width) width = ctx_width;
     if (height > ctx_height) height = ctx_height;
@@ -368,6 +373,17 @@ static BOOL haiku_context_activate(struct opengl_context *base, struct opengl_dr
     hgl.make_current(context->hgl);
     thread_current = context->hgl;
 
+    if (gl && draw->virtual_size.cx > 0 && draw->virtual_size.cy > 0)
+    {
+        int cw, ch;
+
+        hgl.context_size(context->hgl, &cw, &ch);
+        /* a surface grown since the context was last made current keeps its old scissor box (see haiku_drawable_swap) */
+        if (context->viewport_set && (cw != context->scissor_w || ch != context->scissor_h))
+            funcs->p_glScissor(0, 0, draw->virtual_size.cx, draw->virtual_size.cy);
+        context->scissor_w = cw;
+        context->scissor_h = ch;
+    }
     if (gl)
     {
         gl->current = context->hgl;
