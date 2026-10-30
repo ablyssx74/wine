@@ -45,6 +45,14 @@
 #include "crypt32_private.h"
 #include "wine/debug.h"
 
+/* Haiku: libgnutls pulls in libp11-kit, which registers a fork handler with libroot that cannot be removed again. Unloading
+ * the library leaves the handler pointing at unmapped code, and every later fork() (any new process) then crashes. */
+#ifdef __HAIKU__
+# define gnutls_dlclose(h) ((void)0)
+#else
+# define gnutls_dlclose(h) dlclose(h)
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(crypt);
 
 #ifdef SONAME_LIBGNUTLS
@@ -171,7 +179,7 @@ static NTSTATUS process_attach( void *args )
     return TRUE;
 
 fail:
-    dlclose( libgnutls_handle );
+    gnutls_dlclose( libgnutls_handle );
     libgnutls_handle = NULL;
     return STATUS_DLL_INIT_FAILED;
 }
@@ -183,7 +191,7 @@ static NTSTATUS process_detach( void *args )
         if (TRACE_ON( crypt ))
             pgnutls_global_set_log_function( NULL );
         pgnutls_global_deinit();
-        dlclose( libgnutls_handle );
+        gnutls_dlclose( libgnutls_handle );
         libgnutls_handle = NULL;
     }
     return STATUS_SUCCESS;
