@@ -1492,6 +1492,151 @@ static NTSTATUS create_logical_proc_info(void)
     return STATUS_SUCCESS;
 }
 
+#elif defined(__HAIKU__)
+
+/* Haiku has no sysfs: the topology (packages, cores and their threads) comes from get_cpu_topology_info(), a pre-order walk of the
+ * tree (a package, then its cores, each followed by its threads); the caches, with the number of logical processors that share
+ * them, from CPUID (leaf 4 on Intel, 0x8000001D on AMD), asked of the CPU this runs on, as all the CPUs are taken to be alike. */
+static NTSTATUS create_logical_proc_info(void)
+{
+    cpu_topology_node_info *nodes = NULL;
+    uint32 node_count = 0, i;
+    unsigned int pkg_of[MAXIMUM_PROCESSORS], core_of[MAXIMUM_PROCESSORS], regs[4];
+    ULONG_PTR all_cpus_mask = 0;
+    unsigned int num_cpus = 0, cur_pkg = 0, cur_core = 0, leaf, sub;
+    unsigned int core_first[MAXIMUM_PROCESSORS];
+    BOOL amd;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    memset( pkg_of, 0, sizeof(pkg_of) );
+    memset( core_of, 0, sizeof(core_of) );
+
+    if (get_cpu_topology_info( NULL, &node_count ) != B_OK || !node_count) return STATUS_NOT_IMPLEMENTED;
+    if (!(nodes = calloc( node_count, sizeof(*nodes) ))) return STATUS_NO_MEMORY;
+    if (get_cpu_topology_info( nodes, &node_count ) != B_OK)
+    {
+        free( nodes );
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    for (i = 0; i < node_count && num_cpus < MAXIMUM_PROCESSORS; i++)
+    {
+        switch (nodes[i].type)
+        {
+        case B_TOPOLOGY_PACKAGE: cur_pkg = nodes[i].id; break;
+        case B_TOPOLOGY_CORE: cur_core = nodes[i].id; break;
+        case B_TOPOLOGY_SMT:
+        {
+            /* (the thread's id is the number of the CPU) */
+            unsigned int cpu = nodes[i].id < MAXIMUM_PROCESSORS ? nodes[i].id : num_cpus;
+            pkg_of[cpu] = cur_pkg;
+            core_of[cpu] = (cur_pkg << 16) | cur_core;
+            if (num_cpus <= cpu) num_cpus = cpu + 1;
+            all_cpus_mask |= (ULONG_PTR)1 << cpu;
+            break;
+        }
+        default: break;
+        }
+    }
+    free( nodes );
+    if (!num_cpus) return STATUS_NOT_IMPLEMENTED;
+
+    TRACE( "%u logical processors\n", num_cpus );
+
+    /* a core is known by the first logical processor on it, a package by its own id */
+    for (i = 0; i < num_cpus; i++)
+    {
+        unsigned int j;
+        core_first[i] = i;
+        for (j = 0; j < i; j++) if ((all_cpus_mask >> j & 1) && core_of[j] == core_of[i]) { core_first[i] = core_first[j]; break; }
+    }
+    for (i = 0; i < num_cpus; i++)
+    {
+        ULONG_PTR thread_mask = 0;
+        unsigned int j;
+
+        if (!(all_cpus_mask >> i & 1)) continue;
+        for (j = 0; j < num_cpus; j++) if ((all_cpus_mask >> j & 1) && core_of[j] == core_of[i]) thread_mask |= (ULONG_PTR)1 << j;
+        if (!logical_proc_info_add_by_id( RelationProcessorPackage, pkg_of[i], (ULONG_PTR)1 << i )) return STATUS_NO_MEMORY;
+        if (!logical_proc_info_add_by_id( RelationProcessorCore, core_first[i], thread_mask )) return STATUS_NO_MEMORY;
+    }
+
+    /* the caches */
+    do_cpuid( 0, 0, regs );
+    amd = regs[1] == 0x68747541 && regs[3] == 0x69746e65 && regs[2] == 0x444d4163;  /* "AuthenticAMD" */
+    leaf = amd ? 0x8000001d : 4;
+    do_cpuid( amd ? 0x80000000 : 0, 0, regs );
+    if (regs[0] >= leaf)
+    {
+        for (sub = 0; sub < 16; sub++)
+        {
+            CACHE_DESCRIPTOR cache;
+            unsigned int type, level, sharing, ways, parts, line, sets;
+            ULONG_PTR mask;
+            unsigned int p, j, member, chunk;
+
+            do_cpuid( leaf, sub, regs );
+            type = regs[0] & 0x1f;
+            if (!type) break;
+            level = (regs[0] >> 5) & 7;
+            sharing = ((regs[0] >> 14) & 0xfff) + 1;
+            ways = (regs[1] >> 22) + 1;
+            parts = ((regs[1] >> 12) & 0x3ff) + 1;
+            line = (regs[1] & 0xfff) + 1;
+            sets = regs[2] + 1;
+
+            memset( &cache, 0, sizeof(cache) );
+            cache.Level = level;
+            cache.Associativity = ways;
+            cache.LineSize = line;
+            cache.Size = ways * parts * line * sets;
+            cache.Type = type == 1 ? CacheData : type == 2 ? CacheInstruction : CacheUnified;
+
+            /* the logical processors that share it: those of a core when that is all there is to share it, else the CPUs
+             * of a package, in groups of the number that share it */
+            for (p = 0; p < num_cpus; p++)
+            {
+                if (!(all_cpus_mask >> p & 1)) continue;
+                mask = 0;
+                {
+                    /* (the threads of this CPU's core, when no more than they share it) */
+                    unsigned int threads = 0;
+                    for (j = 0; j < num_cpus; j++) if ((all_cpus_mask >> j & 1) && core_of[j] == core_of[p]) threads++;
+                    if (sharing <= threads)
+                    {
+                        for (j = 0; j < num_cpus; j++)
+                            if ((all_cpus_mask >> j & 1) && core_of[j] == core_of[p]) mask |= (ULONG_PTR)1 << j;
+                        if (!logical_proc_info_add_cache( mask, &cache )) return STATUS_NO_MEMORY;
+                        continue;
+                    }
+                }
+                /* (CPUs of this package: the group of `sharing` that holds this one) */
+                member = 0;
+                chunk = 0;
+                for (j = 0; j < num_cpus; j++)
+                {
+                    if (!(all_cpus_mask >> j & 1) || pkg_of[j] != pkg_of[p]) continue;
+                    if (j == p) chunk = member / sharing;
+                    member++;
+                }
+                member = 0;
+                for (j = 0; j < num_cpus; j++)
+                {
+                    if (!(all_cpus_mask >> j & 1) || pkg_of[j] != pkg_of[p]) continue;
+                    if (member / sharing == chunk) mask |= (ULONG_PTR)1 << j;
+                    member++;
+                }
+                if (!logical_proc_info_add_cache( mask, &cache )) return STATUS_NO_MEMORY;
+            }
+        }
+    }
+
+    /* Haiku has no NUMA nodes in its public API: one for all the CPUs */
+    if (!logical_proc_info_add_numa_node( all_cpus_mask, 0 )) return STATUS_NO_MEMORY;
+    logical_proc_info_add_group( num_cpus, all_cpus_mask );
+    return status;
+}
+
 #elif defined(HAVE_LIBHWLOC)
 
 static NTSTATUS add_hwloc_cache(hwloc_obj_t obj, int level)

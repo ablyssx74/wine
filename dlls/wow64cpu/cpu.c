@@ -219,7 +219,11 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movq %rax,0x20(%rsp)\n\t"
                    "mov %ax,%ds\n\t"
                    "mov %ax,%es\n\t"
-                   "mov 0x90(%r13),%fs\n\t"     /* context->SegFs */
+                   "movl 0x90(%r13),%eax\n\t"   /* context->SegFs (0 when the host keeps the base of %fs itself) */
+                   "testl %eax,%eax\n\t"
+                   "jz 1f\n\t"
+                   "mov %ax,%fs\n"
+                   "1:\n\t"
                    "movl 0xc4(%r13),%eax\n\t"   /* context->Esp */
                    "movq %rax,0x18(%rsp)\n\t"
                    "movl 0xc0(%r13),%eax\n\t"   /* context->EFlags */

@@ -87,6 +87,81 @@ extern void _thread_set_tsd_base(uint64_t);
 extern status_t		_kern_generic_syscall(const char *subsystem, uint32 function,
                                               void *buffer, size_t bufferSize);
 #endif
+/* 32-bit (WoW64) code needs %fs to point at the 32-bit TEB while it runs, and the Unix side needs it to point at Haiku's
+ * thread storage. Haiku keeps the %fs base of a thread in the kernel and reloads it at every context switch, so switching it
+ * has to go through the kernel: either THREAD_SET_FS_BASE of a patched kernel, or the wine_compat add-on (a drop-in kernel
+ * driver that finds the field by itself). */
+# include <fcntl.h>
+# include <pthread.h>
+# include <Drivers.h>
+# define THREAD_SET_FS_BASE                   2
+# define WINE_COMPAT_SET_THREAD_FS_BASE       (B_DEVICE_OP_CODES_END + 4)
+# define WINE_COMPAT_STATUS                   (B_DEVICE_OP_CODES_END + 1)
+# define WINE_COMPAT_PROBE                    (B_DEVICE_OP_CODES_END + 5)
+extern status_t _kern_ioctl(int fd, uint32 op, void *buffer, size_t length);
+
+struct wine_compat_probe { uint32 samples, candidates; int32 offset; };
+struct wine_compat_status { uint32 version, patched; int32 calls, compat_frames; };
+static int haiku_fs_no_hook;   /* the add-on is there but could not install its signal hook on this kernel */
+static int haiku_fs_mode;      /* 0: none, 1: kernel call, 2: wine_compat add-on */
+static int haiku_fs_fd = -1;
+
+/* called from the dispatchers with %fs pointing at either TEB: no errno, no TLS, nothing that reads %fs */
+void __attribute__((used)) haiku_set_fs_base( void *base )
+{
+    uint64 value = (uint64)base;
+    if (haiku_fs_mode == 1) _kern_generic_syscall( THREAD_SYSCALLS, THREAD_SET_FS_BASE, &value, sizeof(value) );
+    else if (haiku_fs_mode == 2) _kern_ioctl( haiku_fs_fd, WINE_COMPAT_SET_THREAD_FS_BASE, &value, sizeof(value) );
+}
+
+static void *haiku_probe_thread( void *arg )
+{
+    _kern_ioctl( haiku_fs_fd, WINE_COMPAT_PROBE, arg, sizeof(struct wine_compat_probe) );
+    return NULL;
+}
+
+/* returns 0 if %fs cannot be switched (no 32-bit programs then) */
+static int haiku_init_fs_base(void)
+{
+    struct wine_compat_probe probe = { 0 };
+    uint64 native;
+    pthread_t thread;
+    int fd = open( "/dev/misc/wine_compat", O_RDWR | O_CLOEXEC );
+
+    if (fd >= 0)
+    {
+        haiku_fs_fd = fd;
+        /* the add-on needs two threads to be sure where the field is (it remembers it afterwards) */
+        _kern_ioctl( fd, WINE_COMPAT_PROBE, &probe, sizeof(probe) );
+        if (probe.offset < 0 && !pthread_create( &thread, NULL, haiku_probe_thread, &probe ))
+            pthread_join( thread, NULL );
+        _kern_ioctl( fd, WINE_COMPAT_PROBE, &probe, sizeof(probe) );
+        if (probe.offset >= 0)
+        {
+            /* without the signal hook, the first fault in 32-bit code would hang the thread */
+            struct wine_compat_status status = { 0 };
+            _kern_ioctl( fd, WINE_COMPAT_STATUS, &status, sizeof(status) );
+            if (!status.patched)
+            {
+                haiku_fs_no_hook = 1;
+                close( fd );
+                haiku_fs_fd = -1;
+                return 0;
+            }
+            haiku_fs_mode = 2;
+            return 1;
+        }
+        close( fd );
+        haiku_fs_fd = -1;
+    }
+    __asm__( "movq %%fs:0,%0" : "=r" (native) );
+    if (!_kern_generic_syscall( THREAD_SYSCALLS, THREAD_SET_FS_BASE, &native, sizeof(native) ))
+    {
+        haiku_fs_mode = 1;
+        return 1;
+    }
+    return 0;
+}
 #endif
 
 #include "ntstatus.h"
@@ -395,10 +470,12 @@ static inline const WORD *SS_sig_ptr( const ucontext_t *context )
 #define R13_sig(context)     ((context)->uc_mcontext.r13)
 #define R14_sig(context)     ((context)->uc_mcontext.r14)
 #define R15_sig(context)     ((context)->uc_mcontext.r15)
-#define CS_sig(context)      cs64_sel
+/* the kernel records the code and stack segments of the interrupted code in the (otherwise unused) selector fields of the
+ * saved FPU state, and puts back what is there when the handler returns */
+#define CS_sig(context)      ((context)->uc_mcontext.fpu.fp_fxsave.cs)
 #define FS_sig(context)      NULL
 #define GS_sig(context)      NULL
-#define SS_sig(context)      NULL
+#define SS_sig(context)      ((context)->uc_mcontext.fpu.fp_fxsave.ss)
 #define EFL_sig(context)     ((context)->uc_mcontext.rflags)
 #define RIP_sig(context)     ((context)->uc_mcontext.rip)
 #define RSP_sig(context)     ((context)->uc_mcontext.rsp)
@@ -559,6 +636,7 @@ struct amd64_thread_data
     DWORD                 fs;            /* 0338 WOW TEB selector */
     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
     char                  syscall_dispatch; /* 0340 */
+    void                 *wow_fs_base;   /* 0348 Haiku: base of the WOW TEB, or NULL if %fs is not switched */
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
@@ -568,6 +646,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ins
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_fs_base ) == 0x348 );
 
 static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
 {
@@ -802,6 +881,9 @@ static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontex
     CS_sig(sigcontext)  = context->SegCs;
     FS_sig(sigcontext)  = context->SegFs;
     EFL_sig(sigcontext) = context->EFlags;
+#else
+    CS_sig(sigcontext)  = context->SegCs;
+    SS_sig(sigcontext)  = context->SegSs;
 #endif
 }
 
@@ -843,6 +925,8 @@ static inline struct thread_data *init_handler( void *sigcontext )
 #ifdef __linux__
     amd64_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
     if (fs32_sel) arch_prctl( ARCH_SET_FS, amd64_data->pthread_teb );
+#elif defined __HAIKU__
+    if (amd64_data->pthread_teb) haiku_set_fs_base( amd64_data->pthread_teb );
 #elif defined __APPLE__
     _thread_set_tsd_base( (uint64_t)amd64_data->pthread_teb );
 
@@ -874,6 +958,11 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
         amd64_data->syscall_dispatch = 1;  /* SYSCALL_DISPATCH_FILTER_BLOCK */
         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
     }
+#elif defined __HAIKU__
+    if (amd64_data->wow_fs_base &&
+        !is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+        !is_inside_syscall( data, RSP_sig(sigcontext) ))
+        haiku_set_fs_base( amd64_data->wow_fs_base );
 #elif defined __APPLE__
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext )))
@@ -926,6 +1015,9 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
     context->SegCs  = CS_sig(sigcontext);
     context->SegFs  = FS_sig(sigcontext);
     context->EFlags = EFL_sig(sigcontext);
+#else
+    context->SegCs  = CS_sig(sigcontext);
+    context->SegFs  = 0;
 #endif
     context->SegDs  = ds64_sel;
     context->SegEs  = ds64_sel;
@@ -1568,8 +1660,9 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
         context_init_xstate( &stack->context, NULL );
     }
 
-#ifndef __HAIKU__
     CS_sig(sigcontext)  = cs64_sel;
+#ifdef __HAIKU__
+    SS_sig(sigcontext)  = ds64_sel;
 #endif
     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
     RSP_sig(sigcontext) = (ULONG_PTR)stack;
@@ -1679,6 +1772,44 @@ NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_REC
 }
 
 
+#ifdef __HAIKU__
+/***********************************************************************
+ *           haiku_set_fs_base_regs
+ *
+ * Switch the %fs base to %rdi from the dispatchers, which cannot spare any register: keeps them all, on any stack.
+ */
+extern void haiku_set_fs_base_regs(void);
+__ASM_GLOBAL_FUNC( haiku_set_fs_base_regs,
+                   "pushq %rbp\n\t"
+                   "movq %rsp,%rbp\n\t"
+                   "andq $~15,%rsp\n\t"
+                   "pushq %rax\n\t"
+                   "pushq %rcx\n\t"
+                   "pushq %rdx\n\t"
+                   "pushq %rsi\n\t"
+                   "pushq %rdi\n\t"
+                   "pushq %r8\n\t"
+                   "pushq %r9\n\t"
+                   "pushq %r10\n\t"
+                   "pushq %r11\n\t"
+                   "subq $8,%rsp\n\t"
+                   "call " __ASM_NAME("haiku_set_fs_base") "\n\t"
+                   "addq $8,%rsp\n\t"
+                   "popq %r11\n\t"
+                   "popq %r10\n\t"
+                   "popq %r9\n\t"
+                   "popq %r8\n\t"
+                   "popq %rdi\n\t"
+                   "popq %rsi\n\t"
+                   "popq %rdx\n\t"
+                   "popq %rcx\n\t"
+                   "popq %rax\n\t"
+                   "movq %rbp,%rsp\n\t"
+                   "popq %rbp\n\t"
+                   "ret" )
+#endif
+
+
 /***********************************************************************
  *           call_user_mode_callback
  */
@@ -1728,7 +1859,18 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "movq %r12,%rdi\n\t"        /* user_rsp */
                    "movq %r15,%rcx\n"          /* func */
                    /* switch to user stack */
-                   "1:\tmovq %rdi,%rsp\n\t"    /* user_rsp */
+                   "1:\n\t"
+#ifdef __HAIKU__
+                   "movq 0x348(%r13),%r10\n\t"   /* amd64_thread_data()->wow_fs_base */
+                   "testq %r10,%r10\n\t"
+                   "jz 2f\n\t"
+                   "pushq %rdi\n\t"
+                   "movq %r10,%rdi\n\t"
+                   "call " __ASM_NAME("haiku_set_fs_base_regs") "\n\t"
+                   "popq %rdi\n"
+                   "2:\n\t"
+#endif
+                   "movq %rdi,%rsp\n\t"        /* user_rsp */
                    "movq 0x98(%r14),%rbp\n\t"  /* prev_frame->rbp */
                    "ldmxcsr 0xd8(%r14)\n\t"    /* prev_frame->xsave.MxCsr */
 #if defined(__linux__) || defined(__FreeBSD__)
@@ -2160,6 +2302,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
     TRACE_(seh)( " r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
                  context->R12, context->R13, context->R14, context->R15 );
 
+    { ULONG64 *sp = (ULONG64 *)context->Rsp; for (i = 0; i < 12; i++) TRACE_(seh)( " sp[%d]=%016lx\n", i, (long)sp[i] ); } /* TEMP */
     if (data->jmp_buf)
     {
         TRACE_(seh)( "returning to handler\n" );
@@ -2888,12 +3031,16 @@ NTSTATUS signal_alloc_thread( TEB *teb )
 
     if (wow_teb)
     {
+#ifdef __HAIKU__
+        thread_data->fs = 0;    /* %fs is never loaded here: the kernel keeps its base (see haiku_set_fs_base) */
+#else
         if (!fs32_sel)
         {
             thread_data->fs = ldt_alloc_entry( ldt_make_fs32_entry( wow_teb ));
             if (!thread_data->fs) return STATUS_TOO_MANY_THREADS;
         }
         else thread_data->fs = fs32_sel;
+#endif
     }
     thread_data->frame_size = frame_size;
     return STATUS_SUCCESS;
@@ -2907,7 +3054,9 @@ void signal_free_thread( TEB *teb )
 {
     struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
 
+#ifndef __HAIKU__
     if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
+#endif
 }
 
 
@@ -2988,6 +3137,17 @@ void signal_init_process( TEB *teb )
         cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
 #elif defined(__FreeBSD__)
         cs32_sel = GSEL(GUCODE32_SEL, SEL_UPL);
+#elif defined(__HAIKU__)
+        cs32_sel = 0x1b;  /* USER32_CODE_SELECTOR */
+        if (!haiku_init_fs_base())
+        {
+            if (haiku_fs_no_hook)
+                fprintf( stderr, "wine: the wine_compat add-on is loaded but does not support this kernel (it could not "
+                         "install its signal hook), so 32-bit programs are disabled\n" );
+            else
+                fprintf( stderr, "wine: 32-bit programs need the wine_compat kernel add-on (or a kernel with THREAD_SET_FS_BASE)\n" );
+            exit( 1 );
+        }
 #endif
     }
 
@@ -3077,8 +3237,12 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 #elif defined (__APPLE__)
     thread_data->pthread_teb = mac_thread_gsbase();
 #elif defined (__HAIKU__)
-    //thread_data->pthread_teb = amd64_thread_data()->pthread_teb;
     _kern_generic_syscall(THREAD_SYSCALLS, THREAD_SET_GS_BASE, &teb, sizeof(teb));
+    if (haiku_fs_mode && get_wow_teb( teb ))
+    {
+        __asm__( "movq %%fs:0,%0" : "=r" (thread_data->pthread_teb) );  /* Haiku's thread storage points at itself */
+        thread_data->wow_fs_base = get_wow_teb( teb );
+    }
 #else
 # error Please define setting %gs for your architecture
 #endif
@@ -3311,6 +3475,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "popq %r8\n\t"
                    "leaq -0x98(%rbp),%rcx\n"
                    "2:\n\t"
+#elif defined(__HAIKU__)
+                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rdi,%rdi\n\t"
+                   "jz 2f\n\t"
+                   "call " __ASM_NAME("haiku_set_fs_base_regs") "\n"
+                   "2:\n\t"
 #elif defined __APPLE__
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
                    "xorl %esi,%esi\n\t"
@@ -3353,6 +3523,13 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "callq *%r12\n\t"
                    "leaq -0x98(%rbp),%rcx\n\t"
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
+#ifdef __HAIKU__
+                   "movq 0x348(%r13),%rdi\n\t"     /* amd64_thread_data()->wow_fs_base */
+                   "testq %rdi,%rdi\n\t"
+                   "jz 1f\n\t"
+                   "call " __ASM_NAME("haiku_set_fs_base_regs") "\n"
+                   "1:\n\t"
+#endif
                    /* push rbp-based kernel stack cfi */
                    __ASM_CFI(".cfi_remember_state\n\t")
                    __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
@@ -3627,6 +3804,12 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "popq %r9\n\t"
                    "popq %r8\n\t"
                    "2:\n\t"
+#elif defined(__HAIKU__)
+                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rdi,%rdi\n\t"
+                   "jz 2f\n\t"
+                   "call " __ASM_NAME("haiku_set_fs_base_regs") "\n"
+                   "2:\n\t"
 #elif defined __APPLE__
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
                    "xorl %esi,%esi\n\t"
@@ -3650,6 +3833,13 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movdqa 0x250(%rcx),%xmm15\n\t"
                    "testl $0xffff,0xb4(%rcx)\n\t"  /* frame->restore_flags */
                    "jnz " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
+#ifdef __HAIKU__
+                   "movq 0x348(%r13),%rdi\n\t"     /* amd64_thread_data()->wow_fs_base */
+                   "testq %rdi,%rdi\n\t"
+                   "jz 1f\n\t"
+                   "call " __ASM_NAME("haiku_set_fs_base_regs") "\n"
+                   "1:\n\t"
+#endif
                    /* switch to user stack */
                    "movq 0x88(%rcx),%rsp\n\t"
                    __ASM_CFI(".cfi_restore_state\n\t")
