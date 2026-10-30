@@ -1117,6 +1117,10 @@ case $host_os in
 esac
 
 enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
+case $host_os in
+  haiku*) enable_winehaiku_drv=${enable_winehaiku_drv:-yes} ;;
+esac
+enable_winehaiku_drv=${enable_winehaiku_drv:-no}
 enable_wineandroid_drv=${enable_wineandroid_drv:-no}
 enable_winemac_drv=${enable_winemac_drv:-no}
 
@@ -3317,6 +3321,7 @@ WINE_CONFIG_MAKEFILE(dlls/winecoreaudio.drv)
 WINE_CONFIG_MAKEFILE(dlls/wined3d)
 WINE_CONFIG_MAKEFILE(dlls/winedmo)
 WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
+WINE_CONFIG_MAKEFILE(dlls/winehaiku.drv)
 WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
 WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
 WINE_CONFIG_MAKEFILE(dlls/winemapi)

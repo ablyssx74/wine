@@ -1620,6 +1620,7 @@ enable_winecoreaudio_drv
 enable_wined3d
 enable_winedmo
 enable_winegstreamer
+enable_winehaiku_drv
 enable_winehid_sys
 enable_winemac_drv
 enable_winemapi
@@ -12955,6 +12956,10 @@ fi
 esac
 
 enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
+case $host_os in
+  haiku*) enable_winehaiku_drv=${enable_winehaiku_drv:-yes} ;;
+esac
+enable_winehaiku_drv=${enable_winehaiku_drv:-no}
 enable_wineandroid_drv=${enable_wineandroid_drv:-no}
 enable_winemac_drv=${enable_winemac_drv:-no}
 
@@ -16785,7 +16790,7 @@ fi
         fi
     fi
 fi
-if test -z "$WAYLAND_CLIENT_LIBS" -o -z "$WAYLAND_SCANNER" -o -z "$XKBCOMMON_LIBS" -o -z "$XKBREGISTRY_LIBS" -o "$ac_cv_header_linux_input_h" = "no"
+if test -z "$WAYLAND_CLIENT_LIBS" -o -z "$WAYLAND_SCANNER" -o -z "$XKBCOMMON_LIBS" -o -z "$XKBREGISTRY_LIBS" = "no"
 then :
   case "x$with_wayland" in
   x)   as_fn_append wine_notices "|Wayland ${notice_platform}development files not found, the Wayland driver won't be supported." ;;
@@ -18552,12 +18557,12 @@ then
     then
         . /etc/oss.conf
     fi
-    ac_oss_incl="-I${OSSLIBDIR:-/usr/lib/oss}/include"
+    ac_oss_incl="-I${OSSLIBDIR:-/system/develop/headers}/private"
     CPPFLAGS="$CPPFLAGS $ac_oss_incl"
-    ac_fn_c_check_header_compile "$LINENO" "sys/soundcard.h" "ac_cv_header_sys_soundcard_h" "$ac_includes_default"
-if test "x$ac_cv_header_sys_soundcard_h" = xyes
+    ac_fn_c_check_header_compile "$LINENO" "audio/soundcard.h" "ac_cv_header_audio_soundcard_h" "$ac_includes_default"
+if test "x$ac_cv_header_audio_soundcard_h" = xyes
 then :
-  ac_fn_c_check_member "$LINENO" "oss_sysinfo" "numaudioengines" "ac_cv_member_oss_sysinfo_numaudioengines" "#include <sys/soundcard.h>
+  ac_fn_c_check_member "$LINENO" "oss_sysinfo" "numaudioengines" "ac_cv_member_oss_sysinfo_numaudioengines" "#include <audio/soundcard.h>
 "
 if test "x$ac_cv_member_oss_sysinfo_numaudioengines" = xyes
 then :
@@ -22786,6 +22791,7 @@ wine_fn_config_makefile dlls/winecoreaudio.drv enable_winecoreaudio_drv
 wine_fn_config_makefile dlls/wined3d enable_wined3d
 wine_fn_config_makefile dlls/winedmo enable_winedmo
 wine_fn_config_makefile dlls/winegstreamer enable_winegstreamer
+wine_fn_config_makefile dlls/winehaiku.drv enable_winehaiku_drv
 wine_fn_config_makefile dlls/winehid.sys enable_winehid_sys
 wine_fn_config_makefile dlls/winemac.drv enable_winemac_drv
 wine_fn_config_makefile dlls/winemapi enable_winemapi

@@ -1,0 +1,5 @@
+UNIXLIB   = winehaiku.so
+UNIX_LIBS = $(PTHREAD_LIBS) -lm
+
+SOURCES = \
+	haiku.c
