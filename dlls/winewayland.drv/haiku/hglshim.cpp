@@ -13,14 +13,15 @@
 #include <Application.h>
 #include <GLView.h>
 #include <OS.h>
+#include <Screen.h>
 #include <Window.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <GL/gl.h>
 
-extern "C" void *_glapi_get_proc_address(const char *name);
 
 struct hgl_context
 {
@@ -72,6 +73,21 @@ extern "C" struct hgl_context *hgl_context_create(int width, int height, int alp
     if (doublebuffer) options |= BGL_DOUBLE;
     if (depth) options |= BGL_DEPTH;
     if (stencil) options |= BGL_STENCIL;
+
+    /* With Mesa's software renderer a surface can be grown after it was first used; Zink on a GPU (Nebula, through libglvnd) keeps
+     * the size its swapchain was made with, so a surface that starts small stays small and only its corner is ever drawn. A
+     * program does not tell its window's size before the first use, so there the surface starts as large as the screen. Mesa's
+     * libglapi is what tells the two apart. */
+    if (!dlsym(RTLD_DEFAULT, "_glapi_get_proc_address"))
+    {
+        BScreen screen(B_MAIN_SCREEN_ID);
+        if (screen.IsValid())
+        {
+            BRect frame = screen.Frame();
+            if ((int)frame.Width() + 1 > width) width = (int)frame.Width() + 1;
+            if ((int)frame.Height() + 1 > height) height = (int)frame.Height() + 1;
+        }
+    }
 
     if (!(ctx = (hgl_context *)calloc(1, sizeof(*ctx)))) return NULL;
     ctx->width = width;
@@ -170,7 +186,27 @@ extern "C" int hgl_read_pixels(struct hgl_context *ctx, int width, int height, v
     return 1;
 }
 
+/* The address of a GL function. Mesa's libGL has the table of them in libglapi; libglvnd's (Nebula, which replaces Mesa and has no
+ * libglapi) answers through libEGL's eglGetProcAddress, or exports the function itself. Nothing here needs libglapi to be there. */
 extern "C" void *hgl_proc_address(const char *name)
 {
-    return _glapi_get_proc_address(name);
+    typedef void *(*getproc_t)(const char *);
+    static getproc_t glapi_get, egl_get;
+    static int looked;
+    void *p = NULL;
+
+    pthread_mutex_lock(&app_lock);
+    if (!looked)
+    {
+        void *egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+        glapi_get = (getproc_t)dlsym(RTLD_DEFAULT, "_glapi_get_proc_address");
+        if (egl) egl_get = (getproc_t)dlsym(egl, "eglGetProcAddress");
+        looked = 1;
+    }
+    pthread_mutex_unlock(&app_lock);
+
+    if (glapi_get) p = glapi_get(name);
+    if (!p && egl_get) p = egl_get(name);
+    if (!p) p = dlsym(RTLD_DEFAULT, name);
+    return p;
 }

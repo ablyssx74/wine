@@ -23,6 +23,7 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -251,6 +252,24 @@ static BOOL haiku_drawable_swap(struct opengl_drawable *base)
     if (height > ctx_height) height = ctx_height;
     if (width <= 0 || height <= 0) return TRUE;
 
+    if (getenv("WINE_HAIKU_GL_DEBUG"))
+    {
+        /* once in a while: what the window, the context's surface and GL itself say about their sizes */
+        static unsigned frame;
+        if (frame++ % 120 == 0)
+        {
+            GLint vp[4] = {0}, sc[4] = {0}, fbo = -1, rfbo = -1;
+            funcs->p_glGetIntegerv(GL_VIEWPORT, vp);
+            funcs->p_glGetIntegerv(GL_SCISSOR_BOX, sc);
+            funcs->p_glGetIntegerv(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &fbo);
+            funcs->p_glGetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &rfbo);
+            fprintf(stderr, "hgl: frame %u window %dx%d (monitor %ldx%ld) context %dx%d read %dx%d viewport %d,%d %dx%d "
+                    "scissor %d,%d %dx%d draw fbo %d read fbo %d\n", frame - 1, (int)base->virtual_size.cx,
+                    (int)base->virtual_size.cy, (long)base->monitor_size.cx, (long)base->monitor_size.cy, ctx_width, ctx_height,
+                    width, height, vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3], fbo, rfbo);
+        }
+    }
+
     if (!(buffer = get_buffer(gl, width, height)))
     {
         WARN("No buffer available for %s, dropping the frame\n", debugstr_opengl_drawable(base));
@@ -425,14 +444,39 @@ static struct opengl_driver_funcs haiku_driver_funcs =
 };
 
 /* Use the Haiku driver when EGL has no Wayland platform. Returns whether it was installed. */
+/* Whether EGL on the Wayland display has any configs to offer. A libEGL can advertise the Wayland platform and still have no
+ * driver behind it (Mesa libraries installed without a working GPU driver): it then opens a display but lists no configs, and
+ * no OpenGL window can be made at all. */
+static BOOL egl_has_configs(const struct opengl_funcs *f)
+{
+    EGLDisplay display;
+    EGLint major, minor, count = 0;
+
+    if (!f->p_eglGetPlatformDisplay || !f->p_eglInitialize || !f->p_eglGetConfigs || !process_wayland.wl_display)
+        return TRUE;    /* cannot tell: EGL stays in use */
+    display = f->p_eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, process_wayland.wl_display, NULL);
+    if (!display || !f->p_eglInitialize(display, &major, &minor))
+    {
+        TRACE("EGL cannot open the Wayland display\n");
+        return FALSE;
+    }
+    f->p_eglGetConfigs(display, NULL, 0, &count);
+    TRACE("EGL has %d configs\n", count);
+    return count > 0;
+}
+
 BOOL wayland_haiku_opengl_init(const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs)
 {
-    const char *exts;
+    const char *exts, *choice = getenv("WINE_HAIKU_GL");     /* "egl" or "hgl" decides without looking */
 
-    if (opengl_funcs->egl_handle && opengl_funcs->p_eglQueryString &&
+    if (choice && !strcmp(choice, "egl")) return FALSE;
+    if ((!choice || strcmp(choice, "hgl")) && opengl_funcs->egl_handle && opengl_funcs->p_eglQueryString &&
         (exts = opengl_funcs->p_eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS)) &&
         (strstr(exts, "EGL_KHR_platform_wayland") || strstr(exts, "EGL_EXT_platform_wayland")))
-        return FALSE;
+    {
+        if (egl_has_configs(opengl_funcs)) return FALSE;
+        WARN("EGL has the Wayland platform but no configs: using Haiku's native OpenGL instead\n");
+    }
 
     if (!load_shim()) return FALSE;
     funcs = opengl_funcs;
