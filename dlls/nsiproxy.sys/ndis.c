@@ -29,6 +29,9 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#ifdef __HAIKU__
+#include <sys/sockio.h>
+#endif
 #include <errno.h>
 
 #ifdef HAVE_NET_IF_H
@@ -107,17 +110,12 @@ static pthread_mutex_t if_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct if_entry *find_entry_from_index( UINT index )
 {
-#ifdef __HAIKU__
-    return NULL;
-#else
-
     struct if_entry *entry;
 
     LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
         if (entry->if_index == index) return entry;
 
     return NULL;
-#endif
 }
 
 static struct if_entry *find_entry_from_luid( const NET_LUID *luid )
@@ -298,7 +296,11 @@ static struct if_entry *add_entry( UINT index, char *name )
         return NULL;
     }
 
-#ifndef __HAIKU__
+#ifdef __HAIKU__
+    /* Haiku names a network device by its path, and the loopback one "loop" */
+    entry->if_type = !strcmp( name, "loop" ) ? MIB_IF_TYPE_LOOPBACK : MIB_IF_TYPE_ETHERNET;
+    memset( &entry->if_phys_addr, 0, sizeof(entry->if_phys_addr) );
+#else
     if_get_physical( name, &entry->if_type, &entry->if_phys_addr );
 #endif
 
@@ -356,7 +358,6 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
     fd = socket( PF_INET, SOCK_DGRAM, 0 );
     if (fd == -1) return;
 
-#ifndef __HAIKU__
     if (!ioctl( fd, SIOCGIFFLAGS, &req ))
     {
         if (req.ifr_flags & IFF_UP) data->oper_status = IfOperStatusUp;
@@ -365,7 +366,6 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
 #endif
         else data->oper_status = IfOperStatusDown;
     } else data->oper_status = IfOperStatusUnknown;
-#endif
 
     data->flags.unk = 0;
     data->flags.not_media_conn = 0;
@@ -393,7 +393,10 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
     if (!ioctl( fd, SIOCGIFMTU, &req )) data->mtu = req.ifr_mtu;
     else data->mtu = 0;
 #else
-    data->mtu = 0;
+    if (!ioctl( fd, SIOCGIFMTU, &req ) && req.ifr_mtu) data->mtu = req.ifr_mtu;
+    else data->mtu = (entry->if_type == MIB_IF_TYPE_LOOPBACK) ? 65536 : 1500;
+    /* Some applications check for link speed >= 1000000 */
+    if (entry->if_type != MIB_IF_TYPE_LOOPBACK) data->rcv_speed = data->xmit_speed = 1000000;
 #endif
 
     close( fd );

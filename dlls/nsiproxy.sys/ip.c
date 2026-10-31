@@ -63,6 +63,12 @@
 # include <net/if.h>
 #endif
 
+#ifdef __HAIKU__
+# include <sys/ioctl.h>
+# include <sys/sockio.h>
+# include <unistd.h>
+#endif
+
 #ifdef __APPLE__
 /* For reasons unknown, Mac OS doesn't export <netinet6/ip6_var.h> to user-
  * space. We'll have to define the needed struct ourselves.
@@ -1696,6 +1702,70 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void 
             num++;
         }
         free( buf );
+    }
+#elif defined(__HAIKU__)
+    {
+        /* the routes of the network stack, read the way the route command does */
+        struct ifconf config;
+        struct ifreq *req;
+        char *buffer = NULL, *end;
+        unsigned int size = 0;
+        int fd;
+
+        if ((fd = socket( AF_INET, SOCK_DGRAM, 0 )) < 0) return STATUS_NOT_SUPPORTED;
+
+        config.ifc_len = sizeof(config.ifc_value);
+        if (!ioctl( fd, SIOCGRTSIZE, &config, sizeof(config) )) size = (unsigned int)config.ifc_value;
+        if (size && (buffer = malloc( size )))
+        {
+            config.ifc_len = size;
+            config.ifc_buf = buffer;
+            if (ioctl( fd, SIOCGRTTABLE, &config, sizeof(config) ) < 0) size = 0;
+        }
+        else size = 0;
+        close( fd );
+
+        end = buffer + size;
+        for (req = (struct ifreq *)buffer; size && (char *)req < end;)
+        {
+            struct route_entry *route = &req->ifr_route;
+            size_t addr_size = 0;
+
+            if (route->destination) addr_size += route->destination->sa_len;
+            if (route->mask) addr_size += route->mask->sa_len;
+            if (route->gateway) addr_size += route->gateway->sa_len;
+
+            if (route->destination && route->destination->sa_family == AF_INET &&
+                convert_unix_name_to_luid( req->ifr_name, &entry.luid ) &&
+                convert_luid_to_index( &entry.luid, &entry.if_index ))
+            {
+                entry.prefix = ((struct sockaddr_in *)route->destination)->sin_addr;
+                if (route->mask && route->mask->sa_family == AF_INET)
+                    entry.prefix_len = mask_v4_to_prefix( &((struct sockaddr_in *)route->mask)->sin_addr );
+                else
+                    entry.prefix_len = 32;
+                if ((route->flags & RTF_GATEWAY) && route->gateway && route->gateway->sa_family == AF_INET)
+                    entry.next_hop = ((struct sockaddr_in *)route->gateway)->sin_addr;
+                else
+                    entry.next_hop.s_addr = 0;
+                entry.metric = 0;
+                entry.protocol = entry.next_hop.s_addr ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
+                entry.loopback = entry.protocol == MIB_IPPROTO_LOCAL && entry.prefix_len == 32;
+
+                if (num < *count)
+                {
+                    ipv4_forward_fill_entry( &entry, key_data, rw_data, dynamic_data, static_data );
+                    key_data = (BYTE *)key_data + key_size;
+                    rw_data = (BYTE *)rw_data + rw_size;
+                    dynamic_data = (BYTE *)dynamic_data + dynamic_size;
+                    static_data = (BYTE *)static_data + static_size;
+                }
+                num++;
+            }
+
+            req = (struct ifreq *)((char *)req + IF_NAMESIZE + sizeof(struct route_entry) + addr_size);
+        }
+        free( buffer );
     }
 #else
     FIXME( "not implemented\n" );
