@@ -17,8 +17,12 @@
 #include <Window.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#include <vector>
 
 #include <GL/gl.h>
 
@@ -34,6 +38,37 @@ struct hgl_context
 static pthread_mutex_t app_lock = PTHREAD_MUTEX_INITIALIZER;
 static thread_id app_thread = -1;
 static sem_id app_ready = -1;
+static std::vector<hgl_context *> live_contexts;     /* every context that has not been destroyed (guarded by app_lock) */
+static bool exit_hook_set = false;
+
+static bool debug_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("WINE_HAIKU_GL_DEBUG") != NULL;
+    return enabled == 1;
+}
+
+/* When the process ends, it leaves at once, without the clean-up of the libraries. Haiku's OpenGL stack (libglvnd, Mesa, Zink on
+ * the GPU) cannot be taken down while the process is ending: the windows and views of the contexts that were left (Wine does not
+ * delete the contexts of a program that exits without doing it) hold references to objects of those libraries, other threads of
+ * the stack were stopped by Wine in the middle of what they were doing, and the clean-up either finds a reference count that is
+ * not zero (Haiku's BReferenceable calls the debugger and the process stays on the screen, stopped) or a lock that its owner
+ * never gave back (an abort). A program that restarts itself, which has to end the old process, ended this way and froze the
+ * system. Wine itself ends a process without this clean-up when it has to (abort_process() uses _exit()), and the server has the
+ * exit code already, so nothing is lost; the system frees the process's windows, ports and memory. This handler was registered
+ * after the libraries were loaded, so it runs before their own. */
+static void exit_cleanup(void)
+{
+    if (debug_enabled())
+    {
+        pthread_mutex_lock(&app_lock);
+        const size_t count = live_contexts.size();
+        pthread_mutex_unlock(&app_lock);
+        fprintf(stderr, "hgl: ending, %d context(s) left; leaving without taking them down\n", (int)count);
+    }
+    fflush(NULL);
+    _exit(0);
+}
 
 static int32 app_main(void *)
 {
@@ -59,6 +94,11 @@ extern "C" int hgl_init(void)
         delete_sem(app_ready);
     }
     if (be_app == NULL) ok = 0;
+    if (ok && !exit_hook_set)
+    {
+        exit_hook_set = true;
+        atexit(exit_cleanup);
+    }
     pthread_mutex_unlock(&app_lock);
     return ok;
 }
@@ -100,12 +140,23 @@ extern "C" struct hgl_context *hgl_context_create(int width, int height, int alp
     ctx->window->AddChild(ctx->view);
     ctx->window->Unlock();
     ctx->window->Run();     /* starts the window's thread; the window is never shown */
+    pthread_mutex_lock(&app_lock);
+    live_contexts.push_back(ctx);
+    pthread_mutex_unlock(&app_lock);
+    if (debug_enabled()) fprintf(stderr, "hgl: context %p made, %dx%d\n", (void *)ctx, ctx->width, ctx->height);
     return ctx;
 }
 
 extern "C" void hgl_context_destroy(struct hgl_context *ctx)
 {
     if (!ctx) return;
+    pthread_mutex_lock(&app_lock);
+    for (size_t i = 0; i < live_contexts.size(); i++)
+    {
+        if (live_contexts[i] == ctx) { live_contexts.erase(live_contexts.begin() + i); break; }
+    }
+    pthread_mutex_unlock(&app_lock);
+    if (debug_enabled()) fprintf(stderr, "hgl: context %p destroyed\n", (void *)ctx);
     if (ctx->owner >= 0) ctx->view->UnlockGL();
     if (ctx->window->Lock()) ctx->window->Quit();
     free(ctx);
@@ -166,6 +217,8 @@ extern "C" int hgl_context_size(struct hgl_context *ctx, int *width, int *height
     return 1;
 }
 
+extern "C" void *hgl_proc_address(const char *name);
+
 /* Copy the lower left width x height pixels of the current back (or only) buffer to out as top-down BGRA rows. The context
  * must be current in the calling thread. */
 extern "C" int hgl_read_pixels(struct hgl_context *ctx, int width, int height, void *out, int stride)
@@ -177,9 +230,22 @@ extern "C" int hgl_read_pixels(struct hgl_context *ctx, int width, int height, v
     if (width > ctx->width || height > ctx->height) return 0;
     if (!(tmp = (unsigned char *)malloc((size_t)width * height * 4))) return 0;
 
+    /* The window is the default framebuffer: a program (wined3d under Direct3D 10/11) may have left one of its own bound for
+     * reading, holding its picture upside down, so read from the default one and put the binding back */
+    typedef void (*bindfb_t)(unsigned, unsigned);
+    static bindfb_t bind_fb;
+    static int looked;
+    int old_read = 0;
+    if (!looked) { bind_fb = (bindfb_t)hgl_proc_address("glBindFramebuffer"); looked = 1; }
+    if (bind_fb)
+    {
+        glGetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &old_read);
+        if (old_read) bind_fb(0x8CA8 /* GL_READ_FRAMEBUFFER */, 0);
+    }
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     glReadPixels(0, 0, width, height, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, tmp);
+    if (bind_fb && old_read) bind_fb(0x8CA8, (unsigned)old_read);
     for (y = 0; y < height; y++)
         memcpy((char *)out + (size_t)y * stride, tmp + (size_t)(height - 1 - y) * width * 4, (size_t)width * 4);
     free(tmp);
