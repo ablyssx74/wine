@@ -128,9 +128,36 @@ static BOOL load_shim(void)
     return TRUE;
 }
 
+/* Zink answers GL_VENDOR with "Mesa" and puts the GPU's name in GL_RENDERER. Programs that pick their code by the vendor (Unreal Engine 4's
+ * OpenGL renderer asserts when it does not know it) then find no vendor at all, so name the vendor of the GPU after it.
+ * WINE_HAIKU_GL_VENDOR=real turns this off. */
+static const GLubyte *(*real_glGetString)(GLenum name);
+
+
+static const GLubyte *haiku_glGetString(GLenum name)
+{
+    const GLubyte *str = real_glGetString(name);
+    const char *renderer;
+
+    if (name != GL_VENDOR || !str || strstr((const char *)str, "NVIDIA")) return str;
+    if ((renderer = (const char *)real_glGetString(GL_RENDERER)) && strstr(renderer, "NVIDIA"))
+        return (const GLubyte *)"NVIDIA Corporation";
+    return str;
+}
+
 static void *haiku_get_proc_address(const char *name)
 {
-    return hgl.proc_address(name);
+    void *proc = hgl.proc_address(name);
+
+    if (proc && !strcmp(name, "glGetString") && proc != haiku_glGetString)
+    {
+        const char *vendor = getenv("WINE_HAIKU_GL_VENDOR");
+
+        if (vendor && !strcmp(vendor, "real")) return proc;
+        real_glGetString = proc;
+        return haiku_glGetString;
+    }
+    return proc;
 }
 
 static UINT haiku_init_pixel_formats(UINT *onscreen_count)

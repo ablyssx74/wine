@@ -242,13 +242,32 @@ extern "C" int hgl_read_pixels(struct hgl_context *ctx, int width, int height, v
         glGetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &old_read);
         if (old_read) bind_fb(0x8CA8 /* GL_READ_FRAMEBUFFER */, 0);
     }
+    bigtime_t t0 = system_time();
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     glReadPixels(0, 0, width, height, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, tmp);
     if (bind_fb && old_read) bind_fb(0x8CA8, (unsigned)old_read);
+    bigtime_t t1 = system_time();
     for (y = 0; y < height; y++)
         memcpy((char *)out + (size_t)y * stride, tmp + (size_t)(height - 1 - y) * width * 4, (size_t)width * 4);
     free(tmp);
+    if (debug_enabled())
+    {
+        /* every 120 frames: the average time between two frames, in glReadPixels (waits for the GPU) and in the row copy */
+        static bigtime_t sum_read, sum_copy, start;
+        static int frames;
+        bigtime_t t2 = system_time();
+        if (!frames) start = t0;
+        sum_read += t1 - t0;
+        sum_copy += t2 - t1;
+        if (++frames == 120)
+        {
+            fprintf(stderr, "hgl: timing: %.1f ms per frame (%.0f fps), %.2f ms in glReadPixels, %.2f ms copying rows, %dx%d\n",
+                    (t2 - start) / 120000.0, 120e6 / (t2 - start), sum_read / 120000.0, sum_copy / 120000.0, width, height);
+            frames = 0;
+            sum_read = sum_copy = 0;
+        }
+    }
     return 1;
 }
 
