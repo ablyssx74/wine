@@ -330,6 +330,10 @@ static void haiku_map_device_extensions(struct vulkan_device_extensions *extensi
     /* the layer makes its swapchain images from the swapchain's format only, without the mutable-format flag and the list of formats:
      * a view of another format (DXVK makes sRGB ones) is then not allowed for them, and NVK stops the program on an assertion */
     extensions->has_VK_KHR_swapchain_mutable_format = 0;
+    /* NVK on Haiku gets the free system memory from os_get_available_system_memory(), which has nothing for Haiku: it fails, and the
+     * system memory heap's budget is then a few MiB. DXVK keeps to the budgets, so a 4 MiB buffer of Direct3D 9 was refused and the
+     * program crashed. Without the extension programs go by the sizes of the heaps. */
+    extensions->has_VK_EXT_memory_budget = 0;
 }
 
 static const struct vulkan_driver_funcs haiku_vulkan_driver_funcs =
