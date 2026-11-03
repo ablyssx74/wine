@@ -312,6 +312,10 @@ public:
         if (fBitmap)
         {
             BRect bounds = fBitmap->Bounds();
+            if (debug_enabled() && (fFrames++ % 240) == 0)
+                fprintf(stderr, "hvk: frame %u: bitmap %p %dx%d, bits %p, %d bytes per row, valid %d\n", fFrames - 1, (void *)fBitmap,
+                        (int)bounds.Width() + 1, (int)bounds.Height() + 1, fBitmap->Bits(), (int)fBitmap->BytesPerRow(),
+                        (int)fBitmap->IsValid());
             fFrame(fUser, fBitmap->Bits(), (int)bounds.Width() + 1, (int)bounds.Height() + 1, (int)fBitmap->BytesPerRow());
         }
         return old;
@@ -322,6 +326,7 @@ private:
     hvk_frame_cb fFrame;
     void *fUser;
     BBitmap *fBitmap;
+    unsigned fFrames = 0;
 };
 
 /* Put a hook on a surface of the layer. Returns the hook (hvk_surface_detach() frees it), or NULL. */

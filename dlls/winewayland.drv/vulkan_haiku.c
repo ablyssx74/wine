@@ -23,9 +23,11 @@
 #ifdef __HAIKU__
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #include "waylanddrv.h"
@@ -52,7 +54,27 @@ struct haiku_vk_surface
 {
     struct wayland_client_surface *client;
     struct wayland_shm_buffer *pool[BUFFER_POOL];
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    BOOL frame_pending;     /* the compositor has not yet said that it showed the last frame */
 };
+
+/* The layer offers FIFO and nothing else, so every program presents at the pace of the display: before it puts a frame in the window
+ * the one before has to be shown (the compositor's frame callback, which it sends at the refresh rate of the display), as a Wayland
+ * client does with Vulkan's own Wayland surface. WINE_HAIKU_VK_VSYNC=0 shows frames as fast as they come (to measure). A window
+ * that shows nothing (hidden, minimized) never answers: waiting gives up after a while. */
+#define FRAME_WAIT_NS 100000000
+
+static BOOL vsync_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv("WINE_HAIKU_VK_VSYNC");
+        enabled = !(env && !strcmp(env, "0"));
+    }
+    return enabled;
+}
 
 static BOOL load_shim(void)
 {
@@ -116,6 +138,42 @@ static BOOL layer_present(void *vulkan_handle)
     return found;
 }
 
+static void frame_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+    struct haiku_vk_surface *surface = data;
+
+    pthread_mutex_lock(&surface->lock);
+    surface->frame_pending = FALSE;
+    pthread_cond_signal(&surface->cond);
+    pthread_mutex_unlock(&surface->lock);
+    wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener frame_listener = { frame_done };
+
+static void wait_for_frame(struct haiku_vk_surface *surface)
+{
+    struct timespec until;
+
+    pthread_mutex_lock(&surface->lock);
+    if (surface->frame_pending)
+    {
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += FRAME_WAIT_NS;
+        if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+        while (surface->frame_pending)
+        {
+            if (pthread_cond_timedwait(&surface->cond, &surface->lock, &until))
+            {
+                TRACE("The compositor did not answer the frame callback in time\n");
+                surface->frame_pending = FALSE;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&surface->lock);
+}
+
 static void buffer_release(void *data, struct wl_buffer *buffer)
 {
     struct wayland_shm_buffer *shm_buffer = data;
@@ -168,10 +226,17 @@ static void surface_frame(void *user, const void *bits, int width, int height, i
     struct wayland_shm_buffer *buffer;
     int y;
 
+    if (getenv("WINE_HAIKU_GL_DEBUG"))
+    {
+        static unsigned count;
+        if (count++ % 240 == 0)
+            fprintf(stderr, "hvk: surface_frame %u: %dx%d, %d bytes per row, bits %p\n", count - 1, width, height, bytes_per_row, bits);
+    }
     if (width <= 0 || height <= 0) return;
+    if (vsync_enabled()) wait_for_frame(surface);
     if (!(buffer = get_buffer(surface, width, height)))
     {
-        WARN("No buffer available, dropping the frame\n");
+        ERR("No buffer available, dropping the frame\n");
         return;
     }
 
@@ -185,6 +250,19 @@ static void surface_frame(void *user, const void *bits, int width, int height, i
     wayland_shm_buffer_ref(buffer);
     wl_surface_attach(surface->client->wl_surface, buffer->wl_buffer, 0, 0);
     wl_surface_damage_buffer(surface->client->wl_surface, 0, 0, width, height);
+    if (vsync_enabled())
+    {
+        struct wl_callback *callback = wl_surface_frame(surface->client->wl_surface);
+
+        if (callback)
+        {
+            wl_proxy_set_queue((struct wl_proxy *)callback, process_wayland.wl_event_queue);
+            pthread_mutex_lock(&surface->lock);
+            surface->frame_pending = TRUE;
+            pthread_mutex_unlock(&surface->lock);
+            wl_callback_add_listener(callback, &frame_listener, surface);
+        }
+    }
     wl_surface_commit(surface->client->wl_surface);
     wl_display_flush(process_wayland.wl_display);
 }
@@ -200,6 +278,8 @@ static VkResult haiku_vulkan_surface_create(struct client_surface *client, const
 
     if (!(surface = calloc(1, sizeof(*surface)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     surface->client = wayland_client;
+    pthread_mutex_init(&surface->lock, NULL);
+    pthread_cond_init(&surface->cond, NULL);
 
     if ((res = instance->p_vkCreateHeadlessSurfaceEXT(instance->host.instance, &create_info, NULL /* allocator */, handle)))
     {
