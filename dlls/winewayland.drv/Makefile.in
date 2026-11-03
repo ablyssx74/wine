@@ -21,6 +21,7 @@ SOURCES = \
 	text-input-unstable-v3.xml \
 	viewporter.xml \
 	vulkan.c \
+	vulkan_haiku.c \
 	wayland.c \
 	wayland_data_device.c \
 	wayland_keyboard.c \

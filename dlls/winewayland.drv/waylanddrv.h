@@ -484,6 +484,7 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 struct opengl_funcs;
 struct opengl_driver_funcs;
 extern BOOL wayland_haiku_opengl_init(const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
+extern BOOL wayland_haiku_vulkan_init(void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
 #endif
 struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format, BOOL raw);
 BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);

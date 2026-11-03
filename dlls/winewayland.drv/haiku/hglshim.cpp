@@ -12,6 +12,7 @@
 
 #include <Application.h>
 #include <GLView.h>
+#include <MessageFilter.h>
 #include <OS.h>
 #include <Screen.h>
 #include <Window.h>
@@ -22,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <new>
 #include <vector>
 
 #include <GL/gl.h>
@@ -59,15 +61,36 @@ static bool debug_enabled(void)
  * after the libraries were loaded, so it runs before their own. */
 static void exit_cleanup(void)
 {
+    /* the work that the GPU still has from the thread that is ending (Zink queues it on a thread of its own) is finished first,
+     * so the process does not leave the driver in the middle of it */
+    pthread_mutex_lock(&app_lock);
+    const size_t count = live_contexts.size();
+    for (size_t i = 0; i < count; i++)
+        if (live_contexts[i]->owner == find_thread(NULL)) glFinish();
+    pthread_mutex_unlock(&app_lock);
     if (debug_enabled())
-    {
-        pthread_mutex_lock(&app_lock);
-        const size_t count = live_contexts.size();
-        pthread_mutex_unlock(&app_lock);
         fprintf(stderr, "hgl: ending, %d context(s) left; leaving without taking them down\n", (int)count);
-    }
     fflush(NULL);
     _exit(0);
+}
+
+/* The registrar asks every application to quit when the system shuts down or reboots, and the process has to answer "yes" (any
+ * "no" aborts the shutdown). The answer is yes, and the process leaves as it does at its end: a BApplication that just quits
+ * leaves the windows and the GPU's threads of the contexts running until the process is killed in the middle of what they do. */
+static filter_result shutdown_request_filter(BMessage *message, BHandler **, BMessageFilter *)
+{
+    bool shutdown = false;
+
+    if (message->what != B_QUIT_REQUESTED || message->FindBool("_shutdown_", &shutdown) != B_OK || !shutdown)
+        return B_DISPATCH_MESSAGE;
+
+    BMessage reply(B_REPLY);
+    reply.AddBool("result", true);
+    reply.AddInt32("thread", be_app->Thread());
+    message->SendReply(&reply);
+    if (debug_enabled()) fprintf(stderr, "hgl: the system is shutting down, leaving\n");
+    exit_cleanup();
+    return B_SKIP_MESSAGE;
 }
 
 static int32 app_main(void *)
@@ -98,6 +121,11 @@ extern "C" int hgl_init(void)
     {
         exit_hook_set = true;
         atexit(exit_cleanup);
+        if (be_app->Lock())
+        {
+            be_app->AddCommonFilter(new BMessageFilter(B_QUIT_REQUESTED, shutdown_request_filter));
+            be_app->Unlock();
+        }
     }
     pthread_mutex_unlock(&app_lock);
     return ok;
@@ -157,6 +185,10 @@ extern "C" void hgl_context_destroy(struct hgl_context *ctx)
     }
     pthread_mutex_unlock(&app_lock);
     if (debug_enabled()) fprintf(stderr, "hgl: context %p destroyed\n", (void *)ctx);
+    /* the GPU's work for this context is finished before it goes (the thread Zink queues it on may still be at it); a context
+     * that another thread has current cannot be reached from here */
+    if (ctx->owner == find_thread(NULL)) glFinish();
+    else if (ctx->owner < 0) { ctx->view->LockGL(); glFinish(); ctx->view->UnlockGL(); }
     if (ctx->owner >= 0) ctx->view->UnlockGL();
     if (ctx->window->Lock()) ctx->window->Quit();
     free(ctx);
@@ -218,6 +250,99 @@ extern "C" int hgl_context_size(struct hgl_context *ctx, int *width, int *height
 }
 
 extern "C" void *hgl_proc_address(const char *name);
+
+/* ---- Vulkan: the frames of the VideoStreamsWsi layer ----
+ *
+ * Haiku's Vulkan (NVK, Nebula) reaches a window through that implicit layer: it answers VK_EXT_headless_surface and the swapchain
+ * of such a surface, and at every present it copies the image into a BBitmap (host memory, always the same one) and hands it to
+ * the "bitmap hook" that the program set on the surface. Wine asks Windows programs' VK_KHR_win32_surface for a headless surface
+ * and puts the hook on it; the driver copies the frame into the window's buffer. The two classes below are the layer's own
+ * (Wsi.cpp), only their virtual tables matter: the surface handle the layer gives out is a pointer to its surface object. */
+class BitmapHook {
+public:
+    virtual ~BitmapHook() {}
+    virtual void GetSize(uint32_t &width, uint32_t &height) = 0;
+    virtual BBitmap *SetBitmap(BBitmap *bmp) = 0;
+};
+
+class VKLayerSurfaceBase {
+public:
+    virtual ~VKLayerSurfaceBase() {}
+    virtual void SetBitmapHook(BitmapHook *hook) = 0;
+};
+
+typedef void (*hvk_size_cb)(void *user, unsigned *width, unsigned *height);    /* the size of the window; 0 0 if not known */
+typedef void (*hvk_frame_cb)(void *user, const void *bits, int width, int height, int bytes_per_row);
+
+class FrameHook : public BitmapHook {
+public:
+    FrameHook(hvk_size_cb size, hvk_frame_cb frame, void *user) : fSize(size), fFrame(frame), fUser(user), fBitmap(NULL) {}
+    ~FrameHook() { delete fBitmap; }
+
+    void GetSize(uint32_t &width, uint32_t &height) override
+    {
+        /* what the last frame was, so that the layer never finds a swapchain "suboptimal" that matches the frames it shows */
+        if (fBitmap)
+        {
+            BRect bounds = fBitmap->Bounds();
+            width = (uint32_t)bounds.Width() + 1;
+            height = (uint32_t)bounds.Height() + 1;
+        }
+        else
+        {
+            unsigned w = 0, h = 0;
+            fSize(fUser, &w, &h);
+            width = w;
+            height = h;
+        }
+    }
+
+    /* The first frame of a swapchain passes the bitmap to us (the layer made it with the swapchain and does not keep it); the
+     * next ones pass the same bitmap, drawn into again. What is returned the layer deletes: the bitmap of a swapchain that this one
+     * replaced. */
+    BBitmap *SetBitmap(BBitmap *bmp) override
+    {
+        BBitmap *old = NULL;
+
+        if (bmp != fBitmap)
+        {
+            old = fBitmap;
+            fBitmap = bmp;
+        }
+        if (fBitmap)
+        {
+            BRect bounds = fBitmap->Bounds();
+            fFrame(fUser, fBitmap->Bits(), (int)bounds.Width() + 1, (int)bounds.Height() + 1, (int)fBitmap->BytesPerRow());
+        }
+        return old;
+    }
+
+private:
+    hvk_size_cb fSize;
+    hvk_frame_cb fFrame;
+    void *fUser;
+    BBitmap *fBitmap;
+};
+
+/* Put a hook on a surface of the layer. Returns the hook (hvk_surface_detach() frees it), or NULL. */
+extern "C" void *hvk_surface_attach(void *surface, hvk_size_cb size, hvk_frame_cb frame, void *user)
+{
+    FrameHook *hook;
+
+    if (!surface || !hgl_init()) return NULL;
+    if (!(hook = new (std::nothrow) FrameHook(size, frame, user))) return NULL;
+    ((VKLayerSurfaceBase *)surface)->SetBitmapHook(hook);
+    if (debug_enabled()) fprintf(stderr, "hvk: hook %p on surface %p\n", (void *)hook, surface);
+    return hook;
+}
+
+/* The surface still has to exist */
+extern "C" void hvk_surface_detach(void *surface, void *hook)
+{
+    if (surface) ((VKLayerSurfaceBase *)surface)->SetBitmapHook(NULL);
+    delete (FrameHook *)hook;
+}
+
 
 /* Copy the lower left width x height pixels of the current back (or only) buffer to out as top-down BGRA rows. The context
  * must be current in the calling thread. */

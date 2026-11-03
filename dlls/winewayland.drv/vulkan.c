@@ -105,6 +105,9 @@ UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_d
         return STATUS_INVALID_PARAMETER;
     }
 
+#ifdef __HAIKU__
+    if (wayland_haiku_vulkan_init(vulkan_handle, driver_funcs)) return STATUS_SUCCESS;
+#endif
     *driver_funcs = &wayland_vulkan_driver_funcs;
     return STATUS_SUCCESS;
 }
