@@ -374,9 +374,22 @@ static void data_offer_offer(void *data, struct wl_data_offer *wl_data_offer, co
     data_control_offer_offer(data, NULL, type);
 }
 
+/* The drag and drop events of version 3 of wl_data_offer. A compositor may send them whatever the version the client bound (the Haiku
+ * server sends them with every offer), and libwayland aborts the whole process when an event has no function in the listener. Drag and
+ * drop is not supported, so they are ignored. */
+static void data_offer_source_actions(void *data, struct wl_data_offer *wl_data_offer, uint32_t source_actions)
+{
+}
+
+static void data_offer_action(void *data, struct wl_data_offer *wl_data_offer, uint32_t dnd_action)
+{
+}
+
 static const struct wl_data_offer_listener data_offer_listener =
 {
     data_offer_offer,
+    data_offer_source_actions,
+    data_offer_action,
 };
 
 static void wayland_data_offer_create(void *offer_proxy)
