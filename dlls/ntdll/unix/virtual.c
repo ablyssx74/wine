@@ -5938,6 +5938,11 @@ NTSTATUS WINAPI NtLockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size, 
     *size = ROUND_SIZE( *addr, *size, page_mask );
     *addr = ROUND_ADDR( *addr, page_mask );
 
+#ifdef __HAIKU__
+    /* VirtualLock only hints that the pages should stay in memory. Haiku's munlock() can crash the kernel (Bitmap::GetHighestSet()
+     * reads before the start of its bitmap when the last locked page is unlocked), so the pages are not locked at all. */
+    return status;
+#endif
     if (mlock( ROUND_ADDR( *addr, host_page_mask ), ROUND_SIZE( *addr, *size, host_page_mask ) ))
         status = STATUS_ACCESS_DENIED;
     return status;
@@ -5976,6 +5981,11 @@ NTSTATUS WINAPI NtUnlockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size
     *size = ROUND_SIZE( *addr, *size, page_mask );
     *addr = ROUND_ADDR( *addr, page_mask );
 
+#ifdef __HAIKU__
+    /* VirtualLock only hints that the pages should stay in memory. Haiku's munlock() can crash the kernel (Bitmap::GetHighestSet()
+     * reads before the start of its bitmap when the last locked page is unlocked), so the pages are not locked at all. */
+    return status;
+#endif
     if (munlock( ROUND_ADDR( *addr, host_page_mask ), ROUND_SIZE( *addr, *size, host_page_mask ) ))
         status = STATUS_ACCESS_DENIED;
     return status;
