@@ -219,6 +219,17 @@ static struct list teb_list = LIST_INIT( teb_list );
 #define MAP_NORESERVE 0
 #endif
 
+#ifdef __HAIKU__
+/* Haiku charges every readable or writable private anonymous mapping against its commit limit when the mapping is made (and again
+ * whenever mprotect() opens a part of a reserved range), whether the pages are ever touched or not. Windows programs commit far
+ * more than they use (a browser's heaps), so the limit ran out with plenty of free memory ("Out of memory" from mmap, then a program
+ * that exits or the whole system that stops), and the accounting code of the kernel panicked under the many mprotect() calls of
+ * the worker threads. Areas that are made with MAP_NORESERVE only pay for the pages that are touched, as on Linux. */
+#define ANON_MMAP_EXTRA MAP_NORESERVE
+#else
+#define ANON_MMAP_EXTRA 0
+#endif
+
 #ifdef _WIN64  /* on 64-bit the page protection bytes use a 2-level table */
 static const size_t pages_vprot_shift = 20;
 static const size_t pages_vprot_mask = (1 << 20) - 1;
@@ -275,7 +286,7 @@ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
-    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
+    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags | ANON_MMAP_EXTRA, -1, 0 );
 }
 
 /* allocate anonymous mmap() memory at any address */
@@ -283,7 +294,7 @@ void *anon_mmap_alloc( size_t size, int prot )
 {
     assert( !(size & host_page_mask) );
 
-    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON | ANON_MMAP_EXTRA, -1, 0 );
 }
 
 static inline UINT_PTR make_mem_area( void *base, enum area_state state )
@@ -564,6 +575,7 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 {
     void *ptr;
 
+    flags |= ANON_MMAP_EXTRA;
 #ifdef MAP_FIXED_NOREPLACE
     ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
 #elif defined(MAP_TRYFIXED)
