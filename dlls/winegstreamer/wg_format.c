@@ -643,14 +643,15 @@ void wg_format_from_caps(struct wg_format *format, const GstCaps *caps)
     {
         GstAudioInfo info;
 
-        if (gst_audio_info_from_caps(&info, caps))
+        if (gst_caps_is_fixed(caps) && gst_audio_info_from_caps(&info, caps))
             wg_format_from_audio_info(format, &info);
     }
     else if (!strcmp(name, "video/x-raw"))
     {
         GstVideoInfo info;
 
-        if (gst_video_info_from_caps(&info, caps))
+        /* caps that are not fixed can not give a video info, and GStreamer prints a critical warning when it is asked */
+        if (gst_caps_is_fixed(caps) && gst_video_info_from_caps(&info, caps))
             wg_format_from_video_info(format, &info);
     }
     else if (!strcmp(name, "audio/mpeg") && gst_structure_get_boolean(structure, "parsed", &parsed) && parsed)
