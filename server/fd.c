@@ -115,6 +115,11 @@
 # define USE_EPOLL
 #endif /* HAVE_SYS_EPOLL_H && HAVE_EPOLL_CREATE */
 
+#if defined(__HAIKU__) && defined(HAVE_SYS_EVENT_H) && !defined(HAVE_KQUEUE)
+/* Haiku has kqueue() and kevent() in libbsd, which configure does not look in: the server is linked with it (Makefile.in) */
+# define HAVE_KQUEUE 1
+#endif
+
 #if defined(HAVE_PORT_H) && defined(HAVE_PORT_CREATE)
 # include <port.h>
 # define USE_EVENT_PORTS
@@ -593,6 +598,41 @@ static inline void init_epoll(void)
     kqueue_fd = kqueue();
 }
 
+#ifdef __HAIKU__
+
+/* Haiku's kevent() keeps one registration per file descriptor and only knows EV_ADD and EV_DELETE: EV_ENABLE and EV_DISABLE are
+ * ignored, so a filter that is added "disabled" would still fire (every writable socket would wake the server at once) and an
+ * EV_ENABLE without EV_ADD would remove the descriptor. Add and delete the filters that the wanted events need instead, from the
+ * events the descriptor had before (the caller updates pollfd[] after this returns). */
+static inline void set_fd_epoll_events( struct fd *fd, int user, int events )
+{
+    struct kevent ev[2];
+    int count = 0, old_events, new_events;
+
+    if (kqueue_fd == -1) return;
+
+    old_events = (pollfd[user].fd == -1) ? 0 : (pollfd[user].events & (POLLIN | POLLOUT));
+    new_events = (events == -1) ? 0 : (events & (POLLIN | POLLOUT));
+    if (old_events == new_events) return;
+
+    if ((old_events ^ new_events) & POLLIN)
+        EV_SET( &ev[count++], fd->unix_fd, EVFILT_READ, (new_events & POLLIN) ? EV_ADD : EV_DELETE, 0, 0, (void *)(long)user );
+    if ((old_events ^ new_events) & POLLOUT)
+        EV_SET( &ev[count++], fd->unix_fd, EVFILT_WRITE, (new_events & POLLOUT) ? EV_ADD : EV_DELETE, 0, 0, (void *)(long)user );
+
+    if (kevent( kqueue_fd, ev, count, NULL, 0, NULL ) == -1)
+    {
+        if (errno == ENOMEM)  /* not enough memory, give up on kqueue */
+        {
+            close( kqueue_fd );
+            kqueue_fd = -1;
+        }
+        else perror( "kevent" );  /* should not happen */
+    }
+}
+
+#else  /* __HAIKU__ */
+
 static inline void set_fd_epoll_events( struct fd *fd, int user, int events )
 {
     struct kevent ev[2];
@@ -630,6 +670,8 @@ static inline void set_fd_epoll_events( struct fd *fd, int user, int events )
         else perror( "kevent" );  /* should not happen */
     }
 }
+
+#endif  /* __HAIKU__ */
 
 static inline void remove_epoll_user( struct fd *fd, int user )
 {
