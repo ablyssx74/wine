@@ -25,6 +25,10 @@
 #include "config.h"
 
 #include <stdlib.h>
+#ifdef __HAIKU__
+#include <errno.h>
+#include <poll.h>
+#endif
 
 #include "ntstatus.h"
 
@@ -106,12 +110,50 @@ err:
 
 static NTSTATUS waylanddrv_unix_read_events(void *arg)
 {
+#ifdef __HAIKU__
+    /* Haiku's libwayland-client does not wait in wl_display_dispatch_queue: it returns at once when there is nothing to read, and
+     * the loop below would spin and use a whole core in every process with a window. Wait for the connection ourselves, as
+     * wl_display_dispatch_queue does on other systems. */
+    struct pollfd pfd;
+
+    pfd.fd = wl_display_get_fd(process_wayland.wl_display);
+    pfd.events = POLLIN;
+    for (;;)
+    {
+        while (wl_display_prepare_read_queue(process_wayland.wl_display, process_wayland.wl_event_queue) != 0)
+        {
+            if (wl_display_dispatch_queue_pending(process_wayland.wl_display, process_wayland.wl_event_queue) == -1)
+                return STATUS_UNSUCCESSFUL;
+            wayland_pointer_flush_relative();
+        }
+        if (wl_display_flush(process_wayland.wl_display) == -1 && errno != EAGAIN)
+        {
+            wl_display_cancel_read(process_wayland.wl_display);
+            return STATUS_UNSUCCESSFUL;
+        }
+        pfd.revents = 0;
+        if (poll(&pfd, 1, -1) == -1 && errno != EINTR)
+        {
+            wl_display_cancel_read(process_wayland.wl_display);
+            return STATUS_UNSUCCESSFUL;
+        }
+        if (pfd.revents & (POLLIN | POLLERR | POLLHUP))
+        {
+            if (wl_display_read_events(process_wayland.wl_display) == -1) return STATUS_UNSUCCESSFUL;
+        }
+        else wl_display_cancel_read(process_wayland.wl_display);
+        if (wl_display_dispatch_queue_pending(process_wayland.wl_display, process_wayland.wl_event_queue) == -1)
+            return STATUS_UNSUCCESSFUL;
+        wayland_pointer_flush_relative();
+    }
+#else
     while (wl_display_dispatch_queue(process_wayland.wl_display,
                                      process_wayland.wl_event_queue) != -1)
         wayland_pointer_flush_relative();
     /* This function only returns on a fatal error, e.g., if our connection
      * to the Wayland server is lost. */
     return STATUS_UNSUCCESSFUL;
+#endif
 }
 
 static NTSTATUS waylanddrv_unix_init_clipboard(void *arg)
