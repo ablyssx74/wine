@@ -23,9 +23,23 @@ Install `wine11-11.20-32-x86_64.hpkg` for the whole system, then make a prefix:
 ### 32-bit programs (`wine_compat`)
 
 Haiku cannot run 32-bit code in a 64-bit process on a stock kernel. `wine_compat` is a small kernel add-on that makes it possible.
-It is **not part of the package**: unzip `wine_compat-ds-es.zip` and follow its `INSTALL.txt`. Check with
-`grep wine_compat /var/log/syslog | tail -5` ("patched the call at ..." means it is active). Without the add-on a 32-bit program
-stops with a message and 64-bit programs are not affected.
+It is **not part of the package**: download `wine_compat-ds-es.zip` from the release, unzip it, and in a Terminal in that folder:
+
+    wineserver -k
+    mkdir -p ~/config/non-packaged/add-ons/kernel/drivers/bin
+    mkdir -p ~/config/non-packaged/add-ons/kernel/drivers/dev/misc
+    cp wine_compat ~/config/non-packaged/add-ons/kernel/drivers/bin/wine_compat
+    ln -sf ~/config/non-packaged/add-ons/kernel/drivers/bin/wine_compat ~/config/non-packaged/add-ons/kernel/drivers/dev/misc/wine_compat
+
+Check that it is active (the device can take a few seconds to appear, no reboot is needed):
+
+    ls /dev/misc/wine_compat
+    grep wine_compat /var/log/syslog | tail -5
+
+"patched the call at ..." means it is active. To update an older `wine_compat`, or to remove it, run `wineserver -k`, remove
+`~/config/non-packaged/add-ons/kernel/drivers/dev/misc/wine_compat` and `.../drivers/bin/wine_compat`, wait about 10 seconds, and
+install again (`INSTALL.txt` in the zip has the exact commands). Without the add-on a 32-bit program stops with a message and 64-bit
+programs are not affected.
 
 ## Graphics
 
