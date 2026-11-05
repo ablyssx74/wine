@@ -1,3 +1,5 @@
+**Haiku:** this fork runs Wine on Haiku, see [README-HAIKU.md](README-HAIKU.md) for the setup (Wayland, 32-bit, Vulkan and DXVK, Firefox).
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
