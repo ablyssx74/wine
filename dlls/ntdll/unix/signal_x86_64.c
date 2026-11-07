@@ -171,6 +171,22 @@ static int haiku_init_fs_base(void)
     }
     return 0;
 }
+
+/* Haiku's kernel does not turn an int3 into SIGTRAP (a team without a debugger is killed by debug_server), and Wine used to be
+ * the debugger of every process for that, which makes the kernel clear the vector registers each time a signal handler returns.
+ * The wine_int3 add-on does what a Linux kernel does for the teams that open its device and ask: it puts the instruction
+ * pointer after the int3 and sends the thread SIGTRAP. The device stays open as long as the process lives (the mark ends when
+ * it is closed). Nothing happens without the add-on. WINE_HAIKU_INT3=0 does not ask for it. */
+#define WINE_INT3_MARK  (B_DEVICE_OP_CODES_END + 3)
+static void haiku_init_int3(void)
+{
+    const char *env = getenv( "WINE_HAIKU_INT3" );
+    int fd;
+
+    if (env && env[0] == '0') return;
+    if ((fd = open( "/dev/misc/wine_int3", O_RDWR | O_CLOEXEC )) < 0) return;
+    if (_kern_ioctl( fd, WINE_INT3_MARK, NULL, 0 ) != 0) close( fd );  /* the kernel is not the one the add-on supports */
+}
 #endif
 
 #include "ntstatus.h"
@@ -3149,6 +3165,9 @@ void signal_init_process( TEB *teb )
 
     __asm__( "movw %%cs,%0" : "=m" (cs64_sel) );
     __asm__( "movw %%ss,%0" : "=m" (ds64_sel) );
+#ifdef __HAIKU__
+    haiku_init_int3();
+#endif
 
     if (wow_teb)
     {
