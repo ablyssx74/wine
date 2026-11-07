@@ -98,6 +98,7 @@ extern status_t		_kern_generic_syscall(const char *subsystem, uint32 function,
 # define WINE_COMPAT_SET_THREAD_FS_BASE       (B_DEVICE_OP_CODES_END + 4)
 # define WINE_COMPAT_STATUS                   (B_DEVICE_OP_CODES_END + 1)
 # define WINE_COMPAT_PROBE                    (B_DEVICE_OP_CODES_END + 5)
+# define WINE_COMPAT_GET_FS_BASE              (B_DEVICE_OP_CODES_END + 3)
 extern status_t _kern_ioctl(int fd, uint32 op, void *buffer, size_t length);
 
 struct wine_compat_probe { uint32 samples, candidates; int32 offset; };
@@ -112,6 +113,14 @@ void __attribute__((used)) haiku_set_fs_base( void *base )
     uint64 value = (uint64)base;
     if (haiku_fs_mode == 1) _kern_generic_syscall( THREAD_SYSCALLS, THREAD_SET_FS_BASE, &value, sizeof(value) );
     else if (haiku_fs_mode == 2) _kern_ioctl( haiku_fs_fd, WINE_COMPAT_SET_THREAD_FS_BASE, &value, sizeof(value) );
+}
+
+/* the %fs base the thread has right now (0 if the host does not tell) */
+static unsigned long haiku_get_fs_base(void)
+{
+    uint64 value = 0;
+    if (haiku_fs_mode == 2) _kern_ioctl( haiku_fs_fd, WINE_COMPAT_GET_FS_BASE, &value, sizeof(value) );
+    return value;
 }
 
 static void *haiku_probe_thread( void *arg )
@@ -2854,6 +2863,12 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+#ifdef __HAIKU__
+    /* the %fs base the interrupted code had: the dispatcher switches it to the 32-bit TEB just before it returns to 32-bit
+     * code, so a signal that lands after that (still on the kernel stack) must give it back, or the program goes on with
+     * the Unix side's base and its next %fs read fails */
+    unsigned long fs_entry = haiku_get_fs_base();
+#endif
     struct thread_data *data = init_handler( sigcontext );
 
     if (!data->teb)
@@ -2904,6 +2919,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
             cpu->Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
         }
         NtSetContextThread( GetCurrentThread(), &context->c );
+#ifdef __HAIKU__
+        if (fs_entry) haiku_set_fs_base( (void *)fs_entry );
+#endif
     }
     else
     {
