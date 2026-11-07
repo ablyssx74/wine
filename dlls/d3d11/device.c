@@ -494,7 +494,8 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_context_QueryInterface(ID3D11Devic
     {
         *out = &context->ID3D11Multithread_iface;
     }
-    else if (context->type == D3D11_DEVICE_CONTEXT_IMMEDIATE && IsEqualGUID(iid, &IID_ID3D11VideoContext))
+    else if (context->type == D3D11_DEVICE_CONTEXT_IMMEDIATE && (IsEqualGUID(iid, &IID_ID3D11VideoContext)
+            || IsEqualGUID(iid, &IID_ID3D11VideoContext1)))
     {
         *out = &context->ID3D11VideoContext_iface;
     }
@@ -3806,8 +3807,117 @@ static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorGetStreamRotatio
             iface, processor, stream_idx, enable, rotation);
 }
 
-static const ID3D11VideoContextVtbl d3d11_video_context_vtbl =
+/* ID3D11VideoContext1 methods: not implemented (Chromium asks for them before it uses the video processor). */
+
+static HRESULT STDMETHODCALLTYPE d3d11_video_context_SubmitDecoderBuffers1(ID3D11VideoContext1 *iface,
+        ID3D11VideoDecoder *decoder, UINT buffer_count, const D3D11_VIDEO_DECODER_BUFFER_DESC1 *buffer_desc)
 {
+    FIXME("iface %p, decoder %p, buffer_count %u, buffer_desc %p stub!\n", iface, decoder, buffer_count, buffer_desc);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_video_context_GetDataForNewHardwareKey(ID3D11VideoContext1 *iface,
+        ID3D11CryptoSession *session, UINT input_size, const void *input_data, UINT64 *output_data)
+{
+    FIXME("iface %p, session %p, input_size %u, input_data %p, output_data %p stub!\n",
+            iface, session, input_size, input_data, output_data);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_video_context_CheckCryptoSessionStatus(ID3D11VideoContext1 *iface,
+        ID3D11CryptoSession *session, D3D11_CRYPTO_SESSION_STATUS *status)
+{
+    FIXME("iface %p, session %p, status %p stub!\n", iface, session, status);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_video_context_DecoderEnableDownsampling(ID3D11VideoContext1 *iface,
+        ID3D11VideoDecoder *decoder, DXGI_COLOR_SPACE_TYPE colour_space, const D3D11_VIDEO_SAMPLE_DESC *output_desc,
+        UINT reference_frame_count)
+{
+    FIXME("iface %p, decoder %p, colour_space %#x, output_desc %p, reference_frame_count %u stub!\n",
+            iface, decoder, colour_space, output_desc, reference_frame_count);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_video_context_DecoderUpdateDownsampling(ID3D11VideoContext1 *iface,
+        ID3D11VideoDecoder *decoder, const D3D11_VIDEO_SAMPLE_DESC *output_desc)
+{
+    FIXME("iface %p, decoder %p, output_desc %p stub!\n", iface, decoder, output_desc);
+    return E_NOTIMPL;
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetOutputColorSpace1(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, DXGI_COLOR_SPACE_TYPE colour_space)
+{
+    FIXME("iface %p, processor %p, colour_space %#x stub!\n", iface, processor, colour_space);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetOutputShaderUsage(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, BOOL shader_usage)
+{
+    FIXME("iface %p, processor %p, shader_usage %#x stub!\n", iface, processor, shader_usage);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorGetOutputColorSpace1(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, DXGI_COLOR_SPACE_TYPE *colour_space)
+{
+    FIXME("iface %p, processor %p, colour_space %p stub!\n", iface, processor, colour_space);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorGetOutputShaderUsage(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, BOOL *shader_usage)
+{
+    FIXME("iface %p, processor %p, shader_usage %p stub!\n", iface, processor, shader_usage);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamColorSpace1(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, UINT stream_index, DXGI_COLOR_SPACE_TYPE colour_space)
+{
+    FIXME("iface %p, processor %p, stream_index %u, colour_space %#x stub!\n",
+            iface, processor, stream_index, colour_space);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamMirror(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, UINT stream_index, BOOL enable, BOOL flip_horizontal, BOOL flip_vertical)
+{
+    FIXME("iface %p, processor %p, stream_index %u, enable %#x, flip_horizontal %#x, flip_vertical %#x stub!\n",
+            iface, processor, stream_index, enable, flip_horizontal, flip_vertical);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorGetStreamColorSpace1(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, UINT stream_index, DXGI_COLOR_SPACE_TYPE *colour_space)
+{
+    FIXME("iface %p, processor %p, stream_index %u, colour_space %p stub!\n",
+            iface, processor, stream_index, colour_space);
+}
+
+static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorGetStreamMirror(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, UINT stream_index, BOOL *enable, BOOL *flip_horizontal, BOOL *flip_vertical)
+{
+    FIXME("iface %p, processor %p, stream_index %u, enable %p, flip_horizontal %p, flip_vertical %p stub!\n",
+            iface, processor, stream_index, enable, flip_horizontal, flip_vertical);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_video_context_VideoProcessorGetBehaviorHints(ID3D11VideoContext1 *iface,
+        ID3D11VideoProcessor *processor, UINT output_width, UINT output_height, DXGI_FORMAT output_format,
+        UINT stream_count, const D3D11_VIDEO_PROCESSOR_STREAM_BEHAVIOR_HINT *streams, UINT *behaviour_hints)
+{
+    FIXME("iface %p, processor %p, output_width %u, output_height %u, output_format %#x, stream_count %u, streams %p, "
+            "behaviour_hints %p stub!\n", iface, processor, output_width, output_height, output_format, stream_count,
+            streams, behaviour_hints);
+    return E_NOTIMPL;
+}
+
+/* The table of ID3D11VideoContext1, which begins with the one of ID3D11VideoContext. */
+static const struct
+{
+    ID3D11VideoContextVtbl base;
+    void *video_context1[14];
+}
+d3d11_video_context_vtbl =
+{
+    {
     d3d11_video_context_QueryInterface,
     d3d11_video_context_AddRef,
     d3d11_video_context_Release,
@@ -3873,6 +3983,23 @@ static const ID3D11VideoContextVtbl d3d11_video_context_vtbl =
     d3d11_video_context_ConfigureAuthenticatedChannel,
     d3d11_video_context_VideoProcessorSetStreamRotation,
     d3d11_video_context_VideoProcessorGetStreamRotation,
+    },
+    { /* ID3D11VideoContext1 methods */
+        (void *)d3d11_video_context_SubmitDecoderBuffers1,
+        (void *)d3d11_video_context_GetDataForNewHardwareKey,
+        (void *)d3d11_video_context_CheckCryptoSessionStatus,
+        (void *)d3d11_video_context_DecoderEnableDownsampling,
+        (void *)d3d11_video_context_DecoderUpdateDownsampling,
+        (void *)d3d11_video_context_VideoProcessorSetOutputColorSpace1,
+        (void *)d3d11_video_context_VideoProcessorSetOutputShaderUsage,
+        (void *)d3d11_video_context_VideoProcessorGetOutputColorSpace1,
+        (void *)d3d11_video_context_VideoProcessorGetOutputShaderUsage,
+        (void *)d3d11_video_context_VideoProcessorSetStreamColorSpace1,
+        (void *)d3d11_video_context_VideoProcessorSetStreamMirror,
+        (void *)d3d11_video_context_VideoProcessorGetStreamColorSpace1,
+        (void *)d3d11_video_context_VideoProcessorGetStreamMirror,
+        (void *)d3d11_video_context_VideoProcessorGetBehaviorHints,
+    },
 };
 
 /* ID3D11Multithread methods */
@@ -4029,7 +4156,7 @@ static void d3d11_device_context_init(struct d3d11_device_context *context, stru
 {
     context->ID3D11DeviceContext4_iface.lpVtbl = &d3d11_device_context_vtbl;
     context->ID3D11Multithread_iface.lpVtbl = &d3d11_multithread_vtbl;
-    context->ID3D11VideoContext_iface.lpVtbl = &d3d11_video_context_vtbl;
+    context->ID3D11VideoContext_iface.lpVtbl = &d3d11_video_context_vtbl.base;
     context->ID3DUserDefinedAnnotation_iface.lpVtbl = &d3d11_user_defined_annotation_vtbl;
     context->refcount = 1;
     context->type = type;

@@ -18,6 +18,7 @@
  */
 
 #include "dxgi_private.h"
+#include "d3d11.h"
 
 #define VKD3D_NO_VULKAN_H
 #define VKD3D_NO_WIN32_TYPES
@@ -263,6 +264,14 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
         }
         IWineDXGIFactory_Release(swapchain->factory);
         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
+        if (swapchain->composition_staging) ID3D11Texture2D_Release(swapchain->composition_staging);
+        free(swapchain->composition_shadow);
+        if (swapchain->composition_window)
+        {
+            /* Only the thread that made the window can destroy it; otherwise ask it to. */
+            if (!DestroyWindow(swapchain->composition_window))
+                PostMessageW(swapchain->composition_window, WM_CLOSE, 0, 0);
+        }
         IWineDXGIDevice_Release(device);
     }
 
@@ -741,6 +750,229 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetCoreWindow(IDXGISwapChain4 *
     return DXGI_ERROR_INVALID_CALL;
 }
 
+/* What a swapchain for composition shows (see dlls/dcomp) is put into the window of the target of DirectComposition when it
+ * presents, at the place of the visual: the back buffer that is about to be presented is copied out and drawn with GDI. The
+ * window of the target can be one of another process' window, which win32u shows as a layer of the top-level window. */
+/* Copy a rectangle of the mapped back buffer into the shadow frame. */
+static void composition_copy_rect(const struct d3d11_swapchain *swapchain, const BYTE *src, UINT pitch, const RECT *r, BOOL swap_rb)
+{
+    UINT stride = swapchain->composition_shadow_width * 4, y, x;
+
+    for (y = r->top; y < (UINT)r->bottom; ++y)
+    {
+        const BYTE *from = src + y * pitch + r->left * 4;
+        BYTE *to = swapchain->composition_shadow + y * stride + r->left * 4;
+
+        if (!swap_rb) memcpy(to, from, (r->right - r->left) * 4);
+        else
+            for (x = 0; x < (UINT)(r->right - r->left); ++x)
+            {
+                to[4 * x] = from[4 * x + 2];
+                to[4 * x + 1] = from[4 * x + 1];
+                to[4 * x + 2] = from[4 * x];
+                to[4 * x + 3] = from[4 * x + 3];
+            }
+    }
+}
+
+/* Scroll a rectangle of the shadow frame; returns the rectangle it moved to. */
+static BOOL composition_scroll(const struct d3d11_swapchain *swapchain, const RECT *scroll, const POINT *offset, RECT *moved)
+{
+    UINT width = swapchain->composition_shadow_width, height = swapchain->composition_shadow_height, stride = width * 4;
+    RECT src, dst;
+    int y, first, last, step, cols;
+
+    src = *scroll;
+    if (src.left < 0) src.left = 0;
+    if (src.top < 0) src.top = 0;
+    if (src.right > (LONG)width) src.right = width;
+    if (src.bottom > (LONG)height) src.bottom = height;
+    if (src.right <= src.left || src.bottom <= src.top) return FALSE;
+
+    dst = src;
+    OffsetRect(&dst, offset->x, offset->y);
+    if (dst.left < 0) dst.left = 0;
+    if (dst.top < 0) dst.top = 0;
+    if (dst.right > (LONG)width) dst.right = width;
+    if (dst.bottom > (LONG)height) dst.bottom = height;
+    if (dst.right <= dst.left || dst.bottom <= dst.top) return FALSE;
+
+    cols = dst.right - dst.left;
+    /* rows are moved in the order that does not overwrite the rows still to be read */
+    if (offset->y > 0) { first = dst.bottom - 1; last = dst.top - 1; step = -1; }
+    else { first = dst.top; last = dst.bottom; step = 1; }
+    for (y = first; y != last; y += step)
+        memmove(swapchain->composition_shadow + y * stride + dst.left * 4,
+                swapchain->composition_shadow + (y - offset->y) * stride + (dst.left - offset->x) * 4, cols * 4);
+    *moved = dst;
+    return TRUE;
+}
+
+static void d3d11_swapchain_blit_composition(struct d3d11_swapchain *swapchain, const DXGI_PRESENT_PARAMETERS *params)
+{
+    ID3D11Texture2D *back = NULL, *staging = swapchain->composition_staging;
+    ID3D11DeviceContext *context;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_TEXTURE2D_DESC desc, staging_desc;
+    ID3D11Device *device;
+    BITMAPINFO bmi = {{sizeof(BITMAPINFOHEADER)}};
+    RECT full, moved, *list = NULL, *draw = NULL;
+    const RECT *rects;
+    BOOL partial = FALSE, staging_new = FALSE, have_move = FALSE;
+    UINT count, ndraw = 0, n, i;
+    HWND target;
+    HDC dc;
+    int x, y;
+
+    if (!(target = GetPropW(swapchain->composition_window, L"WineDCompTarget")) || !IsWindow(target)) return;
+    x = (INT_PTR)GetPropW(swapchain->composition_window, L"WineDCompX");
+    y = (INT_PTR)GetPropW(swapchain->composition_window, L"WineDCompY");
+
+    if (FAILED(IDXGISwapChain4_GetBuffer(&swapchain->IDXGISwapChain4_iface, 0, &IID_ID3D11Texture2D, (void **)&back)))
+        return;
+    ID3D11Texture2D_GetDesc(back, &desc);
+    if (desc.SampleDesc.Count > 1 || (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && desc.Format != DXGI_FORMAT_B8G8R8X8_UNORM
+            && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM))
+    {
+        WARN("Format %#x with %u samples is not copied to the window.\n", desc.Format, desc.SampleDesc.Count);
+        ID3D11Texture2D_Release(back);
+        return;
+    }
+
+    ID3D11Texture2D_GetDevice(back, &device);
+    if (staging)
+    {
+        ID3D11Texture2D_GetDesc(staging, &staging_desc);
+        if (staging_desc.Width != desc.Width || staging_desc.Height != desc.Height || staging_desc.Format != desc.Format)
+        {
+            ID3D11Texture2D_Release(staging);
+            staging = NULL;
+        }
+    }
+    if (!staging)
+    {
+        staging_desc = desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(device, &staging_desc, NULL, &staging))) staging = NULL;
+        staging_new = TRUE;
+    }
+    swapchain->composition_staging = staging;
+
+    /* the shadow frame (what the window shows), for the first frame and when the size changes */
+    if (!swapchain->composition_shadow || swapchain->composition_shadow_width != desc.Width
+            || swapchain->composition_shadow_height != desc.Height)
+    {
+        free(swapchain->composition_shadow);
+        swapchain->composition_shadow = calloc(desc.Height, desc.Width * 4);
+        swapchain->composition_shadow_width = desc.Width;
+        swapchain->composition_shadow_height = desc.Height;
+        staging_new = TRUE;
+    }
+
+    /* Present1() can say what changed since the last frame (Chromium does), and what moved: the back buffer is not the last
+     * frame (the buffers take turns), so the frame is built in the shadow: the moved part first, then the changed parts. */
+    SetRect(&full, 0, 0, desc.Width, desc.Height);
+    rects = &full;
+    count = 1;
+    if (swapchain->composition_shadow && swapchain->composition_have_frame && !staging_new
+            && swapchain->composition_last_target == target
+            && swapchain->composition_last_x == x && swapchain->composition_last_y == y
+            && swapchain->composition_last_width == desc.Width && swapchain->composition_last_height == desc.Height
+            && params && params->DirtyRectsCount && params->pDirtyRects
+            && (list = malloc(params->DirtyRectsCount * sizeof(*list))))
+    {
+        for (i = 0, n = 0; i < params->DirtyRectsCount; ++i)
+        {
+            RECT r = params->pDirtyRects[i];
+
+            if (r.left < 0) r.left = 0;
+            if (r.top < 0) r.top = 0;
+            if (r.right > (LONG)desc.Width) r.right = desc.Width;
+            if (r.bottom > (LONG)desc.Height) r.bottom = desc.Height;
+            if (r.right > r.left && r.bottom > r.top) list[n++] = r;
+        }
+        rects = list;
+        count = n;
+        partial = TRUE;
+    }
+
+    if (staging && swapchain->composition_shadow && (count || (partial && params->pScrollRect)))
+    {
+        ID3D11Device_GetImmediateContext(device, &context);
+        if (partial)
+        {
+            for (i = 0; i < count; ++i)
+            {
+                D3D11_BOX box = {rects[i].left, rects[i].top, 0, rects[i].right, rects[i].bottom, 1};
+
+                ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)staging, 0, box.left, box.top, 0,
+                        (ID3D11Resource *)back, 0, &box);
+            }
+        }
+        else ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging, (ID3D11Resource *)back);
+
+        if (SUCCEEDED(ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped)))
+        {
+            BOOL swap_rb = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
+
+            if (partial && params->pScrollRect && params->pScrollOffset)
+                have_move = composition_scroll(swapchain, params->pScrollRect, params->pScrollOffset, &moved);
+            for (i = 0; i < count; ++i) composition_copy_rect(swapchain, mapped.pData, mapped.RowPitch, &rects[i], swap_rb);
+
+            /* what is sent to the window: the changed parts and the part that moved */
+            if (partial)
+            {
+                if ((draw = malloc((count + 1) * sizeof(*draw))))
+                {
+                    for (i = 0; i < count; ++i) draw[ndraw++] = rects[i];
+                    if (have_move) draw[ndraw++] = moved;
+                }
+            }
+            else
+            {
+                draw = &full;
+                ndraw = 1;
+            }
+
+            bmi.bmiHeader.biWidth = desc.Width;
+            bmi.bmiHeader.biHeight = -(int)desc.Height;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            if (draw && (dc = GetDC(target)))
+            {
+                for (i = 0; i < ndraw; ++i)
+                {
+                    int w = draw[i].right - draw[i].left, h = draw[i].bottom - draw[i].top;
+
+                    /* The part to draw is described as a bitmap of its own (its rows start at the shadow's row of the
+                     * rectangle, the row length is that of the frame), and drawn from its first row: where a top-down
+                     * bitmap's rows are counted from is not what the part drawn here would assume for a source offset. */
+                    bmi.bmiHeader.biHeight = -h;
+                    StretchDIBits(dc, x + draw[i].left, y + draw[i].top, w, h, draw[i].left, 0, w, h,
+                            swapchain->composition_shadow + (SIZE_T)draw[i].top * desc.Width * 4, &bmi, DIB_RGB_COLORS, SRCCOPY);
+                }
+                ReleaseDC(target, dc);
+                swapchain->composition_have_frame = TRUE;
+                swapchain->composition_last_target = target;
+                swapchain->composition_last_x = x;
+                swapchain->composition_last_y = y;
+                swapchain->composition_last_width = desc.Width;
+                swapchain->composition_last_height = desc.Height;
+            }
+            if (partial) free(draw);
+            ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
+        }
+        ID3D11DeviceContext_Release(context);
+    }
+    free(list);
+    ID3D11Device_Release(device);
+    ID3D11Texture2D_Release(back);
+}
+
 static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface,
         UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS *present_parameters)
 {
@@ -749,8 +981,11 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface
     TRACE("iface %p, sync_interval %u, flags %#x, present_parameters %p.\n",
             iface, sync_interval, flags, present_parameters);
 
-    if (present_parameters)
+    if (present_parameters && !swapchain->composition_window)
         FIXME("Ignored present parameters %p.\n", present_parameters);
+
+    if (swapchain->composition_window)
+        d3d11_swapchain_blit_composition(swapchain, present_parameters);
 
     return d3d11_swapchain_present(swapchain, sync_interval, flags);
 }
@@ -970,6 +1205,13 @@ static const struct IDXGISwapChain4Vtbl d3d11_swapchain_vtbl =
     /* IDXGISwapChain4 methods */
     d3d11_swapchain_SetHDRMetaData,
 };
+
+void d3d11_swapchain_set_composition_window(IDXGISwapChain1 *iface, HWND window)
+{
+    /* The swapchain of a Direct3D 12 device keeps its window as it is. */
+    if (((IDXGISwapChain4 *)iface)->lpVtbl != &d3d11_swapchain_vtbl) return;
+    d3d11_swapchain_from_IDXGISwapChain4((IDXGISwapChain4 *)iface)->composition_window = window;
+}
 
 static void STDMETHODCALLTYPE d3d11_swapchain_wined3d_object_released(void *parent)
 {

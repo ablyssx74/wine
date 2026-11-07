@@ -387,13 +387,59 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
     FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
 }
 
+/* A swapchain for composition has no window of the application to present to. It gets a window of its own, which DirectComposition
+ * (dlls/dcomp) puts into the window of its target, at the place of the visual that shows the swapchain, when the visual tree is
+ * committed. Until then the window is hidden. */
+static const WCHAR composition_class_name[] = L"WineDXGIComposition";
+
+static HWND create_composition_window(UINT width, UINT height)
+{
+    WNDCLASSW wc = {0};
+
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = composition_class_name;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return NULL;
+
+    return CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, composition_class_name, NULL, WS_POPUP | WS_CLIPSIBLINGS,
+            0, 0, max(width, 1), max(height, 1), NULL, NULL, wc.hInstance, NULL);
+}
+
 static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
 {
-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
-            iface, device, desc, output, swapchain);
+    DXGI_SWAP_CHAIN_DESC1 window_desc;
+    HWND window;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n", iface, device, desc, output, swapchain);
+
+    if (!device || !desc || !swapchain)
+    {
+        WARN("Invalid pointer.\n");
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (!(window = create_composition_window(desc->Width, desc->Height)))
+    {
+        ERR("Failed to create a window for the swapchain, error %lu.\n", GetLastError());
+        return E_FAIL;
+    }
+
+    /* Presented through a window, so the swap chain is one of a window (the alpha mode and the scaling are not applied). */
+    window_desc = *desc;
+    window_desc.Scaling = DXGI_SCALING_STRETCH;
+    window_desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+
+    if (FAILED(hr = IWineDXGIFactory_CreateSwapChainForHwnd(iface, device, window, &window_desc, NULL, output, swapchain)))
+    {
+        DestroyWindow(window);
+        return hr;
+    }
+
+    d3d11_swapchain_set_composition_window(*swapchain, window);
+    return S_OK;
 }
 
 static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)

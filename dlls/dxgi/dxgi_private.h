@@ -186,7 +186,19 @@ struct d3d11_swapchain
     IDXGIOutput *target;
     LONG present_count;
     LONG in_set_fullscreen_state;
+    HWND composition_window;
+    struct ID3D11Texture2D *composition_staging;
+    /* what the last copy to the target window covered, to know when a partial (dirty rectangle) copy is enough */
+    HWND composition_last_target;
+    int composition_last_x, composition_last_y;
+    UINT composition_last_width, composition_last_height;
+    BOOL composition_have_frame;
+    /* the whole last frame, 32 bits and from the top: what a frame that only says what changed (and what scrolled) is added to */
+    BYTE *composition_shadow;
+    UINT composition_shadow_width, composition_shadow_height;
 };
+
+void d3d11_swapchain_set_composition_window(IDXGISwapChain1 *swapchain, HWND window);
 
 HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
         struct wined3d_swapchain_desc *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc);
