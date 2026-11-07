@@ -4403,6 +4403,46 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                 ret = STATUS_SUCCESS;
         }
     }
+#ifdef __HAIKU__
+    if (ret == STATUS_ACCESS_VIOLATION && !(vprot & VPROT_GUARD))
+    {
+        /* When the server writes into this process' memory (WriteProcessMemory, which the Firefox sandbox launcher uses on its
+         * new processes), Haiku's kernel makes a read-only area of the program writable for the write and then gives the whole
+         * area the protection it reported for it, which is none when the area has per-page protections: all the pages of the
+         * area, for example the code of a program, lose their access. The protection kept for the page tells what it should
+         * be, so apply it again to the pages of the view, and let the program go on. A page that faults again and again is
+         * a real fault. */
+        static struct { void *base; int count; } repaired[32];
+        static unsigned int next_slot;
+        int prot = get_unix_prot( vprot ), need, i;
+        struct file_view *view;
+
+        if (err == EXCEPTION_EXECUTE_FAULT) need = PROT_EXEC;
+        else if (err == EXCEPTION_WRITE_FAULT) need = PROT_WRITE;
+        else need = PROT_READ;
+
+        /* Only the image of a program is repaired (that is what the writes of the sandbox launcher damage), and only a few
+         * times for each image: a fault that goes on is a real one. Other memory is left alone. */
+        if ((prot & need) && (view = find_view( page, 0 )) && (view->protect & SEC_IMAGE) && !(view->protect & VPROT_SYSTEM))
+        {
+            for (i = 0; i < ARRAY_SIZE(repaired); i++) if (repaired[i].base == view->base) break;
+            if (i == ARRAY_SIZE(repaired))
+            {
+                i = next_slot++ % ARRAY_SIZE(repaired);
+                repaired[i].base = view->base;
+                repaired[i].count = 0;
+            }
+            if (repaired[i].count < 16)
+            {
+                repaired[i].count++;
+                WARN( "haiku repair of image %p size %lx (%d) at page %p err %u\n", view->base, (unsigned long)view->size,
+                      repaired[i].count, page, (unsigned)err );
+                mprotect_range( view->base, view->size, 0, 0 );
+                ret = STATUS_SUCCESS;
+            }
+        }
+    }
+#endif
     mutex_unlock( &virtual_mutex );
     rec->ExceptionCode = ret;
     return ret;
