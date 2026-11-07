@@ -102,6 +102,7 @@ load_fs_selector(void*, int)
 int32 api_version = B_CUR_DRIVER_API_VERSION;
 
 static bool sPatched = false;
+static const int32 kLoggedCompatSignals = 8;
 static int32 sCalls = 0, sCompatFrames = 0;		// (changed only with atomic_add())
 static area_id sPatchArea = -1;
 static volatile unsigned char* sPatchAddress = NULL;		// where the call instruction's operand is, through our own mapping
@@ -165,8 +166,10 @@ hook_setup_signal_frame(void* thread, void* action, void* frameData)
 	iframe* frame = sGetCurrentIframe != NULL ? sGetCurrentIframe() : NULL;
 	const bool compat = frame != NULL && frame->cs == USER32_CODE_SELECTOR;
 
+	// (Logging every signal made each exception in 32-bit code cost milliseconds: dprintf goes to the syslog and the serial
+	// line. Only the first few are logged, enough to see that the hook works.)
 	const int32 number = atomic_add(&sCalls, 1);
-	if (frame != NULL && (compat || number < 12)) {
+	if (frame != NULL && (compat ? sCompatFrames < kLoggedCompatSignals : number < 12)) {
 		dprintf("wine_compat: signal %d: frame %p cs=0x%lx ss=0x%lx ip=0x%lx sp=0x%lx vector=%lu error=0x%lx\n", (int)number,
 				(void*)frame, (unsigned long)frame->cs, (unsigned long)frame->user_ss, (unsigned long)frame->ip,
 				(unsigned long)frame->user_sp, (unsigned long)frame->vector, (unsigned long)frame->error_code);
@@ -180,8 +183,9 @@ hook_setup_signal_frame(void* thread, void* action, void* frameData)
 		// keeps the 32-bit CS the frame had, and restoring that context returns to 32-bit mode)
 		frame->cs = USER_CODE_SELECTOR;
 		frame->user_ss = USER_DATA_SELECTOR;
-		dprintf("wine_compat:   set up (status %d): the handler wrapper will run at ip=0x%lx sp=0x%lx in cs=0x%lx\n",
-				(int)status, (unsigned long)frame->ip, (unsigned long)frame->user_sp, (unsigned long)frame->cs);
+		if (sCompatFrames <= kLoggedCompatSignals)
+			dprintf("wine_compat:   set up (status %d): the handler wrapper will run at ip=0x%lx sp=0x%lx in cs=0x%lx\n",
+					(int)status, (unsigned long)frame->ip, (unsigned long)frame->user_sp, (unsigned long)frame->cs);
 	} else if (compat) {
 		dprintf("wine_compat:   arch_setup_signal_frame failed: %d\n", (int)status);
 	}
