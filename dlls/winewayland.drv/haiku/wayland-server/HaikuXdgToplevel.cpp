@@ -35,6 +35,7 @@ public:
 
 	bool QuitRequested() final;
 	void WindowActivated(bool isActive) final;
+	void Minimize(bool minimize) override;
 	void WorkspacesChanged(uint32 oldWorkspace, uint32 newWorkspace) final;
 	void FrameResized(float newWidth, float newHeight) final;
 	void DispatchMessage(BMessage *msg, BHandler *target) final;
@@ -60,12 +61,31 @@ void WaylandWindow::WindowActivated(bool isActive)
 	WaylandEnv vlEnv(this);
 	if (isActive != fToplevel->fState.activated) {
 		fToplevel->fState.activated = !fToplevel->fState.activated;
-		fToplevel->DoSendConfigure();
-		fToplevel->XdgSurface()->SendConfigure(fToplevel->XdgSurface()->NextSerial());
+		// A configure for a minimized window tells the client that the compositor restored it (Wine then runs its restore
+		// sequence), and a window that is being minimized is deactivated first: leave it to Minimize(false).
+		if (!IsMinimized()) {
+			fToplevel->DoSendConfigure();
+			fToplevel->XdgSurface()->SendConfigure(fToplevel->XdgSurface()->NextSerial());
+		}
 	}
 
 	if (isActive)
 		UpdateRefreshRate();
+}
+
+void WaylandWindow::Minimize(bool minimize)
+{
+	WaylandEnv vlEnv(this);
+	bool wasMinimized = IsMinimized();
+
+	BWindow::Minimize(minimize);
+
+	// The compositor restored the window (the user chose it in the Deskbar): tell the client with a configure, which is how a
+	// Wayland client learns that it is no longer minimized.
+	if (!minimize && wasMinimized && fToplevel != NULL) {
+		fToplevel->DoSendConfigure();
+		fToplevel->XdgSurface()->SendConfigure(fToplevel->XdgSurface()->NextSerial());
+	}
 }
 
 void WaylandWindow::WorkspacesChanged(uint32 oldWorkspace, uint32 newWorkspace)
@@ -223,10 +243,37 @@ void HaikuXdgToplevel::HandleSetMinSize(int32_t width, int32_t height)
 
 void HaikuXdgToplevel::HandleSetMaximized()
 {
+	if (fState.maximized) return;
+	fState.maximized = true;
+	fSizeChanged = true;
+	if (!fState.fullscreen) fSavedPos = fWindow->Frame();	// (not the frame a fullscreen window took over)
+	BRect screenFrame = BScreen(fWindow).Frame();
+	fWindow->MoveTo(screenFrame.LeftTop());
+	fWindow->ResizeTo(screenFrame.Width(), screenFrame.Height());
+	fWidth = (int32_t)screenFrame.Width() + 1;
+	fHeight = (int32_t)screenFrame.Height() + 1;
+	DoSendConfigure();
+	XdgSurface()->SendConfigure(XdgSurface()->NextSerial());
 }
 
 void HaikuXdgToplevel::HandleUnsetMaximized()
 {
+	if (!fState.maximized) return;
+	fState.maximized = false;
+	if (fState.fullscreen) return;	// the window stays as large as the fullscreen state wants
+	fSizeChanged = true;
+	if (fSavedPos.IsValid()) {
+		fWindow->MoveTo(fSavedPos.LeftTop());
+		fWindow->ResizeTo(fSavedPos.Width(), fSavedPos.Height());
+		fWidth = (int32_t)fSavedPos.Width() + 1;
+		fHeight = (int32_t)fSavedPos.Height() + 1;
+	} else {
+		// the window was maximized before it was ever shown: no size to go back to, the client chooses its own
+		fWidth = 0;
+		fHeight = 0;
+	}
+	DoSendConfigure();
+	XdgSurface()->SendConfigure(XdgSurface()->NextSerial());
 }
 
 void HaikuXdgToplevel::HandleSetFullscreen(struct wl_resource *output)
@@ -259,6 +306,11 @@ void HaikuXdgToplevel::HandleUnsetFullscreen()
 
 void HaikuXdgToplevel::HandleSetMinimized()
 {
+	// BWindow::Minimize() has to run in the window's own thread (called from here it never returned and froze the compositor
+	// thread): ask the window to do it, the way the system does when the user minimizes it.
+	BMessage msg(B_MINIMIZE);
+	msg.AddBool("minimize", true);
+	fWindow->PostMessage(&msg);
 }
 
 
