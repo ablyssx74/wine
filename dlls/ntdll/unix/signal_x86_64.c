@@ -1018,6 +1018,10 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
 #else
     context->SegCs  = CS_sig(sigcontext);
     context->SegFs  = 0;
+    /* the flags are not written back (see set_sigcontext), but wow64cpu pops them from the 32-bit context into an iretq: left
+     * as the stack happened to be they sometimes had NT set, the iretq faulted and each fault nested one more exception on the
+     * 64-bit stack until the thread died of "stack overflow" (an exception in 32-bit code every few thousand times) */
+    context->EFlags = EFL_sig(sigcontext);
 #endif
     context->SegDs  = ds64_sel;
     context->SegEs  = ds64_sel;
