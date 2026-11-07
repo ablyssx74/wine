@@ -1562,3 +1562,26 @@ done:
     }
     return set_ntstatus( status );
 }
+
+
+/***********************************************************************
+ *           AppContainerRegisterSid   (kernelbase.@)
+ *
+ * Firefox's sandbox looks it up by name and aborts when it is missing; the mapping of an app container's SID to its name
+ * is not kept.
+ */
+BOOL WINAPI AppContainerRegisterSid( PSID sid, const WCHAR *moniker, const WCHAR *display_name )
+{
+    FIXME( "(%p, %s, %s): stub\n", sid, debugstr_w(moniker), debugstr_w(display_name) );
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           AppContainerUnregisterSid   (kernelbase.@)
+ */
+BOOL WINAPI AppContainerUnregisterSid( PSID sid )
+{
+    FIXME( "(%p): stub\n", sid );
+    return TRUE;
+}

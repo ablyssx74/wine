@@ -1847,6 +1847,13 @@ static inline DWORD validate_proc_thread_attribute( DWORD_PTR attr, SIZE_T size 
     case PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY:
         if (size != sizeof(DWORD)) return ERROR_BAD_LENGTH;
         break;
+    case PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES:
+    case PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY:
+    case PROC_THREAD_ATTRIBUTE_WIN32K_FILTER:
+    case PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER:
+        /* sandbox settings for the new process (app container, win32k and component filters): accepted, and not applied */
+        WARN( "Ignoring attribute %Iu\n", attr & PROC_THREAD_ATTRIBUTE_NUMBER );
+        break;
     default:
         FIXME( "Unhandled attribute %Iu\n", attr & PROC_THREAD_ATTRIBUTE_NUMBER );
         return ERROR_NOT_SUPPORTED;

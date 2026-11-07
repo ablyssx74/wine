@@ -40,8 +40,8 @@
 # @ stub AppContainerFreeMemory
 # @ stub AppContainerLookupDisplayNameMrtReference
 # @ stub AppContainerLookupMoniker
-# @ stub AppContainerRegisterSid
-# @ stub AppContainerUnregisterSid
+@ stdcall AppContainerRegisterSid(ptr wstr wstr)
+@ stdcall AppContainerUnregisterSid(ptr)
 # @ stub AppPolicyGetClrCompat
 # @ stub AppPolicyGetCreateFileAccess
 # @ stub AppPolicyGetLifecycleManagement
