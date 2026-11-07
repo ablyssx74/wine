@@ -76,6 +76,197 @@ static struct cursoricon_object *get_icon_ptr( HICON handle )
     return obj;
 }
 
+static struct cursoricon_object *get_icon_frame_ptr( HICON handle, UINT step );
+
+/* A cursor set by a process that does not own the window under the pointer (a web view's browser process, whose window is
+ * a child of the host's window) is displayed by the driver of the window's own process, which cannot read it: icons live in
+ * the memory of the process that created them. So a process that sets a cursor publishes its image in a named section,
+ * and NtUserGetIconInfo reads it from there for a cursor of another process. */
+#define REMOTE_CURSOR_MAGIC 0x57435552 /* 'WCUR' */
+
+struct remote_cursor_header
+{
+    UINT magic;
+    UINT is_icon;
+    INT  hotspot_x, hotspot_y;
+    UINT color_width, color_height, color_bpp, color_bytes;
+    UINT mask_width, mask_height, mask_bpp, mask_bytes;
+};
+
+struct remote_cursor
+{
+    struct list entry;
+    HICON       handle;
+    HANDLE      section;
+};
+
+static struct list remote_cursors = LIST_INIT( remote_cursors );
+static pthread_mutex_t remote_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void remote_cursor_name( WCHAR *buffer, HICON handle )
+{
+    static const char prefix[] = "\\BaseNamedObjects\\WineRemoteCursor_";
+    char name[96];
+    unsigned int i;
+
+    snprintf( name, sizeof(name), "%s%08x", prefix, HandleToUlong( handle ));
+    for (i = 0; name[i]; i++) buffer[i] = name[i];
+    buffer[i] = 0;
+}
+
+static UINT get_bitmap_info( HBITMAP bitmap, BITMAP *bmp )
+{
+    if (!bitmap || !NtGdiExtGetObjectW( bitmap, sizeof(*bmp), bmp )) return 0;
+    return bmp->bmWidthBytes * bmp->bmHeight;
+}
+
+static void publish_remote_cursor( HICON handle )
+{
+    struct cursoricon_object *obj, *frame;
+    struct remote_cursor_header *header = NULL;
+    struct remote_cursor *entry;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    LARGE_INTEGER size;
+    SIZE_T view_size;
+    WCHAR name_buf[96];
+    BITMAP color_bmp = {0}, mask_bmp = {0};
+    UINT color_bytes, mask_bytes;
+    HANDLE section;
+
+    pthread_mutex_lock( &remote_cursor_lock );
+    LIST_FOR_EACH_ENTRY( entry, &remote_cursors, struct remote_cursor, entry )
+    {
+        if (entry->handle == handle)
+        {
+            pthread_mutex_unlock( &remote_cursor_lock );
+            return;
+        }
+    }
+    pthread_mutex_unlock( &remote_cursor_lock );
+
+    if (!(obj = get_icon_ptr( handle ))) return;  /* not ours */
+    if (!(frame = get_icon_frame_ptr( handle, 0 )))
+    {
+        release_user_handle_ptr( obj );
+        return;
+    }
+
+    color_bytes = get_bitmap_info( frame->frame.color, &color_bmp );
+    mask_bytes = get_bitmap_info( frame->frame.mask, &mask_bmp );
+    if (!mask_bytes)
+    {
+        release_user_handle_ptr( frame );
+        release_user_handle_ptr( obj );
+        return;
+    }
+
+    remote_cursor_name( name_buf, handle );
+    RtlInitUnicodeString( &name, name_buf );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    size.QuadPart = sizeof(*header) + color_bytes + mask_bytes;
+    view_size = size.QuadPart;
+    if (NtCreateSection( &section, SECTION_ALL_ACCESS, &attr, &size, PAGE_READWRITE, SEC_COMMIT, 0 ) ||
+        NtMapViewOfSection( section, GetCurrentProcess(), (void **)&header, 0, 0, NULL, &view_size, ViewShare, 0,
+                            PAGE_READWRITE ))
+    {
+        WARN( "Failed to publish cursor %p\n", handle );
+        if (section) NtClose( section );
+        release_user_handle_ptr( frame );
+        release_user_handle_ptr( obj );
+        return;
+    }
+
+    header->is_icon = obj->is_icon;
+    header->hotspot_x = frame->frame.hotspot.x;
+    header->hotspot_y = frame->frame.hotspot.y;
+    header->color_width = color_bmp.bmWidth;
+    header->color_height = color_bmp.bmHeight;
+    header->color_bpp = color_bmp.bmBitsPixel;
+    header->color_bytes = color_bytes;
+    header->mask_width = mask_bmp.bmWidth;
+    header->mask_height = mask_bmp.bmHeight;
+    header->mask_bpp = mask_bmp.bmBitsPixel;
+    header->mask_bytes = mask_bytes;
+    if (color_bytes) NtGdiGetBitmapBits( frame->frame.color, color_bytes, header + 1 );
+    NtGdiGetBitmapBits( frame->frame.mask, mask_bytes, (char *)(header + 1) + color_bytes );
+    header->magic = REMOTE_CURSOR_MAGIC;
+    NtUnmapViewOfSection( GetCurrentProcess(), header );
+    release_user_handle_ptr( frame );
+    release_user_handle_ptr( obj );
+
+    if (!(entry = malloc( sizeof(*entry) )))
+    {
+        NtClose( section );
+        return;
+    }
+    entry->handle = handle;
+    entry->section = section;  /* kept open so that the name stays valid until the cursor is destroyed */
+    pthread_mutex_lock( &remote_cursor_lock );
+    list_add_tail( &remote_cursors, &entry->entry );
+    pthread_mutex_unlock( &remote_cursor_lock );
+    TRACE( "published cursor %p (%ux%u)\n", handle, color_bmp.bmWidth, mask_bmp.bmHeight );
+}
+
+static void unpublish_remote_cursor( HICON handle )
+{
+    struct remote_cursor *entry;
+
+    pthread_mutex_lock( &remote_cursor_lock );
+    LIST_FOR_EACH_ENTRY( entry, &remote_cursors, struct remote_cursor, entry )
+    {
+        if (entry->handle != handle) continue;
+        list_remove( &entry->entry );
+        pthread_mutex_unlock( &remote_cursor_lock );
+        NtClose( entry->section );
+        free( entry );
+        return;
+    }
+    pthread_mutex_unlock( &remote_cursor_lock );
+}
+
+static BOOL get_remote_icon_info( HICON handle, ICONINFO *info )
+{
+    struct remote_cursor_header *header = NULL;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    SIZE_T view_size = 0;
+    WCHAR name_buf[96];
+    HANDLE section;
+    BOOL ret = FALSE;
+
+    remote_cursor_name( name_buf, handle );
+    RtlInitUnicodeString( &name, name_buf );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    if (NtOpenSection( &section, SECTION_MAP_READ, &attr )) return FALSE;
+    if (!NtMapViewOfSection( section, GetCurrentProcess(), (void **)&header, 0, 0, NULL, &view_size, ViewShare, 0,
+                             PAGE_READONLY ))
+    {
+        if (header->magic == REMOTE_CURSOR_MAGIC &&
+            sizeof(*header) + header->color_bytes + header->mask_bytes <= view_size)
+        {
+            const char *bits = (const char *)(header + 1);
+
+            info->fIcon = header->is_icon;
+            info->xHotspot = header->hotspot_x;
+            info->yHotspot = header->hotspot_y;
+            info->hbmColor = header->color_bytes ?
+                NtGdiCreateBitmap( header->color_width, header->color_height, 1, header->color_bpp, bits ) : 0;
+            info->hbmMask = NtGdiCreateBitmap( header->mask_width, header->mask_height, 1, header->mask_bpp,
+                                               bits + header->color_bytes );
+            if (info->hbmMask && (info->hbmColor || !header->color_bytes)) ret = TRUE;
+            else
+            {
+                if (info->hbmMask) NtGdiDeleteObjectApp( info->hbmMask );
+                if (info->hbmColor) NtGdiDeleteObjectApp( info->hbmColor );
+            }
+        }
+        NtUnmapViewOfSection( GetCurrentProcess(), header );
+    }
+    NtClose( section );
+    return ret;
+}
+
 BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
 {
     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
@@ -114,6 +305,9 @@ HCURSOR WINAPI NtUserSetCursor( HCURSOR cursor )
     BOOL ret;
 
     TRACE( "%p\n", cursor );
+
+    /* publish the image first: the owner of the window under the pointer is told as soon as the server has the handle */
+    if (cursor) publish_remote_cursor( cursor );
 
     SERVER_START_REQ( set_cursor )
     {
@@ -194,6 +388,7 @@ static BOOL free_icon_handle( HICON handle )
         UINT i;
 
         assert( !obj->rsrc );  /* shared icons can't be freed */
+        unpublish_remote_cursor( handle );
 
         if (!obj->is_ani)
         {
@@ -489,6 +684,16 @@ BOOL WINAPI NtUserGetIconInfo( HICON icon, ICONINFO *info, UNICODE_STRING *modul
 
     if (!(obj = get_icon_ptr( icon )))
     {
+        if (get_remote_icon_info( icon, info ))
+        {
+            if (module) module->Length = 0;
+            if (res_name)
+            {
+                res_name->Length = 0;
+                res_name->Buffer = NULL;
+            }
+            return TRUE;
+        }
         RtlSetLastWin32Error( ERROR_INVALID_CURSOR_HANDLE );
         return FALSE;
     }

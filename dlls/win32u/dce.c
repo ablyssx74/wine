@@ -613,6 +613,9 @@ void window_surface_unlock( struct window_surface *surface )
     pthread_mutex_unlock( &surface->mutex );
 }
 
+static const struct window_surface_funcs remote_surface_funcs;
+static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits );
+
 void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -639,6 +642,8 @@ void window_surface_flush( struct window_surface *surface )
 
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+
+        if (surface->funcs != &remote_surface_funcs) apply_remote_layers( surface, &dirty, color_info, color_bits );
 
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
@@ -771,6 +776,505 @@ done:
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+
+/***********************************************************************
+ * Window surfaces of windows whose top-level window belongs to another process.
+ *
+ * The surface of a window is kept by the process of its top-level window, and that process is the only one that can show it.
+ * A window that was made by another process (the browser or the GPU process of WebView2 draw into children of the window of the
+ * program that hosts them) gets a surface of its own, kept in a shared section, and the process of the top-level window is
+ * told what changed with an internal message. There the layers of these windows are put over the surface of the top-level
+ * window when it is flushed.
+ */
+
+#define REMOTE_SURFACE_BITS_OFFSET 0x10000
+#define REMOTE_SURFACE_MAX_RECTS 64
+
+struct remote_surface_header
+{
+    LONG width, height;        /* size of the window */
+    LONG origin_x, origin_y;   /* position of the window in the surface of the top-level window */
+    RECT dirty;                /* what was drawn since the process of the top-level window last looked */
+    UINT rect_count;
+    RECT rects[REMOTE_SURFACE_MAX_RECTS];  /* the part of the window that is visible, in the coordinates of the window */
+};
+
+struct remote_surface
+{
+    struct window_surface header;
+    struct list entry;                      /* in remote_surfaces */
+    HWND top;
+    HANDLE section;
+    struct remote_surface_header *shared;
+    UINT instance;
+};
+
+struct remote_layer
+{
+    struct list entry;                      /* in remote_layers */
+    HWND top, hwnd;
+    UINT instance;
+    HANDLE section;
+    struct remote_surface_header *shared;   /* the header of the section */
+    BYTE *bits;                             /* the colours, of 32 bits and from the top */
+    LONG width, height;
+    DWORD order;                            /* when it changed last: the order of layers whose window is not found in the stacking */
+};
+
+static struct list remote_surfaces = LIST_INIT( remote_surfaces );
+static struct list remote_layers = LIST_INIT( remote_layers );
+static pthread_mutex_t remote_lock = PTHREAD_MUTEX_INITIALIZER;
+static UINT remote_instance_counter;
+static DWORD remote_order_counter;
+
+static void remote_section_name( WCHAR *buffer, HWND hwnd, UINT instance )
+{
+    static const char prefix[] = "\\BaseNamedObjects\\WineRemoteSurface_";
+    char name[128];
+    unsigned int i;
+
+    snprintf( name, sizeof(name), "%s%08x_%u", prefix, HandleToUlong( hwnd ), instance );
+    for (i = 0; name[i]; i++) buffer[i] = name[i];
+    buffer[i] = 0;
+}
+
+static void remote_surface_notify( struct remote_surface *surface, BOOL dead )
+{
+    NtUserPostMessage( surface->top, WM_WINE_REMOTE_SURFACE, HandleToUlong( surface->header.hwnd ),
+                       (surface->instance << 1) | dead );
+}
+
+static void remote_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
+{
+}
+
+static BOOL remote_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                                  const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                  const BITMAPINFO *shape_info, const void *shape_bits )
+{
+    struct remote_surface *surface = CONTAINING_RECORD( window_surface, struct remote_surface, header );
+
+    TRACE( "remote surface %p of %p: dirty %s\n", surface, surface->header.hwnd, wine_dbgstr_rect( dirty ) );
+    add_bounds_rect( &surface->shared->dirty, dirty );
+    remote_surface_notify( surface, FALSE );
+    return TRUE;
+}
+
+static void remote_surface_destroy( struct window_surface *window_surface )
+{
+    struct remote_surface *surface = CONTAINING_RECORD( window_surface, struct remote_surface, header );
+
+    remote_surface_notify( surface, TRUE );
+    NtUnmapViewOfSection( GetCurrentProcess(), surface->shared );
+    NtClose( surface->section );
+}
+
+static const struct window_surface_funcs remote_surface_funcs =
+{
+    .size = sizeof(struct remote_surface),
+    .set_clip = remote_surface_set_clip,
+    .flush = remote_surface_flush,
+    .destroy = remote_surface_destroy,
+};
+
+static struct remote_surface *create_remote_surface( HWND hwnd, HWND top, int width, int height )
+{
+    char info_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)info_buf;
+    struct window_surface *window_surface;
+    struct remote_surface *surface;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    LARGE_INTEGER size;
+    SIZE_T view_size = REMOTE_SURFACE_BITS_OFFSET;
+    WCHAR name_buf[128];
+    HANDLE section;
+    HBITMAP bitmap;
+    void *view = NULL;
+    UINT instance;
+    RECT rect;
+
+    pthread_mutex_lock( &remote_lock );
+    instance = ++remote_instance_counter;
+    pthread_mutex_unlock( &remote_lock );
+
+    remote_section_name( name_buf, hwnd, instance );
+    RtlInitUnicodeString( &name, name_buf );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    size.QuadPart = REMOTE_SURFACE_BITS_OFFSET + (LONGLONG)width * height * 4;
+    if (NtCreateSection( &section, SECTION_ALL_ACCESS, &attr, &size, PAGE_READWRITE, SEC_COMMIT, 0 ))
+    {
+        WARN( "Failed to create the section %s for %p\n", debugstr_w( name_buf ), hwnd );
+        return NULL;
+    }
+    if (NtMapViewOfSection( section, GetCurrentProcess(), &view, 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READWRITE ))
+    {
+        NtClose( section );
+        return NULL;
+    }
+
+    memset( info, 0, sizeof(info->bmiHeader) );
+    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth       = width;
+    info->bmiHeader.biHeight      = -height; /* top-down */
+    info->bmiHeader.biPlanes      = 1;
+    info->bmiHeader.biBitCount    = 32;
+    info->bmiHeader.biCompression = BI_RGB;
+    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
+
+    if (!(bitmap = NtGdiCreateDIBSection( 0, section, REMOTE_SURFACE_BITS_OFFSET, info, DIB_RGB_COLORS, 0, 0, 0, NULL )))
+    {
+        NtUnmapViewOfSection( GetCurrentProcess(), view );
+        NtClose( section );
+        return NULL;
+    }
+
+    SetRect( &rect, 0, 0, width, height );
+    if (!(window_surface = window_surface_create( &remote_surface_funcs, hwnd, &rect, info, bitmap )))
+    {
+        NtUnmapViewOfSection( GetCurrentProcess(), view );
+        NtClose( section );
+        return NULL;
+    }
+
+    surface = CONTAINING_RECORD( window_surface, struct remote_surface, header );
+    TRACE( "created remote surface %p for %p in top-level %p, %dx%d, instance %u\n", surface, hwnd, top, width, height, instance );
+    surface->top = top;
+    surface->section = section;
+    surface->shared = view;
+    surface->instance = instance;
+    surface->shared->width = width;
+    surface->shared->height = height;
+    reset_bounds( &surface->shared->dirty );
+    return surface;
+}
+
+/* The surface for a window of another process' top-level window, with the part of it that is visible. */
+/* A window that changes size keeps what it showed (up to the new size): the surface that replaces the old one starts with its
+ * pixels, as the program that draws in the window (Chromium, which sends only the parts that changed) expects. */
+static void copy_remote_surface_bits( struct remote_surface *dst, struct remote_surface *src )
+{
+    char dst_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )], src_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *dst_info = (BITMAPINFO *)dst_buf, *src_info = (BITMAPINFO *)src_buf;
+    void *dst_bits, *src_bits;
+    int dst_stride, src_stride, rows, bytes, y;
+
+    window_surface_lock( &src->header );
+    window_surface_lock( &dst->header );
+    dst_bits = window_surface_get_color( &dst->header, dst_info );
+    src_bits = window_surface_get_color( &src->header, src_info );
+    if (dst_bits && src_bits && dst_info->bmiHeader.biBitCount == 32 && src_info->bmiHeader.biBitCount == 32 &&
+        dst_info->bmiHeader.biHeight < 0 && src_info->bmiHeader.biHeight < 0)
+    {
+        dst_stride = get_dib_stride( dst_info->bmiHeader.biWidth, 32 );
+        src_stride = get_dib_stride( src_info->bmiHeader.biWidth, 32 );
+        rows = min( -dst_info->bmiHeader.biHeight, -src_info->bmiHeader.biHeight );
+        bytes = min( dst_info->bmiHeader.biWidth, src_info->bmiHeader.biWidth ) * 4;
+        for (y = 0; y < rows; y++) memcpy( (BYTE *)dst_bits + y * dst_stride, (BYTE *)src_bits + y * src_stride, bytes );
+    }
+    window_surface_unlock( &dst->header );
+    window_surface_unlock( &src->header );
+}
+
+static struct window_surface *get_remote_surface( HWND hwnd, HWND top, const RECT *win_rect, const RECT *top_rect,
+                                                  const RECT *vis_rects, UINT vis_count )
+{
+    int width = win_rect->right - win_rect->left, height = win_rect->bottom - win_rect->top;
+    struct remote_surface *surface = NULL, *entry, *next, *old = NULL;
+    struct list dead = LIST_INIT( dead );
+    struct remote_surface_header *shared;
+    UINT i, count = min( vis_count, REMOTE_SURFACE_MAX_RECTS );
+    BOOL changed = FALSE, created = FALSE;
+
+    if (width <= 0 || height <= 0) return NULL;
+
+    pthread_mutex_lock( &remote_lock );
+    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &remote_surfaces, struct remote_surface, entry )
+    {
+        if (entry->header.hwnd == hwnd && entry->top == top && entry->shared->width == width &&
+            entry->shared->height == height)
+        {
+            surface = entry;
+        }
+        else if (entry->header.hwnd == hwnd || !is_window( entry->header.hwnd ))
+        {
+            if (entry->header.hwnd == hwnd) old = entry;
+            list_remove( &entry->entry );
+            list_add_tail( &dead, &entry->entry );
+        }
+    }
+    if (!surface && (surface = create_remote_surface( hwnd, top, width, height )))
+    {
+        list_add_tail( &remote_surfaces, &surface->entry );
+        window_surface_add_ref( &surface->header );  /* the list's reference */
+        created = TRUE;
+        changed = TRUE;
+    }
+    pthread_mutex_unlock( &remote_lock );
+    if (created) register_window_surface( NULL, &surface->header );
+    if (created && old) copy_remote_surface_bits( surface, old );
+
+    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &dead, struct remote_surface, entry )
+    {
+        register_window_surface( &entry->header, NULL );
+        window_surface_release( &entry->header );
+    }
+
+    if (!surface) return NULL;
+
+    shared = surface->shared;
+    if (shared->origin_x != win_rect->left - top_rect->left || shared->origin_y != win_rect->top - top_rect->top ||
+        shared->rect_count != count) changed = TRUE;
+    for (i = 0; !changed && i < count; i++)
+    {
+        RECT r = vis_rects[i];
+        OffsetRect( &r, -win_rect->left, -win_rect->top );
+        if (!EqualRect( &r, &shared->rects[i] )) changed = TRUE;
+    }
+    if (changed)
+    {
+        shared->origin_x = win_rect->left - top_rect->left;
+        shared->origin_y = win_rect->top - top_rect->top;
+        shared->rect_count = count;
+        for (i = 0; i < count; i++)
+        {
+            shared->rects[i] = vis_rects[i];
+            OffsetRect( &shared->rects[i], -win_rect->left, -win_rect->top );
+        }
+        remote_surface_notify( surface, FALSE );
+    }
+
+    window_surface_add_ref( &surface->header );
+    return &surface->header;
+}
+
+/* The surfaces of windows of other processes are flushed when a device context is released, as their process may not go idle. */
+static void flush_remote_surfaces(void)
+{
+    struct window_surface *surfaces[16];
+    struct remote_surface *entry;
+    unsigned int i, count = 0;
+
+    if (list_empty( &remote_surfaces )) return;
+    pthread_mutex_lock( &remote_lock );
+    LIST_FOR_EACH_ENTRY( entry, &remote_surfaces, struct remote_surface, entry )
+    {
+        if (count == ARRAY_SIZE(surfaces)) break;
+        window_surface_add_ref( (surfaces[count++] = &entry->header) );
+    }
+    pthread_mutex_unlock( &remote_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        window_surface_flush( surfaces[i] );
+        window_surface_release( surfaces[i] );
+    }
+}
+
+static void remove_remote_layer( struct remote_layer *layer )
+{
+    list_remove( &layer->entry );
+    if (layer->bits) NtUnmapViewOfSection( GetCurrentProcess(), layer->bits );
+    NtUnmapViewOfSection( GetCurrentProcess(), layer->shared );
+    NtClose( layer->section );
+    free( layer );
+}
+
+static void invalidate_remote_layer( HWND top )
+{
+    NtUserRedrawWindow( top, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
+}
+
+static struct remote_layer *open_remote_layer( HWND top, HWND hwnd, UINT instance )
+{
+    struct remote_surface_header *shared = NULL;
+    struct remote_layer *layer;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    SIZE_T view_size = REMOTE_SURFACE_BITS_OFFSET, bits_size;
+    LARGE_INTEGER offset;
+    WCHAR name_buf[128];
+    void *bits = NULL;
+    HANDLE section;
+
+    remote_section_name( name_buf, hwnd, instance );
+    RtlInitUnicodeString( &name, name_buf );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    if (NtOpenSection( &section, SECTION_MAP_READ, &attr )) return NULL;
+    if (NtMapViewOfSection( section, GetCurrentProcess(), (void **)&shared, 0, 0, NULL, &view_size, ViewShare, 0,
+                            PAGE_READONLY ))
+    {
+        NtClose( section );
+        return NULL;
+    }
+
+    bits_size = (SIZE_T)shared->width * shared->height * 4;
+    offset.QuadPart = REMOTE_SURFACE_BITS_OFFSET;
+    if (NtMapViewOfSection( section, GetCurrentProcess(), &bits, 0, 0, &offset, &bits_size, ViewShare, 0, PAGE_READONLY ) ||
+        !(layer = calloc( 1, sizeof(*layer) )))
+    {
+        NtUnmapViewOfSection( GetCurrentProcess(), shared );
+        NtClose( section );
+        return NULL;
+    }
+    layer->top = top;
+    layer->hwnd = hwnd;
+    layer->instance = instance;
+    layer->section = section;
+    layer->shared = shared;
+    layer->bits = bits;
+    layer->width = shared->width;
+    layer->height = shared->height;
+    return layer;
+}
+
+/***********************************************************************
+ *           remote_surface_update
+ *
+ * The window of another process told, with an internal message to its top-level window, that its surface changed.
+ */
+void remote_surface_update( HWND top, HWND hwnd, LPARAM lparam )
+{
+    UINT instance = lparam >> 1;
+    BOOL dead = lparam & 1, invalidate = FALSE;
+
+    TRACE( "top %p, hwnd %p, instance %u, dead %d\n", top, hwnd, instance, dead );
+    struct remote_layer *layer = NULL, *entry;
+    struct window_surface *surface = NULL;
+    RECT rect = {0};
+    WND *win;
+
+    pthread_mutex_lock( &remote_lock );
+    LIST_FOR_EACH_ENTRY( entry, &remote_layers, struct remote_layer, entry )
+        if (entry->hwnd == hwnd) { layer = entry; break; }
+
+    if (layer && (dead || layer->instance != instance))
+    {
+        SetRect( &rect, layer->shared->origin_x, layer->shared->origin_y,
+                 layer->shared->origin_x + layer->width, layer->shared->origin_y + layer->height );
+        remove_remote_layer( layer );
+        layer = NULL;
+        invalidate = dead;
+    }
+    if (!dead)
+    {
+        if (!layer && (layer = open_remote_layer( top, hwnd, instance ))) list_add_tail( &remote_layers, &layer->entry );
+        if (layer)
+        {
+            layer->order = ++remote_order_counter;
+            SetRect( &rect, layer->shared->origin_x, layer->shared->origin_y,
+                     layer->shared->origin_x + layer->width, layer->shared->origin_y + layer->height );
+        }
+    }
+    pthread_mutex_unlock( &remote_lock );
+
+    if (invalidate) invalidate_remote_layer( top );
+    if (!dead && !layer) return;
+
+    if ((win = get_win_ptr( top )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        if ((surface = win->surface)) window_surface_add_ref( surface );
+        release_win_ptr( win );
+    }
+    if (surface && surface != &dummy_surface)
+    {
+        window_surface_lock( surface );
+        add_bounds_rect( &surface->bounds, &rect );
+        window_surface_unlock( surface );
+    }
+    if (surface) window_surface_release( surface );
+}
+
+/* Put the layers of the windows of other processes over the surface of the top-level window, where it is flushed. */
+static const WCHAR dcomp_content_prop[] = { 'W','i','n','e','D','C','o','m','p','C','o','n','t','e','n','t',0 };
+
+/* The windows below hwnd (and hwnd), in the order they are painted: a window first, then its children from the lowest up. */
+static void collect_stacking( HWND hwnd, HWND *list, UINT *count, UINT max, UINT depth )
+{
+    HWND kids[64], child;
+    UINT n = 0;
+
+    if (*count >= max) return;
+    list[(*count)++] = hwnd;
+    if (depth >= 8) return;
+
+    for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child && n < ARRAY_SIZE(kids);
+         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
+        kids[n++] = child;
+
+    while (n) collect_stacking( kids[--n], list, count, max, depth + 1 );
+}
+
+/* Put the layers of the windows of other processes over the surface of the top-level window, where it is flushed. The layers
+ * go on in the order their windows are stacked (the window under first), not in the order they were changed: a window that
+ * paints its background late (after a resize, say) must not end up over the content of the window above it, which only
+ * sends the parts of it that changed. */
+static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits )
+{
+    struct { struct remote_layer *layer; ULONGLONG key; } sorted[64];
+    struct remote_layer *layer;
+    HWND stack[128];
+    UINT stack_count = 0, count = 0, j, k;
+    int stride, height, i;
+    BOOL bottom_up;
+
+    if (list_empty( &remote_layers ) || info->bmiHeader.biBitCount != 32) return;
+    TRACE( "applying layers over %p, dirty %s\n", surface->hwnd, wine_dbgstr_rect( dirty ) );
+    stride = get_dib_stride( info->bmiHeader.biWidth, 32 );
+    height = abs( info->bmiHeader.biHeight );
+    bottom_up = info->bmiHeader.biHeight > 0;
+
+    /* the stacking is read without the lock (it asks the server), and only when it matters */
+    pthread_mutex_lock( &remote_lock );
+    LIST_FOR_EACH_ENTRY( layer, &remote_layers, struct remote_layer, entry ) if (layer->top == surface->hwnd) count++;
+    pthread_mutex_unlock( &remote_lock );
+    if (!count) return;
+    if (count > 1) collect_stacking( surface->hwnd, stack, &stack_count, ARRAY_SIZE(stack), 0 );
+
+    pthread_mutex_lock( &remote_lock );
+    count = 0;
+    LIST_FOR_EACH_ENTRY( layer, &remote_layers, struct remote_layer, entry )
+    {
+        ULONGLONG key;
+
+        if (layer->top != surface->hwnd || count >= ARRAY_SIZE(sorted)) continue;
+        for (j = 0; j < stack_count; j++) if (stack[j] == layer->hwnd) break;
+        /* a window that is not found (gone since, or not below the top-level window) goes over the others, last changed last */
+        key = j < stack_count ? j : (ULONGLONG)stack_count + 1 + layer->order;
+        /* The window a DirectComposition target shows its visuals in: they go over the window (and over the windows in it,
+         * for the target made "topmost", which is what Chromium does), whatever the stacking says. The windows around it
+         * (Chromium's own, which are only there for input and accessibility) have nothing but the white of their class on
+         * them, as there is no bitmap for them on Windows. */
+        if (NtUserGetProp( layer->hwnd, dcomp_content_prop )) key += (ULONGLONG)1 << 32;
+        for (k = count; k > 0 && sorted[k - 1].key > key; k--) sorted[k] = sorted[k - 1];
+        sorted[k].layer = layer;
+        sorted[k].key = key;
+        count++;
+    }
+
+    for (j = 0; j < count; j++)
+    {
+        layer = sorted[j].layer;
+        for (i = 0; i < min( layer->shared->rect_count, REMOTE_SURFACE_MAX_RECTS ); i++)
+        {
+            RECT r = layer->shared->rects[i];
+            int y;
+
+            OffsetRect( &r, layer->shared->origin_x, layer->shared->origin_y );
+            if (!intersect_rect( &r, &r, dirty ) || r.right > info->bmiHeader.biWidth || r.bottom > height) continue;
+            for (y = r.top; y < r.bottom; y++)
+            {
+                int ly = y - layer->shared->origin_y, lx = r.left - layer->shared->origin_x;
+                BYTE *dst = (BYTE *)bits + (bottom_up ? height - 1 - y : y) * stride + r.left * 4;
+
+                if (ly < 0 || ly >= layer->height || lx < 0 || lx + (r.right - r.left) > layer->width) continue;
+                memcpy( dst, layer->bits + (SIZE_T)ly * layer->width * 4 + lx * 4, (r.right - r.left) * 4 );
+            }
+        }
+    }
+    pthread_mutex_unlock( &remote_lock );
+}
+
 /***********************************************************************
  *           dump_rdw_flags
  */
@@ -825,6 +1329,8 @@ static void update_visible_region( struct dce *dce )
     DWORD paint_flags = 0;
     size_t size = 256;
     RECT win_rect, top_rect;
+    RECT vis_rects[REMOTE_SURFACE_MAX_RECTS];
+    UINT vis_count = 0;
     WND *win;
 
     /* don't clip siblings if using parent clip region */
@@ -849,6 +1355,20 @@ static void update_visible_region( struct dce *dce )
                 data->rdh.nCount   = reply_size / sizeof(RECT);
                 data->rdh.nRgnSize = reply_size;
                 vis_rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
+                if (data->rdh.nCount <= REMOTE_SURFACE_MAX_RECTS)
+                {
+                    vis_count = data->rdh.nCount;
+                    memcpy( vis_rects, data->Buffer, vis_count * sizeof(RECT) );
+                }
+                else  /* too many rectangles: their box */
+                {
+                    const RECT *rects = (const RECT *)data->Buffer;
+                    UINT i;
+
+                    vis_count = data->rdh.nCount ? 1 : 0;
+                    if (vis_count) vis_rects[0] = rects[0];
+                    for (i = 1; i < data->rdh.nCount; i++) union_rect( &vis_rects[0], &vis_rects[0], &rects[i] );
+                }
                 top_win     = wine_server_ptr_handle( reply->top_win );
                 win_rect    = wine_server_get_rect( reply->win_rect );
                 top_rect    = wine_server_get_rect( reply->top_rect );
@@ -876,6 +1396,13 @@ static void update_visible_region( struct dce *dce )
             surface = win->surface;
             if (surface) window_surface_add_ref( surface );
             release_win_ptr( win );
+        }
+        else if (win == WND_OTHER_PROCESS && top_win)
+        {
+            /* the top-level window is another process': the window draws into a surface of its own */
+            TRACE( "hwnd %p is in the top-level window %p of another process\n", dce->hwnd, top_win );
+            surface = get_remote_surface( dce->hwnd, top_win, &win_rect, &top_rect, vis_rects, vis_count );
+            if (surface) top_rect = win_rect;
         }
     }
 
@@ -1407,7 +1934,9 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
  */
 INT WINAPI NtUserReleaseDC( HWND hwnd, HDC hdc )
 {
-    return release_dc( hwnd, hdc, FALSE );
+    INT ret = release_dc( hwnd, hdc, FALSE );
+    flush_remote_surfaces();
+    return ret;
 }
 
 /***********************************************************************
