@@ -1958,8 +1958,27 @@ static struct thread *get_foreground_thread( struct desktop *desktop, user_handl
 
 static int is_current_process_foreground( struct desktop *desktop )
 {
-    return !desktop->foreground_pid || desktop->foreground_pid == current->process->id ||
-           desktop->foreground_pid == current->process->parent_id;
+    struct process *fg;
+    int ret, depth;
+
+    if (!desktop->foreground_pid || desktop->foreground_pid == current->process->id ||
+        desktop->foreground_pid == current->process->parent_id) return 1;
+
+    /* a process may also take the foreground back from a process it started, directly or through helpers (a web view's
+     * browser process takes it when its window is created, and its host then calls SetForegroundWindow/MoveFocus) */
+    ret = 0;
+    fg = get_process_from_id( desktop->foreground_pid );
+    for (depth = 0; fg && depth < 8; depth++)
+    {
+        struct process *parent;
+
+        if (fg->parent_id == current->process->id) { ret = 1; break; }
+        parent = get_process_from_id( fg->parent_id );
+        release_object( fg );
+        fg = parent;
+    }
+    if (fg) release_object( fg );
+    return ret;
 }
 
 /* user32 reserves 1 & 2 for winemouse and winekeyboard,
