@@ -2160,6 +2160,38 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
     len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA), FALSE );
     nameA[len] = '\0';
     thr_set_name( unix_tid, nameA );
+#elif defined(__HAIKU__)
+    unsigned int status;
+    char nameA[B_OS_NAME_LENGTH];
+    int unix_pid, unix_tid, len;
+
+    SERVER_START_REQ( get_thread_times )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        status = wine_server_call( req );
+        if (status == STATUS_SUCCESS)
+        {
+            unix_pid = reply->unix_pid;
+            unix_tid = reply->unix_tid;
+        }
+    }
+    SERVER_END_REQ;
+
+    if (status != STATUS_SUCCESS || unix_pid == -1 || unix_tid == -1)
+        return;
+
+    if (unix_pid != getpid())
+    {
+        static int once;
+        if (!once++) FIXME("cross-process native thread naming not supported\n");
+        return;
+    }
+
+    /* the name shows in ps and in ProcessController, which helps to tell the threads of a program apart */
+    len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA) - 1, FALSE );
+    if (len < 0) return;
+    nameA[len] = '\0';
+    rename_thread( unix_tid, nameA );
 #else
     static int once;
     if (!once++) FIXME("not implemented on this platform\n");
