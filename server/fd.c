@@ -595,6 +595,9 @@ static int kqueue_fd = -1;
 
 static inline void init_epoll(void)
 {
+#ifdef __HAIKU__
+    if (getenv( "WINE_HAIKU_NO_KQUEUE" )) return;   /* leave kqueue_fd at -1: the poll() loop is used instead */
+#endif
     kqueue_fd = kqueue();
 }
 
