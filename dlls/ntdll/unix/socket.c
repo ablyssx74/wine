@@ -2559,6 +2559,15 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             }
 
             ret = setsockopt( fd, IPPROTO_IPV6, IPV6_V6ONLY, in_buffer, in_size );
+#ifdef __HAIKU__
+            if (ret && errno == EINVAL)
+            {
+                /* Haiku's IPv6 sockets have no IPV6_V6ONLY option: Chromium and Firefox's network code set it to 0 on every IPv6
+                 * socket they open and give up on the socket when that fails (WSAEINVAL), so pretend it worked */
+                WARN( "ignoring IPV6_V6ONLY, not supported by the host\n" );
+                ret = 0;
+            }
+#endif
             status = ret ? sock_errno_to_status( errno ) : STATUS_SUCCESS;
             break;
         }
