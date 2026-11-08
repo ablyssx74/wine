@@ -1450,6 +1450,51 @@ static WCHAR *get_initial_directory(void)
 }
 
 
+#ifdef __HAIKU__
+/* Haiku: the GPU of Chromium-based browsers does not work (DXVK lacks the composition swap chain their Direct3D compositor needs,
+ * and the OpenGL they fall back to paints nothing): the browser process gets "--disable-gpu" added (its children inherit the
+ * switch) unless it has the switch or --type= already, or the user set WINE_HAIKU_BROWSER_GPU in the environment. This is for the
+ * first process (the command line is built from argv) and for processes started by another (the startup info). Returns the number
+ * of WCHARs to add to the command line. */
+static const char haiku_no_gpu_switch[] = " --disable-gpu";
+
+static BOOL haiku_wcs_contains( const WCHAR *str, DWORD len, const char *needle )
+{
+    DWORD i, j, n = strlen( needle );
+
+    for (i = 0; i + n <= len; i++)
+    {
+        for (j = 0; j < n; j++) if (str[i + j] != (WCHAR)needle[j]) break;
+        if (j == n) return TRUE;
+    }
+    return FALSE;
+}
+
+static DWORD haiku_browser_cmdline_extra( const WCHAR *image, DWORD len, const WCHAR *cmd, DWORD cmdlen )
+{
+    static const char *const browsers[] = { "chrome.exe", "msedge.exe", "brave.exe", "chromium.exe", "vivaldi.exe", "opera.exe" };
+    DWORD i, j;
+
+    if (!image || !cmd || getenv( "WINE_HAIKU_BROWSER_GPU" )) return 0;
+    for (i = len; i > 0; i--) if (image[i - 1] == '\\' || image[i - 1] == '/') break;
+    image += i;
+    len -= i;
+    for (i = 0; i < ARRAY_SIZE(browsers); i++)
+    {
+        const char *b = browsers[i];
+        if (len != strlen( b )) continue;
+        for (j = 0; j < len; j++) if ((image[j] | 0x20) != (WCHAR)b[j]) break;   /* ASCII, case-insensitive */
+        if (j == len) break;
+    }
+    if (i == ARRAY_SIZE(browsers)) return 0;
+
+    if (haiku_wcs_contains( cmd, cmdlen, "--type=" ) || haiku_wcs_contains( cmd, cmdlen, "--disable-gpu" ) ||
+        haiku_wcs_contains( cmd, cmdlen, "--enable-gpu" ) || haiku_wcs_contains( cmd, cmdlen, " -- " ))
+        return 0;
+    return sizeof(haiku_no_gpu_switch) - 1;
+}
+#endif
+
 /***********************************************************************
  *           build_command_line
  *
@@ -1481,7 +1526,7 @@ static WCHAR *build_command_line( WCHAR **wargv )
 
     len = 1;
     for (arg = wargv; *arg; arg++) len += 3 + 2 * wcslen( *arg );
-    if (!(ret = malloc( len * sizeof(WCHAR) ))) return NULL;
+    if (!(ret = malloc( (len + 32) * sizeof(WCHAR) ))) return NULL;
 
     p = ret;
     for (arg = wargv; *arg; arg++)
@@ -1526,6 +1571,14 @@ static WCHAR *build_command_line( WCHAR **wargv )
     }
     if (p > ret) p--;  /* remove last space */
     *p = 0;
+#ifdef __HAIKU__
+    if (wargv[0])
+    {
+        DWORD k, extra = haiku_browser_cmdline_extra( wargv[0], wcslen( wargv[0] ), ret, p - ret );
+        for (k = 0; k < extra; k++) *p++ = (unsigned char)haiku_no_gpu_switch[k];
+        *p = 0;
+    }
+#endif
     if (p - ret >= 32767)
     {
         ERR( "command line too long (%u)\n", (int)(p - ret) );
@@ -2137,12 +2190,19 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     struct startup_info_data *info;
     DWORD size;
     void *ptr;
+#ifdef __HAIKU__
+    DWORD cmd_extra = haiku_browser_cmdline_extra( nt_image->Buffer, nt_image->Length / sizeof(WCHAR),
+                                                   get_params_string( params, &params->CommandLine ),
+                                                   params->CommandLine.Length / sizeof(WCHAR) ) * sizeof(WCHAR);
+#else
+    DWORD cmd_extra = 0;
+#endif
 
     size = sizeof(*info);
     size += params->CurrentDirectory.DosPath.Length;
     size += params->DllPath.Length;
     size += nt_image->Length;
-    size += params->CommandLine.Length;
+    size += params->CommandLine.Length + cmd_extra;
     size += params->WindowTitle.Length;
     size += params->Desktop.Length;
     size += params->ShellInfo.Length;
@@ -2182,6 +2242,16 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     info->curdir_len = append_string( &ptr, params, &params->CurrentDirectory.DosPath );
     info->dllpath_len = append_string( &ptr, params, &params->DllPath );
     info->cmdline_len = append_string( &ptr, params, &params->CommandLine );
+#ifdef __HAIKU__
+    if (cmd_extra)
+    {
+        WCHAR *dst = ptr;
+        DWORD k;
+        for (k = 0; k < sizeof(haiku_no_gpu_switch) - 1; k++) dst[k] = (unsigned char)haiku_no_gpu_switch[k];
+        ptr = dst + k;
+        info->cmdline_len += cmd_extra;
+    }
+#endif
     info->title_len = append_string( &ptr, params, &params->WindowTitle );
     info->desktop_len = append_string( &ptr, params, &params->Desktop );
     info->shellinfo_len = append_string( &ptr, params, &params->ShellInfo );
