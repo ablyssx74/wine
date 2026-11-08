@@ -4449,6 +4449,31 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
 }
 
 
+#ifdef __HAIKU__
+/***********************************************************************
+ *           virtual_haiku_repair_teb
+ *
+ * Called first thing from the SIGSEGV handler, before it reads anything from the TEB. When another process writes into a new
+ * process (the Chromium sandbox launcher does), Haiku's kernel can give the whole area that holds the TEBs and the PEB the
+ * protection "none" (the area has page protections of its own). The handler then faults on its first read of the TEB, so no
+ * fault is ever handled: the thread is redelivered the signal for ever, a core spinning in the kernel. Give the page back
+ * its access here, with nothing but the thread data (which is kept at the top of the stack, not in the TEB).
+ */
+BOOL virtual_haiku_repair_teb( struct thread_data *data, void *addr )
+{
+    static LONG repairs;
+    char *teb = (char *)data->teb, *page;
+
+    if (!teb || !teb_block_size) return FALSE;
+    if ((char *)addr < teb || (char *)addr >= teb + 2 * teb_block_size) return FALSE;   /* this thread's TEB (and the PEB after the first) */
+    if (InterlockedIncrement( &repairs ) > 1024) abort_thread( 1 );   /* it does not help: do not spin for ever */
+    page = ROUND_ADDR( addr, host_page_mask );
+    mprotect( page, host_page_size, PROT_READ | PROT_WRITE );
+    return TRUE;
+}
+#endif
+
+
 /***********************************************************************
  *           virtual_setup_exception
  */

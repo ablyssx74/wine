@@ -327,6 +327,9 @@ extern NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_
 extern void virtual_map_user_shared_data(void);
 extern void virtual_init_user_shared_data(void);
 extern NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, void *stack );
+#ifdef __HAIKU__
+extern BOOL virtual_haiku_repair_teb( struct thread_data *data, void *addr );
+#endif
 extern unsigned int virtual_locked_server_call( void *req_ptr );
 extern ssize_t virtual_locked_read( int fd, void *addr, size_t size );
 extern ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset );

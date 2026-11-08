@@ -2580,9 +2580,15 @@ static void WriteModuleName(addr_t address)
 static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    struct thread_data *data = init_handler( sigcontext );
+    struct thread_data *data;
     struct xcontext context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
+
+#ifdef __HAIKU__
+    /* before init_handler reads the TEB: the TEB itself may be what faulted */
+    if (virtual_haiku_repair_teb( get_current_thread_data(), siginfo->si_addr )) return;
+#endif
+    data = init_handler( sigcontext );
 
 #ifdef __HAIKU__
     if (haiku_trace_segv())
