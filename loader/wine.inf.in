@@ -600,6 +600,16 @@ HKLM,Software\Microsoft\Transaction Server,,16
 HKLM,Software\Microsoft\WBEM,"Installation Directory",2,"%11%\wbem"
 HKLM,Software\Microsoft\Windows Messaging Subsystem,"MAPI",2,"1"
 HKLM,Software\Policies,,16
+; Haiku: browsers start with hardware acceleration off. Their GPU path does not work on this stack: Firefox can hang creating its
+; Vulkan device (DXVK on NVK) and freeze Haiku when it exits, and Chromium's GPU process crash-loops (DXVK has no composition swap
+; chain) or falls back to an OpenGL that paints nothing (ntdll adds --disable-gpu to Chromium browsers for the same reason).
+; Firefox and the Chromium family read these policies. NOCLOBBER (0x10003): a value the user sets is kept, so set it to 1 to turn
+; hardware acceleration back on.
+HKLM,Software\Policies\Mozilla\Firefox,"HardwareAcceleration",0x10003,0
+HKLM,Software\Policies\Google\Chrome,"HardwareAccelerationModeEnabled",0x10003,0
+HKLM,Software\Policies\Chromium,"HardwareAccelerationModeEnabled",0x10003,0
+HKLM,Software\Policies\Microsoft\Edge,"HardwareAccelerationModeEnabled",0x10003,0
+HKLM,Software\Policies\BraveSoftware\Brave,"HardwareAccelerationModeEnabled",0x10003,0
 HKLM,Software\Registered Applications,,16
 HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisable8dot3NameCreation",0x10003,0
 HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisableLastAccessUpdate",0x10003,0x80000002
