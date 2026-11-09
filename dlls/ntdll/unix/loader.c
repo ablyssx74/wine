@@ -499,6 +499,62 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
 }
 
 
+#ifdef __HAIKU__
+/***********************************************************************
+ *           spawn_wineloader
+ *
+ * Haiku: start the loader with posix_spawn() instead of fork() + exec. Haiku's fork() copies per-page data in proportion to the
+ * size of the reserved address space, which takes seconds and gigabytes in a Chromium-sized process (Steam's browser: the memory
+ * of the whole system went into one fork() and could not be taken back); posix_spawn() does not copy the address space.
+ * Does what exec_wineloader() + loader_exec() do, with the environment passed explicitly.
+ */
+NTSTATUS spawn_wineloader( pid_t *pid, char **argv, int socketfd, const struct pe_image_info *pe_info, char *winedebug,
+                           const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attr )
+{
+    extern char **environ;
+    static char noexec[] = "WINELOADERNOEXEC=1";
+    WORD machine = pe_info->machine;
+    ULONGLONG res_start = pe_info->base;
+    ULONGLONG res_end = pe_info->base + pe_info->map_size;
+    char preloader_reserve[64], socket_env[64], *extra[4], **env, *path;
+    int i, j, count = 0, n = 0, k = 0, ret;
+
+    if (pe_info->wine_fakedll) res_start = res_end = 0;
+    if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+        machine = is_machine_64bit( native_machine ) ? IMAGE_FILE_MACHINE_AMD64 : native_machine;
+
+    snprintf( socket_env, sizeof(socket_env), "WINESERVERSOCKET=%u", socketfd );
+    snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x%08x-%x%08x",
+              (UINT)(res_start >> 32), (UINT)res_start, (UINT)(res_end >> 32), (UINT)res_end );
+    extra[n++] = noexec;
+    extra[n++] = preloader_reserve;
+    extra[n++] = socket_env;
+    if (winedebug) extra[n++] = winedebug;
+
+    while (environ && environ[count]) count++;
+    if (!(env = malloc( (count + n + 1) * sizeof(*env) ))) return STATUS_NO_MEMORY;
+    for (i = 0; i < count; i++)
+    {
+        for (j = 0; j < n; j++)
+        {
+            size_t len = strchr( extra[j], '=' ) - extra[j] + 1;
+            if (!strncmp( environ[i], extra[j], len )) break;
+        }
+        if (j == n) env[k++] = environ[i];
+    }
+    for (j = 0; j < n; j++) env[k++] = extra[j];
+    env[k] = NULL;
+
+    if (!(path = get_alternate_wineloader( machine ))) path = strdup( wineloader );
+    argv[1] = path;
+    ret = posix_spawn( pid, path, actions, attr, argv + 1, env );
+    free( path );
+    free( env );
+    return ret ? errno_to_status( ret ) : STATUS_SUCCESS;
+}
+#endif
+
+
 /***********************************************************************
  *           exec_wineserver
  *

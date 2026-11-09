@@ -28,6 +28,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef __HAIKU__
+#include <pthread.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -396,6 +399,86 @@ static BOOL is_unix_console_handle( HANDLE handle )
 }
 
 
+#ifdef __HAIKU__
+/* waits for a child started by haiku_spawn_process (the fork() version reparents it to init through a second fork, so nobody
+ * has to wait for it; here it is our child and would stay a zombie) */
+static void *haiku_reaper( void *arg )
+{
+    pid_t pid = (pid_t)(intptr_t)arg;
+    while (waitpid( pid, NULL, 0 ) < 0 && errno == EINTR) {}
+    return NULL;
+}
+
+/***********************************************************************
+ *           haiku_spawn_process
+ *
+ * spawn_process() with posix_spawn(): Haiku's fork() copies per-page protection data in proportion to the reserved address
+ * space (about 5 s and 400 MB per TB), which in a process like Steam's browser used all the memory of the machine.
+ */
+static NTSTATUS haiku_spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd, int unixdir, char *winedebug,
+                                     const struct pe_image_info *pe_info, int stdin_fd, int stdout_fd )
+{
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    sigset_t sigdef, all, old;
+    NTSTATUS status;
+    pid_t pid = -1;
+    char **argv;
+    BOOL new_session = ((peb && peb->ProcessParameters &&
+                         params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                        params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                        params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                        params->ConsoleHandle == NULL);
+    int in = new_session ? -1 : stdin_fd, out = new_session ? -1 : stdout_fd;
+    short flags = POSIX_SPAWN_SETSIGDEF;
+
+    if (posix_spawn_file_actions_init( &actions )) return STATUS_NO_MEMORY;
+    posix_spawnattr_init( &attr );
+    sigemptyset( &sigdef );
+    sigaddset( &sigdef, SIGPIPE );
+    posix_spawnattr_setsigdefault( &attr, &sigdef );
+    if (new_session) flags |= POSIX_SPAWN_SETSID;
+    posix_spawnattr_setflags( &attr, flags );
+
+    if (in == -1) posix_spawn_file_actions_addopen( &actions, 0, "/dev/null", O_RDWR, 0 );
+    else if (in != 0) posix_spawn_file_actions_adddup2( &actions, in, 0 );
+    if (out == -1) posix_spawn_file_actions_addopen( &actions, 1, "/dev/null", O_RDWR, 0 );
+    else if (out != 1) posix_spawn_file_actions_adddup2( &actions, out, 1 );
+    if (stdin_fd > 1) posix_spawn_file_actions_addclose( &actions, stdin_fd );
+    if (stdout_fd > 1 && stdout_fd != stdin_fd) posix_spawn_file_actions_addclose( &actions, stdout_fd );
+    if (unixdir != -1)
+    {
+        posix_spawn_file_actions_addfchdir( &actions, unixdir );
+        posix_spawn_file_actions_addclose( &actions, unixdir );
+    }
+
+    if (!(argv = build_argv( &params->CommandLine, 2 ))) status = STATUS_NO_MEMORY;
+    else
+    {
+        status = spawn_wineloader( &pid, argv, socketfd, pe_info, winedebug, &actions, &attr );
+        free( argv );
+    }
+    posix_spawn_file_actions_destroy( &actions );
+    posix_spawnattr_destroy( &attr );
+
+    if (!status && pid > 0)
+    {
+        pthread_t thread;
+        pthread_attr_t tattr;
+
+        sigfillset( &all );
+        pthread_sigmask( SIG_BLOCK, &all, &old );   /* the reaper thread must not take Wine's signals */
+        pthread_attr_init( &tattr );
+        pthread_attr_setdetachstate( &tattr, PTHREAD_CREATE_DETACHED );
+        if (pthread_create( &thread, &tattr, haiku_reaper, (void *)(intptr_t)pid )) {}
+        pthread_attr_destroy( &tattr );
+        pthread_sigmask( SIG_SETMASK, &old, NULL );
+    }
+    return status;
+}
+#endif
+
+
 /***********************************************************************
  *           spawn_process
  */
@@ -414,6 +497,16 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     if (wine_server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL ) &&
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
+
+#ifdef __HAIKU__
+    if (!getenv( "WINE_HAIKU_FORK_SPAWN" ))
+    {
+        status = haiku_spawn_process( params, socketfd, unixdir, winedebug, pe_info, stdin_fd, stdout_fd );
+        if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+        if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+        return status;
+    }
+#endif
 
     if (!(pid = fork()))  /* child */
     {
@@ -471,6 +564,44 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 {
     pid_t pid, wret;
     int fd[2], status, err;
+
+#ifdef __HAIKU__
+    if (!getenv( "WINE_HAIKU_FORK_SPAWN" ))
+    {
+        /* posix_spawnp() instead of fork(): see haiku_spawn_process */
+        extern char **environ;
+        posix_spawnattr_t attr;
+        sigset_t sigdef;
+
+        posix_spawnattr_init( &attr );
+        sigemptyset( &sigdef );
+        sigaddset( &sigdef, SIGPIPE );
+        posix_spawnattr_setsigdefault( &attr, &sigdef );
+        posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETSIGDEF );
+        err = posix_spawnp( &pid, argv[0], NULL, &attr, argv, environ );
+        posix_spawnattr_destroy( &attr );
+        if (err) return errno_to_status( err );
+        if (!wait)
+        {
+            pthread_t thread;
+            pthread_attr_t tattr;
+            sigset_t all, old;
+
+            sigfillset( &all );
+            pthread_sigmask( SIG_BLOCK, &all, &old );
+            pthread_attr_init( &tattr );
+            pthread_attr_setdetachstate( &tattr, PTHREAD_CREATE_DETACHED );
+            pthread_create( &thread, &tattr, haiku_reaper, (void *)(intptr_t)pid );
+            pthread_attr_destroy( &tattr );
+            pthread_sigmask( SIG_SETMASK, &old, NULL );
+            return 0;
+        }
+        while (pid != (wret = waitpid( pid, &status, 0 )))
+            if (wret == -1 && errno != EINTR) return errno_to_status( errno );
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        return 255;
+    }
+#endif
 
 #ifdef HAVE_PIPE2
     if (pipe2( fd, O_CLOEXEC ) == -1)
@@ -584,6 +715,77 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     if (wine_server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL ) &&
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
+
+#ifdef __HAIKU__
+    if (!getenv( "WINE_HAIKU_FORK_SPAWN" ))
+    {
+        /* posix_spawn() instead of fork(): see haiku_spawn_process */
+        extern char **environ;
+        posix_spawn_file_actions_t actions;
+        posix_spawnattr_t sattr;
+        sigset_t sigdef;
+        BOOL new_session = ((peb && peb->ProcessParameters &&
+                             params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                            params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                            params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                            params->ConsoleHandle == NULL);
+        int in = new_session ? -1 : stdin_fd, out = new_session ? -1 : stdout_fd, err;
+        short flags = POSIX_SPAWN_SETSIGDEF;
+
+        close( fd[0] );
+        close( fd[1] );
+        posix_spawn_file_actions_init( &actions );
+        posix_spawnattr_init( &sattr );
+        sigemptyset( &sigdef );
+        sigaddset( &sigdef, SIGPIPE );
+        posix_spawnattr_setsigdefault( &sattr, &sigdef );
+        if (new_session) flags |= POSIX_SPAWN_SETSID;
+        posix_spawnattr_setflags( &sattr, flags );
+        if (in == -1) posix_spawn_file_actions_addopen( &actions, 0, "/dev/null", O_RDWR, 0 );
+        else if (in != 0) posix_spawn_file_actions_adddup2( &actions, in, 0 );
+        if (out == -1) posix_spawn_file_actions_addopen( &actions, 1, "/dev/null", O_RDWR, 0 );
+        else if (out != 1) posix_spawn_file_actions_adddup2( &actions, out, 1 );
+        if (stdin_fd > 1) posix_spawn_file_actions_addclose( &actions, stdin_fd );
+        if (stdout_fd > 1 && stdout_fd != stdin_fd) posix_spawn_file_actions_addclose( &actions, stdout_fd );
+        if (unixdir != -1)
+        {
+            posix_spawn_file_actions_addfchdir( &actions, unixdir );
+            posix_spawn_file_actions_addclose( &actions, unixdir );
+        }
+        argv = build_argv( &params->CommandLine, 0 );
+        err = argv ? posix_spawn( &pid, unix_name, &actions, &sattr, argv, environ ) : ENOMEM;
+        free( argv );
+        posix_spawn_file_actions_destroy( &actions );
+        posix_spawnattr_destroy( &sattr );
+        if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+        if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+        switch (err)
+        {
+        case 0:
+            {
+                pthread_t thread;
+                pthread_attr_t tattr;
+                sigset_t all, old;
+
+                sigfillset( &all );
+                pthread_sigmask( SIG_BLOCK, &all, &old );
+                pthread_attr_init( &tattr );
+                pthread_attr_setdetachstate( &tattr, PTHREAD_CREATE_DETACHED );
+                pthread_create( &thread, &tattr, haiku_reaper, (void *)(intptr_t)pid );
+                pthread_attr_destroy( &tattr );
+                pthread_sigmask( SIG_SETMASK, &old, NULL );
+            }
+            return STATUS_SUCCESS;
+        case EPERM:
+        case EACCES: return STATUS_ACCESS_DENIED;
+        case ENOENT: return STATUS_OBJECT_NAME_NOT_FOUND;
+        case EMFILE:
+        case ENFILE: return STATUS_TOO_MANY_OPENED_FILES;
+        case ENOMEM: return STATUS_NO_MEMORY;
+        default: return STATUS_INVALID_IMAGE_FORMAT;
+        }
+    }
+#endif
 
     if (!(pid = fork()))  /* child */
     {
@@ -752,6 +954,52 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
     if (!process_attr) process_attr = &empty_attr;
+
+#ifdef __HAIKU__
+    /* Diagnostic switch: WINE_HAIKU_BLOCK_EXES=name1.exe,name2.exe:--type=gpu-process makes CreateProcess fail for those
+     * programs (to find out which child process of an application sets off a problem; the application cannot repair a
+     * missing program this way). An entry may end in :TEXT, then only command lines that contain TEXT are refused. */
+    {
+        const char *block = getenv( "WINE_HAIKU_BLOCK_EXES" );
+        if (block && path.Buffer && path.Length)
+        {
+            const WCHAR *end_w = path.Buffer + path.Length / sizeof(WCHAR), *base = end_w;
+            size_t len, i;
+            while (base > path.Buffer && base[-1] != '\\' && base[-1] != '/') base--;
+            len = end_w - base;
+            for (const char *p = block; *p; )
+            {
+                const char *comma = strchr( p, ',' );
+                size_t n = comma ? comma - p : strlen( p ), name_n = n;
+                const char *colon = memchr( p, ':', n ), *text = NULL;
+                BOOL same;
+                if (colon) { name_n = colon - p; text = colon + 1; }
+                same = (name_n == len);
+                for (i = 0; same && i < name_n; i++)
+                    if (base[i] > 127 || tolower( (unsigned char)p[i] ) != tolower( (unsigned char)base[i] )) same = FALSE;
+                if (same && text)
+                {
+                    size_t tn = n - name_n - 1, cl = params->CommandLine.Length / sizeof(WCHAR), j;
+                    BOOL found = FALSE;
+                    for (j = 0; !found && tn && j + tn <= cl; j++)
+                    {
+                        for (i = 0; i < tn; i++)
+                            if (params->CommandLine.Buffer[j + i] != (unsigned char)text[i]) break;
+                        found = (i == tn);
+                    }
+                    same = found;
+                }
+                if (same)
+                {
+                    ERR( "WINE_HAIKU_BLOCK_EXES: refusing to start %s\n", debugstr_us( &path ));
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
+                if (!comma) break;
+                p = comma + 1;
+            }
+        }
+    }
+#endif
 
     TRACE( "%s image %s cmdline %s parent %p machine %x\n", debugstr_us( &path ),
            debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ), parent, machine );
