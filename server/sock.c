@@ -4238,6 +4238,7 @@ static inline MIB_TCP_STATE tcp_state_to_mib_state( int state )
    }
 }
 
+#ifndef __HAIKU__
 static MIB_TCP_STATE get_tcp_socket_state( int fd )
 {
 #ifdef __APPLE__
@@ -4259,6 +4260,7 @@ static MIB_TCP_STATE get_tcp_socket_state( int fd )
 
     return MIB_TCP_STATE_ESTAB;
 }
+#endif
 
 struct enum_tcp_connection_info
 {
@@ -4273,13 +4275,37 @@ static int enum_tcp_connections( struct process *process, struct object *obj, vo
     struct enum_tcp_connection_info *info = user;
     MIB_TCP_STATE socket_state;
     union tcp_connection *conn;
+    union win_sockaddr laddr = sock->addr, paddr = sock->peer_addr;
+    int paddr_len = sock->peer_addr_len;
 
     assert( obj->ops == &sock_ops );
 
     if (sock->type != WS_SOCK_STREAM || !(sock->family == WS_AF_INET || sock->family == WS_AF_INET6))
         return 0;
 
+#ifdef __HAIKU__
+    /* Haiku has no TCP_INFO, and the addresses the server recorded from its socket events can lag behind the real connection
+     * (a program that accepted a connection and asks at once who owns the other end found nothing): ask the socket itself */
+    {
+        union unix_sockaddr live;
+        socklen_t live_len = sizeof(live);
+        int unix_fd = get_unix_fd( sock->fd );
+
+        if (!getsockname( unix_fd, &live.addr, &live_len ))
+            sockaddr_from_unix( &live, &laddr.addr, sizeof(laddr) );
+        live_len = sizeof(live);
+        if (!getpeername( unix_fd, &live.addr, &live_len ))
+        {
+            paddr_len = sockaddr_from_unix( &live, &paddr.addr, sizeof(paddr) );
+            socket_state = MIB_TCP_STATE_ESTAB;
+        }
+        else if (sock->state == SOCK_LISTENING) socket_state = MIB_TCP_STATE_LISTEN;
+        else if (sock->state == SOCK_CONNECTING) socket_state = MIB_TCP_STATE_SYN_SENT;
+        else socket_state = MIB_TCP_STATE_CLOSED;
+    }
+#else
     socket_state = get_tcp_socket_state( get_unix_fd(sock->fd) );
+#endif
     if (info->state_filter && socket_state != info->state_filter)
         return 0;
 
@@ -4299,24 +4325,24 @@ static int enum_tcp_connections( struct process *process, struct object *obj, vo
 
     if (sock->family == WS_AF_INET)
     {
-        conn->ipv4.local_addr = sock->addr.in.sin_addr.WS_s_addr;
-        conn->ipv4.local_port = sock->addr.in.sin_port;
-        if (sock->peer_addr_len)
+        conn->ipv4.local_addr = laddr.in.sin_addr.WS_s_addr;
+        conn->ipv4.local_port = laddr.in.sin_port;
+        if (paddr_len)
         {
-            conn->ipv4.remote_addr = sock->peer_addr.in.sin_addr.WS_s_addr;
-            conn->ipv4.remote_port = sock->peer_addr.in.sin_port;
+            conn->ipv4.remote_addr = paddr.in.sin_addr.WS_s_addr;
+            conn->ipv4.remote_port = paddr.in.sin_port;
         }
     }
     else
     {
-        memcpy( &conn->ipv6.local_addr, &sock->addr.in6.sin6_addr, 16 );
-        conn->ipv6.local_scope_id = sock->addr.in6.sin6_scope_id;
-        conn->ipv6.local_port = sock->addr.in6.sin6_port;
-        if (sock->peer_addr_len)
+        memcpy( &conn->ipv6.local_addr, &laddr.in6.sin6_addr, 16 );
+        conn->ipv6.local_scope_id = laddr.in6.sin6_scope_id;
+        conn->ipv6.local_port = laddr.in6.sin6_port;
+        if (paddr_len)
         {
-            memcpy( &conn->ipv6.remote_addr, &sock->peer_addr.in6.sin6_addr, 16 );
-            conn->ipv6.remote_scope_id = sock->peer_addr.in6.sin6_scope_id;
-            conn->ipv6.remote_port = sock->peer_addr.in6.sin6_port;
+            memcpy( &conn->ipv6.remote_addr, &paddr.in6.sin6_addr, 16 );
+            conn->ipv6.remote_scope_id = paddr.in6.sin6_scope_id;
+            conn->ipv6.remote_port = paddr.in6.sin6_port;
         }
     }
 
