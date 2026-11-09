@@ -1583,6 +1583,17 @@ static NTSTATUS do_getsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
         return status;
 
     ret = getsockopt( fd, level, option, out_buffer, &len );
+#ifdef __HAIKU__
+    if (ret && level == IPPROTO_IPV6 && option == IPV6_V6ONLY && out_size >= 1)
+    {
+        /* Haiku has no IPV6_V6ONLY (its IPv6 sockets are IPv6 only): answer "set", as the setsockopt side pretends to work.
+         * Firefox's QUIC code (neqo) fails to open its UDP sockets (WSAEINVAL) when this query fails. */
+        WARN( "IPV6_V6ONLY not supported by the host, reporting 1\n" );
+        *(char *)out_buffer = 1;
+        len = 1;
+        ret = 0;
+    }
+#endif
     if (needs_close) close( fd );
     if (ret) return sock_errno_to_status( errno );
     if (io)
