@@ -757,7 +757,17 @@ static NTSTATUS unix_getaddrinfo( void *args )
         }
     }
 
+#ifdef __HAIKU__
+    /* Haiku's libnetwork takes a write lock inside every getaddrinfo() (_nsconfigure) and a thread that has to wait for it spins:
+     * block_thread() returns B_INTERRUPTED at once, about 12000 times a second, so a browser's resolver threads burn cores while
+     * lookups overlap. Let them queue on a plain mutex instead. */
+    static pthread_mutex_t haiku_getaddrinfo_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock( &haiku_getaddrinfo_mutex );
+#endif
     ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
+#ifdef __HAIKU__
+    pthread_mutex_unlock( &haiku_getaddrinfo_mutex );
+#endif
     if (ret)
         return addrinfo_err_from_unix( ret );
 
