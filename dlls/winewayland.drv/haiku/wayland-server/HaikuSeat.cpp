@@ -10,6 +10,7 @@
 #include <InterfaceDefs.h>
 #include <Application.h>
 #include <Window.h>
+#include <MessageQueue.h>
 #include <View.h>
 #include <Cursor.h>
 #include <Autolock.h>
@@ -392,6 +393,16 @@ void HaikuSeatGlobal::DoTrack(TrackId id, const TrackInfo &info)
 	SetPointerFocus(fPointerFocus, BMessage(), id);
 	fTrack.info = info;
 	switch (id) {
+		case trackMove: {
+			fTrack.moveStartScreen = fTrack.lastScreen;
+			fTrack.moveStartWin = fPointerFocus->View()->Window()->Frame().LeftTop();
+			fTrack.statEvents = fTrack.statSkipped = 0;
+			fTrack.statMoveUs = 0;
+			fTrack.statStart = system_time();
+			fTrack.lastMoveEnd = 0;
+			fTrack.lastMoveTo = fTrack.moveStartWin;
+			break;
+		}
 		case trackResize: {
 			auto geometry = fPointerFocus->XdgSurface()->Geometry();
 			fTrack.wndWidth = geometry.width;
@@ -566,6 +577,17 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 			msg->FindInt64("when", &when);
 			msg->FindInt32("buttons", (int32*)&btns);
 			uint32 oldBtns = fOldMouseBtns;
+			if (fTrack.id == trackMove && fTrack.haveScreen) {
+				BPoint target(fTrack.moveStartWin.x + (fTrack.lastScreen.x - fTrack.moveStartScreen.x),
+					fTrack.moveStartWin.y + (fTrack.lastScreen.y - fTrack.moveStartScreen.y));
+				if (target != fTrack.lastMoveTo) fPointerFocus->View()->Window()->MoveTo(target);
+			}
+			if (fTrack.id == trackMove && getenv("WINE_HAIKU_MOVE_STATS") != NULL) {
+				fprintf(stderr, "wayland move: %u events, %u coalesced, %u MoveTo avg %lld us, drag %lld ms\n",
+					fTrack.statEvents, fTrack.statSkipped, fTrack.statEvents - fTrack.statSkipped,
+					(long long)(fTrack.statMoveUs / std::max<uint32_t>(1, fTrack.statEvents - fTrack.statSkipped)),
+					(long long)((system_time() - fTrack.statStart) / 1000));
+			}
 			switch (fTrack.id) {
 				case trackNone:
 				case trackClient: {
@@ -601,6 +623,11 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 			uint32 btns;
 			msg->FindInt64("when", &when);
 			msg->FindPoint("be:view_where", &where);
+			{
+				BPoint sw;
+				fTrack.haveScreen = msg->FindPoint("screen_where", &sw) == B_OK;
+				if (fTrack.haveScreen) fTrack.lastScreen = sw;
+			}
 			switch (fTrack.id) {
 				case trackNone:
 				case trackClient: {
@@ -619,7 +646,30 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					break;
 				}
 				case trackMove: {
-					fPointerFocus->View()->Window()->MoveBy(where.x - fTrack.origin.x, where.y - fTrack.origin.y);
+					BWindow *window = fPointerFocus->View()->Window();
+					fTrack.statEvents++;
+					if (fTrack.haveScreen) {
+						// Newer pointer events already queued: the window only needs to
+						// follow the latest one (the position is absolute).
+						if (window->MessageQueue()->FindMessage(B_MOUSE_MOVED, 0) != NULL) {
+							fTrack.statSkipped++;
+							break;
+						}
+						BPoint target(fTrack.moveStartWin.x + (fTrack.lastScreen.x - fTrack.moveStartScreen.x),
+							fTrack.moveStartWin.y + (fTrack.lastScreen.y - fTrack.moveStartScreen.y));
+						bigtime_t t0 = system_time();
+						// at most about one move per 6 ms (the last position is applied on button release)
+						if (target == fTrack.lastMoveTo || t0 - fTrack.lastMoveEnd < 6000) {
+							fTrack.statSkipped++;
+							break;
+						}
+						window->MoveTo(target);
+						fTrack.lastMoveTo = target;
+						fTrack.lastMoveEnd = system_time();
+						fTrack.statMoveUs += fTrack.lastMoveEnd - t0;
+					} else {
+						window->MoveBy(where.x - fTrack.origin.x, where.y - fTrack.origin.y);
+					}
 					break;
 				}
 				case trackResize: {

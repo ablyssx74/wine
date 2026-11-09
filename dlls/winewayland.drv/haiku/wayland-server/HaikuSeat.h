@@ -71,6 +71,13 @@ private:
 		bool captured;
 		bool inside;
 		BPoint origin;
+		BPoint lastScreen;
+		BPoint moveStartScreen;
+		BPoint moveStartWin;
+		bool haveScreen;
+		uint32_t statEvents, statSkipped;
+		bigtime_t statMoveUs, statStart, lastMoveEnd;
+		BPoint lastMoveTo;
 		int32_t wndWidth, wndHeight;
 		TrackInfo info;
 	};
