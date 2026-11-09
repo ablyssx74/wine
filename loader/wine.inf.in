@@ -610,6 +610,23 @@ HKLM,Software\Policies\Google\Chrome,"HardwareAccelerationModeEnabled",0x10003,0
 HKLM,Software\Policies\Chromium,"HardwareAccelerationModeEnabled",0x10003,0
 HKLM,Software\Policies\Microsoft\Edge,"HardwareAccelerationModeEnabled",0x10003,0
 HKLM,Software\Policies\BraveSoftware\Brave,"HardwareAccelerationModeEnabled",0x10003,0
+; Haiku: only Haiku's own fonts (Noto Sans, Noto Sans Mono) are installed, so the names Windows programs ask for (Arial, Segoe UI, Tahoma...) found
+; no font at all: Chromium (Steam's browser) drew no text. Wine's font replacement list gives those names Noto Sans. A real font of the
+; same name is still used when present, and an entry is skipped when the replacement font is missing, so other systems are not affected.
+HKCU,Software\Wine\Fonts\Replacements,"Arial",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Tahoma",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Segoe UI",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Segoe UI Symbol",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Verdana",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Helvetica",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Microsoft Sans Serif",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Times New Roman",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Georgia",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Trebuchet MS",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Calibri",0x10000,"Noto Sans"
+HKCU,Software\Wine\Fonts\Replacements,"Courier New",0x10000,"Noto Sans Mono"
+HKCU,Software\Wine\Fonts\Replacements,"Consolas",0x10000,"Noto Sans Mono"
+HKCU,Software\Wine\Fonts\Replacements,"Lucida Console",0x10000,"Noto Sans Mono"
 HKLM,Software\Registered Applications,,16
 HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisable8dot3NameCreation",0x10003,0
 HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisableLastAccessUpdate",0x10003,0x80000002
