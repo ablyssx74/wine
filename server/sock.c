@@ -3426,10 +3426,12 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         }
         sndbuf = *(DWORD *)get_req_data();
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__HAIKU__)
         if (!sndbuf)
         {
-            /* setsockopt fails if a zero value is passed */
+            /* setsockopt fails if a zero value is passed (Apple). On Haiku a zero send buffer makes every later send on a UDP
+             * socket fail at once, so Windows programs that ask for an unbuffered send (Chromium, Steam) could not send
+             * datagrams */
             sock->sndbuf = sndbuf;
             return;
         }
