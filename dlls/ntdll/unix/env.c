@@ -1455,9 +1455,7 @@ static WCHAR *get_initial_directory(void)
  * and the OpenGL they fall back to paints nothing): the browser process gets "--disable-gpu" added (its children inherit the
  * switch) unless it has the switch or --type= already, or the user set WINE_HAIKU_BROWSER_GPU in the environment. This is for the
  * first process (the command line is built from argv) and for processes started by another (the startup info). Returns the number
- * of WCHARs to add to the command line. */
-static const char haiku_no_gpu_switch[] = " --disable-gpu";
-
+ * of chars to add to the command line. */
 static BOOL haiku_wcs_contains( const WCHAR *str, DWORD len, const char *needle )
 {
     DWORD i, j, n = strlen( needle );
@@ -1470,12 +1468,16 @@ static BOOL haiku_wcs_contains( const WCHAR *str, DWORD len, const char *needle 
     return FALSE;
 }
 
-static DWORD haiku_browser_cmdline_extra( const WCHAR *image, DWORD len, const WCHAR *cmd, DWORD cmdlen )
+/* Fills extra (at least 64 chars) with the switches to add and returns their number. msedge.exe also gets --no-sandbox: Edge's renderers
+ * cannot be started in its sandbox under Wine (no renderer process, blank pages), the other browsers can. WINE_HAIKU_BROWSER_SANDBOX
+ * in the environment keeps Edge's sandbox. */
+static DWORD haiku_browser_cmdline_extra( const WCHAR *image, DWORD len, const WCHAR *cmd, DWORD cmdlen, char *extra )
 {
     static const char *const browsers[] = { "chrome.exe", "msedge.exe", "brave.exe", "chromium.exe", "vivaldi.exe", "opera.exe" };
     DWORD i, j;
 
-    if (!image || !cmd || getenv( "WINE_HAIKU_BROWSER_GPU" )) return 0;
+    extra[0] = 0;
+    if (!image || !cmd) return 0;
     for (i = len; i > 0; i--) if (image[i - 1] == '\\' || image[i - 1] == '/') break;
     image += i;
     len -= i;
@@ -1487,11 +1489,15 @@ static DWORD haiku_browser_cmdline_extra( const WCHAR *image, DWORD len, const W
         if (j == len) break;
     }
     if (i == ARRAY_SIZE(browsers)) return 0;
+    if (haiku_wcs_contains( cmd, cmdlen, "--type=" ) || haiku_wcs_contains( cmd, cmdlen, " -- " )) return 0;
 
-    if (haiku_wcs_contains( cmd, cmdlen, "--type=" ) || haiku_wcs_contains( cmd, cmdlen, "--disable-gpu" ) ||
-        haiku_wcs_contains( cmd, cmdlen, "--enable-gpu" ) || haiku_wcs_contains( cmd, cmdlen, " -- " ))
-        return 0;
-    return sizeof(haiku_no_gpu_switch) - 1;
+    if (!getenv( "WINE_HAIKU_BROWSER_GPU" ) && !haiku_wcs_contains( cmd, cmdlen, "--disable-gpu" ) &&
+        !haiku_wcs_contains( cmd, cmdlen, "--enable-gpu" ))
+        strcat( extra, " --disable-gpu" );
+    if (!strcmp( browsers[i], "msedge.exe" ) && !getenv( "WINE_HAIKU_BROWSER_SANDBOX" ) &&
+        !haiku_wcs_contains( cmd, cmdlen, "--no-sandbox" ))
+        strcat( extra, " --no-sandbox" );
+    return strlen( extra );
 }
 #endif
 
@@ -1574,8 +1580,9 @@ static WCHAR *build_command_line( WCHAR **wargv )
 #ifdef __HAIKU__
     if (wargv[0])
     {
-        DWORD k, extra = haiku_browser_cmdline_extra( wargv[0], wcslen( wargv[0] ), ret, p - ret );
-        for (k = 0; k < extra; k++) *p++ = (unsigned char)haiku_no_gpu_switch[k];
+        char xs[64];
+        DWORD k, extra = haiku_browser_cmdline_extra( wargv[0], wcslen( wargv[0] ), ret, p - ret, xs );
+        for (k = 0; k < extra; k++) *p++ = (unsigned char)xs[k];
         *p = 0;
     }
 #endif
@@ -2191,9 +2198,10 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     DWORD size;
     void *ptr;
 #ifdef __HAIKU__
+    char haiku_extra[64];
     DWORD cmd_extra = haiku_browser_cmdline_extra( nt_image->Buffer, nt_image->Length / sizeof(WCHAR),
                                                    get_params_string( params, &params->CommandLine ),
-                                                   params->CommandLine.Length / sizeof(WCHAR) ) * sizeof(WCHAR);
+                                                   params->CommandLine.Length / sizeof(WCHAR), haiku_extra ) * sizeof(WCHAR);
 #else
     DWORD cmd_extra = 0;
 #endif
@@ -2247,7 +2255,7 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     {
         WCHAR *dst = ptr;
         DWORD k;
-        for (k = 0; k < sizeof(haiku_no_gpu_switch) - 1; k++) dst[k] = (unsigned char)haiku_no_gpu_switch[k];
+        for (k = 0; k < cmd_extra / sizeof(WCHAR); k++) dst[k] = (unsigned char)haiku_extra[k];
         ptr = dst + k;
         info->cmdline_len += cmd_extra;
     }
