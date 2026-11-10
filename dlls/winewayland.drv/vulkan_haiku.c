@@ -230,11 +230,60 @@ static void surface_frame(void *user, const void *bits, int width, int height, i
     {
         static unsigned count;
         if (count++ % 240 == 0)
-            fprintf(stderr, "hvk: surface_frame %u: %dx%d, %d bytes per row, bits %p\n", count - 1, width, height, bytes_per_row, bits);
+        {
+            const unsigned *px = bits;
+            int row = bytes_per_row / 4, x, y;
+            unsigned long nonzero = 0, opaque = 0;
+            unsigned first = 0;
+            for (y = 0; y < height; y++)
+                for (x = 0; x < width; x++)
+                {
+                    unsigned v = px[y * row + x];
+                    if (v) { if (!nonzero) first = v; nonzero++; }
+                    if ((v >> 24) == 0xff) opaque++;
+                }
+            fprintf(stderr, "hvk: surface_frame %u: %dx%d, %d bytes per row, bits %p, pixels: top-left %08x centre %08x bottom-right %08x, "
+                    "%lu of %d non-zero (first %08x), %lu with alpha ff\n", count - 1, width, height, bytes_per_row, bits,
+                    px[0], px[(height / 2) * row + width / 2], px[(height - 1) * row + width - 1], nonzero, width * height, first, opaque);
+        }
     }
     if (width <= 0 || height <= 0) return;
+    /* WINE_HAIKU_FRAME_GAP=ms: report a pause between two presented frames, and where the present spent its time */
+    {
+        static double last_entry, gap_limit = -1;
+        struct timespec ts;
+        double now, t_wait, t_buf;
+
+        if (gap_limit < 0) gap_limit = getenv("WINE_HAIKU_FRAME_GAP") ? atof(getenv("WINE_HAIKU_FRAME_GAP")) : 0;
+        if (gap_limit > 0)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            now = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+            if (last_entry && now - last_entry > gap_limit)
+            {
+                time_t wall = time(NULL);
+                struct tm tmv;
+                char hms[16];
+                localtime_r(&wall, &tmv);
+                strftime(hms, sizeof(hms), "%H:%M:%S", &tmv);
+                fprintf(stderr, "hvk: PAUSE %s: %.0f ms between presented frames\n", hms, now - last_entry);
+            }
+            last_entry = now;
+            if (vsync_enabled()) wait_for_frame(surface);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            t_wait = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6 - now;
+            buffer = get_buffer(surface, width, height);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            t_buf = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6 - now - t_wait;
+            if (t_wait > gap_limit || t_buf > gap_limit)
+                fprintf(stderr, "hvk: SLOW present: wait_for_frame %.0f ms, get_buffer %.0f ms\n", t_wait, t_buf);
+            goto have_buffer;
+        }
+    }
     if (vsync_enabled()) wait_for_frame(surface);
-    if (!(buffer = get_buffer(surface, width, height)))
+    buffer = get_buffer(surface, width, height);
+have_buffer:
+    if (!buffer)
     {
         ERR("No buffer available, dropping the frame\n");
         return;
