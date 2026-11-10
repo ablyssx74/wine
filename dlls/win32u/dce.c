@@ -1200,7 +1200,12 @@ static void collect_stacking( HWND hwnd, HWND *list, UINT *count, UINT max, UINT
 
     for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child && n < ARRAY_SIZE(kids);
          child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
+    {
+        /* a hidden window (and what is in it) is not painted: its layer must not go over the windows that were under it
+         * (Steam keeps the browser window of a page it left, hidden, over the one that shows the page it went to) */
+        if (!(NtUserGetWindowLongW( child, GWL_STYLE ) & WS_VISIBLE)) continue;
         kids[n++] = child;
+    }
 
     while (n) collect_stacking( kids[--n], list, count, max, depth + 1 );
 }
@@ -1229,7 +1234,7 @@ static void apply_remote_layers( struct window_surface *surface, const RECT *dir
     LIST_FOR_EACH_ENTRY( layer, &remote_layers, struct remote_layer, entry ) if (layer->top == surface->hwnd) count++;
     pthread_mutex_unlock( &remote_lock );
     if (!count) return;
-    if (count > 1) collect_stacking( surface->hwnd, stack, &stack_count, ARRAY_SIZE(stack), 0 );
+    collect_stacking( surface->hwnd, stack, &stack_count, ARRAY_SIZE(stack), 0 );
 
     pthread_mutex_lock( &remote_lock );
     count = 0;
@@ -1239,7 +1244,9 @@ static void apply_remote_layers( struct window_surface *surface, const RECT *dir
 
         if (layer->top != surface->hwnd || count >= ARRAY_SIZE(sorted)) continue;
         for (j = 0; j < stack_count; j++) if (stack[j] == layer->hwnd) break;
-        /* a window that is not found (gone since, or not below the top-level window) goes over the others, last changed last */
+        /* a window that is not found is hidden (or gone since, or in a hidden window): it is not painted. Only when the list of
+         * the stacking was cut short (too many windows) does it go over the others, last changed last */
+        if (j == stack_count && stack_count < ARRAY_SIZE(stack)) continue;
         key = j < stack_count ? j : (ULONGLONG)stack_count + 1 + layer->order;
         /* The window a DirectComposition target shows its visuals in: they go over the window (and over the windows in it,
          * for the target made "topmost", which is what Chromium does), whatever the stacking says. The windows around it
