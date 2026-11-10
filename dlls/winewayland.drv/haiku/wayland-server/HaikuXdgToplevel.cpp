@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include <stdio.h>
 #include "HaikuXdgToplevel.h"
 #include "HaikuXdgShell.h"
 #include "HaikuXdgSurface.h"
@@ -167,6 +169,16 @@ void WaylandWindow::UpdateRefreshRate()
 
 //#pragma mark - HaikuXdgToplevel
 
+
+// Debug aid: WINE_HAIKU_WIN_TRACE=1 prints the window state requests and the configures sent back.
+static bool WinTrace()
+{
+	static int on = -1;
+	if (on < 0) on = getenv("WINE_HAIKU_WIN_TRACE") != NULL;
+	return on;
+}
+#define WTRACE(...) do { if (WinTrace()) { fprintf(stderr, "wintrace: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
 void HaikuXdgToplevel::DoSendConfigure()
 {
 	uint32_t stateArray[3];
@@ -182,6 +194,7 @@ void HaikuXdgToplevel::DoSendConfigure()
 	if (fState.activated ) {*p++ = XdgToplevel::stateActivated;}
 
 	state.size = (uint8_t*)p - (uint8_t*)state.data;
+	WTRACE("configure %dx%d max=%d full=%d act=%d", (int)fWidth, (int)fHeight, (int)fState.maximized, (int)fState.fullscreen, (int)fState.activated);
 	SendConfigure(fWidth, fHeight, &state);
 }
 
@@ -241,12 +254,23 @@ void HaikuXdgToplevel::HandleSetMinSize(int32_t width, int32_t height)
 	fMinHeight = height;
 }
 
+// A frame worth going back to when a window leaves the maximized or fullscreen state. The frame of a window that was created
+// full-screen (Steam starts maximized, from its saved settings) is the 1x1 frame of the new BWindow, and going back to that
+// made a 2x2 window that Wine put back to full screen at once, forever (about 60 times a second).
+static bool UsableFrame(const BRect &frame, const BRect &screen)
+{
+	// (a frame as large as the screen is not one to go back to: the client would take it for a full-screen window again)
+	return frame.IsValid() && frame.Width() >= 63 && frame.Height() >= 63 &&
+		(frame.Width() < screen.Width() - 8 || frame.Height() < screen.Height() - 8);
+}
+
 void HaikuXdgToplevel::HandleSetMaximized()
 {
+	WTRACE("request set_maximized (max=%d full=%d)", (int)fState.maximized, (int)fState.fullscreen);
 	if (fState.maximized) return;
 	fState.maximized = true;
 	fSizeChanged = true;
-	if (!fState.fullscreen) fSavedPos = fWindow->Frame();	// (not the frame a fullscreen window took over)
+	if (!fState.fullscreen && UsableFrame(fWindow->Frame(), BScreen(fWindow).Frame())) fSavedPos = fWindow->Frame();	// (not the frame a fullscreen window took over)
 	BRect screenFrame = BScreen(fWindow).Frame();
 	fWindow->MoveTo(screenFrame.LeftTop());
 	fWindow->ResizeTo(screenFrame.Width(), screenFrame.Height());
@@ -258,11 +282,12 @@ void HaikuXdgToplevel::HandleSetMaximized()
 
 void HaikuXdgToplevel::HandleUnsetMaximized()
 {
+	WTRACE("request unset_maximized (max=%d full=%d)", (int)fState.maximized, (int)fState.fullscreen);
 	if (!fState.maximized) return;
 	fState.maximized = false;
 	if (fState.fullscreen) return;	// the window stays as large as the fullscreen state wants
 	fSizeChanged = true;
-	if (fSavedPos.IsValid()) {
+	if (UsableFrame(fSavedPos, BScreen(fWindow).Frame())) {
 		fWindow->MoveTo(fSavedPos.LeftTop());
 		fWindow->ResizeTo(fSavedPos.Width(), fSavedPos.Height());
 		fWidth = (int32_t)fSavedPos.Width() + 1;
@@ -278,10 +303,12 @@ void HaikuXdgToplevel::HandleUnsetMaximized()
 
 void HaikuXdgToplevel::HandleSetFullscreen(struct wl_resource *output)
 {
+	WTRACE("request set_fullscreen (max=%d full=%d)", (int)fState.maximized, (int)fState.fullscreen);
 	if (fState.fullscreen) return;
 	fState.fullscreen = true;
 	fSizeChanged = true;
-	fSavedPos = fWindow->Frame();
+	// (a maximized window keeps the frame it had before: the frame it has now is the screen)
+	if (!fState.maximized && UsableFrame(fWindow->Frame(), BScreen(fWindow).Frame())) fSavedPos = fWindow->Frame();
 	BRect screenFrame = BScreen(fWindow).Frame();
 	fWindow->MoveTo(screenFrame.LeftTop());
 	fWindow->ResizeTo(screenFrame.Width(), screenFrame.Height());
@@ -293,13 +320,21 @@ void HaikuXdgToplevel::HandleSetFullscreen(struct wl_resource *output)
 
 void HaikuXdgToplevel::HandleUnsetFullscreen()
 {
+	WTRACE("request unset_fullscreen (max=%d full=%d)", (int)fState.maximized, (int)fState.fullscreen);
 	if (!fState.fullscreen) return;
 	fState.fullscreen = false;
 	fSizeChanged = true;
-	fWindow->MoveTo(fSavedPos.LeftTop());
-	fWindow->ResizeTo(fSavedPos.Width(), fSavedPos.Height());
-	fWidth = (int32_t)fSavedPos.Width() + 1;
-	fHeight = (int32_t)fSavedPos.Height() + 1;
+	if (fState.maximized) {
+		// still maximized: the window stays as large as the maximized state wants
+	} else if (UsableFrame(fSavedPos, BScreen(fWindow).Frame())) {
+		fWindow->MoveTo(fSavedPos.LeftTop());
+		fWindow->ResizeTo(fSavedPos.Width(), fSavedPos.Height());
+		fWidth = (int32_t)fSavedPos.Width() + 1;
+		fHeight = (int32_t)fSavedPos.Height() + 1;
+	} else {
+		fWidth = 0;		// no frame to go back to: the client chooses its own size
+		fHeight = 0;
+	}
 	DoSendConfigure();
 	XdgSurface()->SendConfigure(XdgSurface()->NextSerial());
 }

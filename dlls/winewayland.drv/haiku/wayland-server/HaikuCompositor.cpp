@@ -14,6 +14,9 @@
 #include <wayland-server-protocol.h>
 #include <stdio.h>
 #include <bit>
+#include <sys/stat.h>
+#include <time.h>
+#include <map>
 
 #include "AppKitPtrs.h"
 #include <Application.h>
@@ -470,6 +473,38 @@ void HaikuSurface::HandleSetInputRegion(struct wl_resource *region_resource)
 	fPendingFields |= (1 << fieldInputRgn);
 }
 
+
+// Debug aid: with WINE_HAIKU_DUMP_DIR set, touching <dir>/trigger makes every surface that commits in the next 3 seconds
+// write its buffer as <dir>/<surface>-<w>x<h>[-sub].ppm (once per trigger), to see what a client really sent.
+static void DumpSurfaceIfRequested(HaikuSurface *surface, BBitmap *bmp, bool isSub)
+{
+	static const char *dir = getenv("WINE_HAIKU_DUMP_DIR");
+	static std::map<HaikuSurface*, time_t> done;
+	if (dir == NULL || bmp == NULL) return;
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/trigger", dir);
+	struct stat st;
+	if (stat(path, &st) != 0 || time(NULL) - st.st_mtime > 3) return;
+	auto it = done.find(surface);
+	if (it != done.end() && it->second == st.st_mtime) return;
+	done[surface] = st.st_mtime;
+	BRect b = bmp->Bounds();
+	int w = (int)b.Width() + 1, h = (int)b.Height() + 1;
+	snprintf(path, sizeof(path), "%s/%p-%dx%d%s.ppm", dir, (void*)surface, w, h, isSub ? "-sub" : "");
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) return;
+	fprintf(f, "P6\n%d %d\n255\n", w, h);
+	const uint8 *bits = (const uint8*)bmp->Bits();
+	for (int y = 0; y < h; y++) {
+		const uint8 *row = bits + (size_t)y * bmp->BytesPerRow();
+		for (int x = 0; x < w; x++) {
+			uint8 rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4]};
+			fwrite(rgb, 1, 3, f);
+		}
+	}
+	fclose(f);
+}
+
 void HaikuSurface::HandleCommit()
 {
 	//printf("HaikuSurface::HandleCommit()\n");
@@ -527,6 +562,7 @@ void HaikuSurface::HandleCommit()
 		viewLocked->ResizeTo(size.width, size.height);
 		Invalidate();
 	}
+	DumpSurfaceIfRequested(this, Bitmap(), fSubsurface != NULL);
 	if (fHook.IsSet()) {
 		fHook->HandleCommit();
 	}
