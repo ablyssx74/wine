@@ -24,6 +24,16 @@ problems that broke Steam and the browsers are fixed.
   in Firefox and Chromium browsers, `WINE_HAIKU_NO_KQUEUE=1` selects the `poll()` loop in the Wine server, and a crash that read a damaged TEB
   page in the SIGSEGV handler is fixed.
 
+## Downloads in this release
+
+| file | what it is |
+|---|---|
+| `wine11-11.20-39-x86_64.hpkg` | Wine, install for the whole system |
+| `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
+| `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
+| `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches |
+| `ut4-launcher.zip` | the UT4 Community Launcher 1.9.0 built to run under Wine (needs the WebView2 runtime and `wine_int3`; steps in its README) |
+
 ## Requirements
 
 - Haiku x86_64, a recent nightly (hrev60299 or newer was tested), with the `wayland_server` compositor running.
