@@ -517,6 +517,11 @@ void HaikuSurface::HandleCommit()
 		auto viewLocked = AppKitPtrs::LockedPtr(View());
 		if (fSubsurface != NULL) {
 			viewLocked->MoveTo(fSubsurface->GetState().x, fSubsurface->GetState().y);
+			// A subsurface without a buffer is unmapped: hide its view so that the parent is redrawn where it was (an
+			// invalidated transparent view leaves the old pixels on the screen, and Steam's pages that were switched
+			// away from showed through).
+			if (fState.buffer == NULL && !viewLocked->IsHidden(viewLocked)) viewLocked->Hide();
+			else if (fState.buffer != NULL && viewLocked->IsHidden(viewLocked)) viewLocked->Show();
 		}
 		BSize size = Size();
 		viewLocked->ResizeTo(size.width, size.height);

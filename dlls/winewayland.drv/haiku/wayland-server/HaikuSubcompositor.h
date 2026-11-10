@@ -45,6 +45,7 @@ public:
 	void GetOffset(int32_t &x, int32 &y);
 
 	void HandleSetPosition(int32_t x, int32_t y) final;
+	void Restack(struct wl_resource *siblingResource, bool above);
 	void HandlePlaceAbove(struct wl_resource *sibling) final;
 	void HandlePlaceBelow(struct wl_resource *sibling) final;
 	void HandleSetSync() final;
