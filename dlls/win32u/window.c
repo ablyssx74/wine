@@ -4890,6 +4890,22 @@ static UINT window_min_maximize( HWND hwnd, UINT cmd, RECT *rect )
         /* Restore to normal position */
 
         *rect = wpl.rcNormalPosition;
+#ifdef __HAIKU__
+        /* A window that was created maximized (Steam opens maximized, from its saved settings) has the whole screen as its normal
+         * position, so restoring it changed nothing, and the Wayland driver then took the window for a full-screen one and asked
+         * for that. Restore it to three quarters of the work area, in the middle. */
+        {
+            MONITORINFO mon = monitor_info_from_rect( *rect, get_thread_dpi() );
+            if (rect->left <= mon.rcMonitor.left && rect->right >= mon.rcMonitor.right &&
+                rect->top <= mon.rcMonitor.top && rect->bottom >= mon.rcMonitor.bottom)
+            {
+                int work_w = mon.rcWork.right - mon.rcWork.left, work_h = mon.rcWork.bottom - mon.rcWork.top;
+                int w = work_w * 3 / 4, h = work_h * 3 / 4;
+                SetRect( rect, mon.rcWork.left + (work_w - w) / 2, mon.rcWork.top + (work_h - h) / 2,
+                         mon.rcWork.left + (work_w - w) / 2 + w, mon.rcWork.top + (work_h - h) / 2 + h );
+            }
+        }
+#endif
         break;
     }
 
