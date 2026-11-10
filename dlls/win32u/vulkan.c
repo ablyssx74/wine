@@ -27,6 +27,13 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#ifdef __HAIKU__
+#include <sys/mman.h>
+/* (<OS.h> has a type called system_info, which win32u_private.h has a variable of) */
+#define system_info haiku_os_system_info
+#include <OS.h>
+#undef system_info
+#endif
 
 #include "ntstatus.h"
 #include "win32u_private.h"
@@ -1181,6 +1188,43 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         res = device->p_vkMapMemory( device->host.device, info.memory, info.offset, info.size, info.flags, data );
     }
 
+#ifdef __HAIKU__
+    if (placed_info.pPlacedAddress && res == VK_SUCCESS && *data != placed_info.pPlacedAddress)
+    {
+        /* The NVIDIA driver of Haiku (NVK) maps the memory where it likes and ignores the address it was asked for. A 32-bit
+         * program was handed the address Wine had reserved, which is not the GPU's memory: everything it wrote was lost and
+         * every frame came out empty. The driver's mapping is an area: clone it to the address that was asked for. */
+        void *host = *data, *dest = placed_info.pPlacedAddress;
+        SIZE_T reserved = (memory->size + 0xfff) & ~(SIZE_T)0xfff;
+        area_id area = area_for( host ), clone = B_ERROR;
+        area_info ai;
+
+        if (area >= 0 && get_area_info( area, &ai ) == B_OK && ai.address == host && ai.size <= reserved)
+        {
+            munmap( dest, ai.size );    /* (Wine's own reservation of the address) */
+            clone = clone_area( "wine vulkan map", &dest, B_EXACT_ADDRESS, B_READ_AREA | B_WRITE_AREA, area );
+            if (clone < 0 || dest != placed_info.pPlacedAddress)
+            {
+                if (clone >= 0) delete_area( clone );
+                mmap( placed_info.pPlacedAddress, ai.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0 );
+                clone = B_ERROR;
+            }
+        }
+        if (clone < 0)
+        {
+            ERR( "The driver mapped the memory at %p, not at the address %p it was asked for, and it cannot be moved there\n",
+                 host, placed_info.pPlacedAddress );
+            device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
+            res = VK_ERROR_MEMORY_MAP_FAILED;
+        }
+        else
+        {
+            TRACE( "The driver mapped the memory at %p, cloned its area to %p\n", host, dest );
+            *data = dest;
+        }
+    }
+#endif
+
     if (placed_info.pPlacedAddress)
     {
         if (res != VK_SUCCESS)
@@ -1981,6 +2025,14 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     return res;
 }
 
+/* Debug aid: WINE_HAIKU_VK_DEBUG=1 prints the first calls of acquire, submit and present with their sizes and results. */
+static BOOL haiku_vk_debug( unsigned *counter )
+{
+    static int on = -1;
+    if (on < 0) on = getenv( "WINE_HAIKU_VK_DEBUG" ) != NULL;
+    return on && (*counter)++ < 12;
+}
+
 static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchainKHR client_swapchain, uint64_t timeout,
                                               VkSemaphore client_semaphore, VkFence client_fence, uint32_t *image_index )
 {
@@ -1995,6 +2047,12 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
+    {
+        static unsigned n;
+        if (haiku_vk_debug( &n ))
+            fprintf( stderr, "vkdbg: acquire timeout %lld sem %d fence %d -> res %d index %u\n", (long long)timeout,
+                     semaphore != NULL, fence != NULL, res, image_index ? *image_index : ~0u );
+    }
 
     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
@@ -2046,6 +2104,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    {
+        static unsigned n;
+        if (haiku_vk_debug( &n ))
+            fprintf( stderr, "vkdbg: present waits %u swapchains %u index0 %u -> res %d\n", present_info->waitSemaphoreCount,
+                     present_info->swapchainCount, present_info->pImageIndices ? present_info->pImageIndices[0] : ~0u, res );
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
@@ -2439,6 +2503,17 @@ static VkResult win32u_vkQueueSubmit2( VkQueue client_queue, uint32_t count, con
     struct vulkan_device *device = queue->device;
 
     TRACE( "queue %p, count %u, submits %p, fence %p\n", queue, count, submits, fence );
+    {
+        static unsigned n;
+        if (haiku_vk_debug( &n ))
+        {
+            uint32_t i;
+            for (i = 0; i < count; i++)
+                fprintf( stderr, "vkdbg: submit2 [%u/%u] flags %x waits %u cmdbufs %u signals %u fence %d\n", i, count, submits[i].flags,
+                         submits[i].waitSemaphoreInfoCount, submits[i].commandBufferInfoCount, submits[i].signalSemaphoreInfoCount,
+                         fence != NULL );
+        }
+    }
 
     return queue_submit( queue, count, submits, client_fence, device->p_vkQueueSubmit2 );
 }
