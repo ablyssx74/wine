@@ -794,6 +794,15 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
     return recv_len;
 }
 
+#ifdef __HAIKU__
+/* Wine's socket workers assume the descriptor they got from the server is non-blocking (the server sets O_NONBLOCK). On Haiku
+ * the client's recvmsg() was seen blocking on such a socket while another thread was inside sendmsg() on it, and the sendmsg()
+ * never returned (kernel network stack spinning, slab memory growing at hundreds of MB/s): never rely on the flag. */
+#define HAIKU_SOCK_FLAGS MSG_DONTWAIT
+#else
+#define HAIKU_SOCK_FLAGS 0
+#endif
+
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
 {
     char control_buffer[512];
@@ -816,7 +825,7 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
 #endif
 
 	TRACE("async->unix_flags: %#x\n", async->unix_flags);
-    while ((ret = virtual_locked_recvmsg( fd, &hdr, async->unix_flags )) < 0 && errno == EINTR);
+    while ((ret = virtual_locked_recvmsg( fd, &hdr, async->unix_flags | HAIKU_SOCK_FLAGS )) < 0 && errno == EINTR);
 
     if (ret < 0)
     {
@@ -1103,7 +1112,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
     hdr.msg_iov = async->iov + async->iov_cursor;
     hdr.msg_iovlen = async->count - async->iov_cursor;
 
-    while ((ret = sendmsg( fd, &hdr, async->unix_flags )) == -1)
+    while ((ret = sendmsg( fd, &hdr, async->unix_flags | HAIKU_SOCK_FLAGS )) == -1)
     {
         if (errno == EISCONN)
         {
