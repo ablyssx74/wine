@@ -3,16 +3,38 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-39
+
+Steam now starts, signs in and shows the store, the library and your profile. Windows apps get smoother, and several network and font
+problems that broke Steam and the browsers are fixed.
+
+- **Steam signs in.** The network fixes below remove the "Unexpected Transport Error" and the failing sign-in polling; QR-code sign-in works.
+- **Steam draws correctly.** Child surfaces are stacked in the order the application asks for, and a page Steam switched away from no longer
+  shows through behind the current one.
+- **Readable text.** The usual Windows font names (Arial, Tahoma, Segoe UI, Verdana, Times New Roman, Courier New, Consolas and others) fall
+  back to Noto Sans / Noto Sans Mono, so text in Steam and other apps is no longer blank. Existing prefixes get this after `wineboot -u`.
+- **Smoother window dragging**, close to a native window.
+- **Child processes start without `fork()`.** On Haiku `fork()` copies page data in proportion to the reserved address space, which could use
+  up all the memory of the machine when a program like Steam's browser started its helpers. Wine now uses `posix_spawn()`
+  (`WINE_HAIKU_FORK_SPAWN=1` goes back to `fork()`).
+- **Network:** UDP sockets no longer fail every send (this was a runaway kernel memory growth while Steam ran); `netstat` and the TCP
+  connection table list the real connections; a crash in the network driver on interfaces without an address is fixed; a failing
+  `IPV6_V6ONLY` query is answered with success; `getaddrinfo()` calls are serialized.
+- **Browsers:** Chromium-based browsers (including Edge) start with `--no-sandbox` and `--disable-gpu`, hardware acceleration is off by default
+  in Firefox and Chromium browsers, `WINE_HAIKU_NO_KQUEUE=1` selects the `poll()` loop in the Wine server, and a crash that read a damaged TEB
+  page in the SIGSEGV handler is fixed.
+
 ## Requirements
 
 - Haiku x86_64, a recent nightly (hrev60299 or newer was tested), with the `wayland_server` compositor running.
 - For 3D: an NVIDIA GPU with the **Nebula** driver package installed. It brings the NVK Vulkan driver and Zink OpenGL.
   Without it, 64-bit programs still run and OpenGL uses Haiku's software renderer; DXVK needs Nebula.
 - For 32-bit programs: the `wine_compat` kernel add-on (see below).
+- Optional: the `wine_int3` kernel add-on, for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox; see below).
 
 ## Install
 
-Install `wine11-11.20-32-x86_64.hpkg` for the whole system, then make a prefix:
+Install `wine11-11.20-39-x86_64.hpkg` for the whole system, then make a prefix:
 
     wineboot -u
     wineserver -w
@@ -40,6 +62,12 @@ Check that it is active (the device can take a few seconds to appear, no reboot 
 `~/config/non-packaged/add-ons/kernel/drivers/dev/misc/wine_compat` and `.../drivers/bin/wine_compat`, wait about 10 seconds, and
 install again (`INSTALL.txt` in the zip has the exact commands). Without the add-on a 32-bit program stops with a message and 64-bit
 programs are not affected.
+
+### `int3` and `DebugBreak()` (`wine_int3`)
+
+Haiku's kernel does not turn an `int3` into `SIGTRAP`, so Chromium, WebView2 and the Firefox sandbox die when they execute one. `wine_int3`
+is a second small kernel add-on, only for Wine processes. Download `wine_int3.zip` from the release and install it the same way as
+`wine_compat` (its `INSTALL.txt` has the commands). It is optional: without it a program that executes `int3` is killed.
 
 ## Graphics
 
@@ -97,5 +125,8 @@ Keep `browser.tabs.remote.autostart` set to `false`. The standard Firefox instal
 
 ## Known problems
 
-- Programs that need Wine's sandbox features (Firefox's content and DRM processes, Steam's web helper) do not start.
-- 32-bit programs need the `wine_compat` add-on, which was tested on hrev60299 only.
+- Steam runs with its GPU path turned off (`-cef-disable-gpu -cef-disable-gpu-compositing`) and some pages still draw with small glitches
+  while they load.
+- Programs that need Wine's sandbox features (Firefox's content and DRM processes) do not start.
+- 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 and hrev60377; on another
+  build it reports that it could not install its hook and Wine disables 32-bit programs instead of crashing.
