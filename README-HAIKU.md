@@ -3,6 +3,22 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-40
+
+11.20-39 could not start 32-bit Windows programs (the error was "ShellExecuteEx failed: File not found", or "Missing game executable" in
+Steam). Install 11.20-40 if you installed 11.20-39.
+
+- **32-bit programs start again.** The new way of starting programs (`posix_spawn()`) asked for a separate 32-bit loader that a WoW64
+  build does not have, and gave up. It now falls back to the normal loader, as the old code did.
+- **Steam's Library page shows.** Steam keeps the page it left in a window that it hides; Wine put the picture of that hidden window over
+  the page that replaced it, so the Library never appeared under the old Store page. Hidden windows are no longer painted.
+- **Sockets** receive and send without blocking (`MSG_DONTWAIT`), as the build that ran Steam reliably did.
+- **Maximize and restore:** the compositor no longer returns a window to a 1x1 or full-screen-sized frame that it had recorded when a
+  window was created full-screen (Steam opens maximized from its saved settings). This stops a loop of 60 state changes a second, but
+  Steam's own restore still stays at full size, because the size it restores to is the whole screen. Resizing it smaller does not work yet.
+- Debug aids: `WINE_HAIKU_WIN_TRACE=1` prints the window state requests and replies of the compositor, and `WINE_HAIKU_DUMP_DIR=<dir>` (then
+  `touch <dir>/trigger`) saves what each window surface has committed.
+
 ## What's new in 11.20-39
 
 Steam now starts, signs in and shows the store, the library and your profile. Windows apps get smoother, and several network and font
@@ -28,7 +44,7 @@ problems that broke Steam and the browsers are fixed.
 
 | file | what it is |
 |---|---|
-| `wine11-11.20-39-x86_64.hpkg` | Wine, install for the whole system |
+| `wine11-11.20-40-x86_64.hpkg` | Wine, install for the whole system |
 | `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
 | `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
 | `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches |
@@ -44,7 +60,7 @@ problems that broke Steam and the browsers are fixed.
 
 ## Install
 
-Install `wine11-11.20-39-x86_64.hpkg` for the whole system, then make a prefix:
+Install `wine11-11.20-40-x86_64.hpkg` for the whole system, then make a prefix:
 
     wineboot -u
     wineserver -w
@@ -138,8 +154,13 @@ Video with DRM does not play, and `about:support` crashed an earlier build (not 
 
 ## Known problems
 
+- On one test PC the whole system sometimes froze for good while Steam's window was changing (a Library click, maximizing it, a page
+  loading). The kernel log shows nothing, and the cause has not been found.
+- Unreal Tournament 3 starts but its window stays white or tiny, and Steam's CD-key window never appears (the game does not need it).
+- Steam sometimes stalls while starting ("steamwebhelper is not responding"). Close Steam, wait about 15 seconds so that all of Wine has
+  stopped, and start it again.
 - Steam runs with its GPU path turned off (`-cef-disable-gpu -cef-disable-gpu-compositing`) and some pages still draw with small glitches
   while they load, and its tab layout is not always right.
 - Programs that need Wine's sandbox features (Firefox's content and DRM processes) do not start.
-- 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 and hrev60377; on another
+- 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 (`wine_int3` on hrev60377); on another
   build it reports that it could not install its hook and Wine disables 32-bit programs instead of crashing.
