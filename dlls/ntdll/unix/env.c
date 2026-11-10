@@ -1468,7 +1468,7 @@ static BOOL haiku_wcs_contains( const WCHAR *str, DWORD len, const char *needle 
     return FALSE;
 }
 
-/* Fills extra (at least 64 chars) with the switches to add and returns their number. msedge.exe also gets --no-sandbox: Edge's renderers
+/* Fills extra (at least 128 chars) with the switches to add and returns their number. msedge.exe also gets --no-sandbox: Edge's renderers
  * cannot be started in its sandbox under Wine (no renderer process, blank pages), the other browsers can. WINE_HAIKU_BROWSER_SANDBOX
  * in the environment keeps Edge's sandbox. */
 static DWORD haiku_browser_cmdline_extra( const WCHAR *image, DWORD len, const WCHAR *cmd, DWORD cmdlen, char *extra )
@@ -1481,6 +1481,23 @@ static DWORD haiku_browser_cmdline_extra( const WCHAR *image, DWORD len, const W
     for (i = len; i > 0; i--) if (image[i - 1] == '\\' || image[i - 1] == '/') break;
     image += i;
     len -= i;
+    /* Steam's own client (not the browser it starts): its browser helper stalls at start-up when it uses the GPU, so the client gets
+     * the switches that turn that off, which is what its "restart with GPU acceleration disabled" does by itself, unless the command
+     * line has them already or WINE_HAIKU_STEAM_GPU / WINE_HAIKU_STEAM_SANDBOX are set. */
+    if (len == 9)
+    {
+        static const char steam[] = "steam.exe";
+        for (j = 0; j < len; j++) if ((image[j] | 0x20) != (WCHAR)steam[j]) break;
+        if (j == len)
+        {
+            if (!getenv( "WINE_HAIKU_STEAM_GPU" ) && !haiku_wcs_contains( cmd, cmdlen, "-cef-disable-gpu" ) &&
+                !haiku_wcs_contains( cmd, cmdlen, "-cef-enable-gpu" ))
+                strcat( extra, " -cef-disable-gpu -cef-disable-gpu-compositing" );
+            if (!getenv( "WINE_HAIKU_STEAM_SANDBOX" ) && !haiku_wcs_contains( cmd, cmdlen, "-no-cef-sandbox" ))
+                strcat( extra, " -no-cef-sandbox" );
+            return strlen( extra );
+        }
+    }
     for (i = 0; i < ARRAY_SIZE(browsers); i++)
     {
         const char *b = browsers[i];
@@ -1532,7 +1549,9 @@ static WCHAR *build_command_line( WCHAR **wargv )
 
     len = 1;
     for (arg = wargv; *arg; arg++) len += 3 + 2 * wcslen( *arg );
-    if (!(ret = malloc( (len + 32) * sizeof(WCHAR) ))) return NULL;
+    /* (Haiku: room for the switches haiku_browser_cmdline_extra() appends, up to 127 chars, which a short command line like "steam.exe"
+     * would overflow) */
+    if (!(ret = malloc( (len + 32 + 128) * sizeof(WCHAR) ))) return NULL;
 
     p = ret;
     for (arg = wargv; *arg; arg++)
@@ -1580,7 +1599,7 @@ static WCHAR *build_command_line( WCHAR **wargv )
 #ifdef __HAIKU__
     if (wargv[0])
     {
-        char xs[64];
+        char xs[128];
         DWORD k, extra = haiku_browser_cmdline_extra( wargv[0], wcslen( wargv[0] ), ret, p - ret, xs );
         for (k = 0; k < extra; k++) *p++ = (unsigned char)xs[k];
         *p = 0;
@@ -2198,7 +2217,7 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     DWORD size;
     void *ptr;
 #ifdef __HAIKU__
-    char haiku_extra[64];
+    char haiku_extra[128];
     DWORD cmd_extra = haiku_browser_cmdline_extra( nt_image->Buffer, nt_image->Length / sizeof(WCHAR),
                                                    get_params_string( params, &params->CommandLine ),
                                                    params->CommandLine.Length / sizeof(WCHAR), haiku_extra ) * sizeof(WCHAR);
