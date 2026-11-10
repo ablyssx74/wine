@@ -545,10 +545,22 @@ NTSTATUS spawn_wineloader( pid_t *pid, char **argv, int socketfd, const struct p
     for (j = 0; j < n; j++) env[k++] = extra[j];
     env[k] = NULL;
 
-    if (!(path = get_alternate_wineloader( machine ))) path = strdup( wineloader );
-    argv[1] = path;
-    ret = posix_spawn( pid, path, actions, attr, argv + 1, env );
-    free( path );
+    /* like loader_exec(): the loader of the other architecture is tried first, and when it does not exist (a WoW64 build has
+     * no i386-unix/wine) the default loader starts the program */
+    ret = ENOENT;
+    if ((path = get_alternate_wineloader( machine )))
+    {
+        argv[1] = path;
+        ret = posix_spawn( pid, path, actions, attr, argv + 1, env );
+        free( path );
+    }
+    if (ret == ENOENT)
+    {
+        path = strdup( wineloader );
+        argv[1] = path;
+        ret = posix_spawn( pid, path, actions, attr, argv + 1, env );
+        free( path );
+    }
     free( env );
     return ret ? errno_to_status( ret ) : STATUS_SUCCESS;
 }
