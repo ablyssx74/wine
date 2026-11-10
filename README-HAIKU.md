@@ -112,7 +112,11 @@ Only Direct3D 9 and 11 programs use DXVK; an OpenGL renderer does not.
 
 ## Firefox
 
-The portable Firefox works. In its profile's `user.js`, to use the GPU for rendering:
+The standard Firefox install and the portable one both render pages, with Firefox's own sandbox on (a Haiku kernel bug that left the
+sandboxed content processes with unreadable code was worked around in Wine, so `MOZ_DISABLE_CONTENT_SANDBOX=1` is no longer needed).
+New prefixes get a policy that turns hardware acceleration off; for an existing prefix run `wineboot -u`.
+
+To use the GPU for rendering anyway, put this in the profile's `user.js`:
 
     user_pref("gfx.webrender.all", true);
     user_pref("gfx.webrender.software", false);
@@ -120,8 +124,7 @@ The portable Firefox works. In its profile's `user.js`, to use the GPU for rende
     user_pref("layers.acceleration.force-enabled", true);
     user_pref("layers.gpu-process.enabled", false);
 
-Keep `browser.tabs.remote.autostart` set to `false`. The standard Firefox install shows a blank page unless
-`MOZ_DISABLE_CONTENT_SANDBOX=1` is set, video with DRM does not play, and `about:support` crashes it.
+Video with DRM does not play, and `about:support` crashed an earlier build (not rechecked).
 
 ## Known problems
 
