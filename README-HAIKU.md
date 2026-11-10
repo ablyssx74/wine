@@ -9,8 +9,8 @@ Steam now starts, signs in and shows the store, the library and your profile. Wi
 problems that broke Steam and the browsers are fixed.
 
 - **Steam signs in.** The network fixes below remove the "Unexpected Transport Error" and the failing sign-in polling; QR-code sign-in works.
-- **Steam draws correctly.** Child surfaces are stacked in the order the application asks for, and a page Steam switched away from no longer
-  shows through behind the current one.
+- **Steam draws better, but not perfectly.** Child surfaces are now stacked in the order the application asks for, and a page Steam switched
+  away from no longer shows through behind the current one. The tab layout is still not right in places and some glitches remain.
 - **Readable text.** The usual Windows font names (Arial, Tahoma, Segoe UI, Verdana, Times New Roman, Courier New, Consolas and others) fall
   back to Noto Sans / Noto Sans Mono, so text in Steam and other apps is no longer blank. Existing prefixes get this after `wineboot -u`.
 - **Smoother window dragging**, close to a native window.
@@ -126,7 +126,7 @@ Keep `browser.tabs.remote.autostart` set to `false`. The standard Firefox instal
 ## Known problems
 
 - Steam runs with its GPU path turned off (`-cef-disable-gpu -cef-disable-gpu-compositing`) and some pages still draw with small glitches
-  while they load.
+  while they load, and its tab layout is not always right.
 - Programs that need Wine's sandbox features (Firefox's content and DRM processes) do not start.
 - 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 and hrev60377; on another
   build it reports that it could not install its hook and Wine disables 32-bit programs instead of crashing.
