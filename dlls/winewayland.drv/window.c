@@ -577,6 +577,21 @@ static void wayland_configure_window(HWND hwnd)
         return;
     }
 
+    /* A window that the application has just minimized (WS_MINIMIZE is set) can still receive a configure that the
+     * compositor sent before it learned about the minimize (e.g. for the deactivation that made the application
+     * minimize itself). Applying it would move and resize the minimized window back to its old rectangle without
+     * clearing WS_MINIMIZE, and the application would then never see a real size again (UE3 games kept a viewport
+     * of the minimized 160x31 size). Just acknowledge it; the compositor sends a new configure on the real restore. */
+    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE)
+    {
+        TRACE("hwnd=%p minimized, ignoring configure\n", hwnd);
+        surface->current = surface->processing;
+        memset(&surface->processing, 0, sizeof(surface->processing));
+        xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        wayland_win_data_release(data);
+        return;
+    }
+
     SetRect(&rect, 0, 0, width, height);
     rect = map_rect_from_surface(surface, rect);
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
