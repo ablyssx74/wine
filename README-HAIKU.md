@@ -3,6 +3,36 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-41
+
+Steam starts reliably, 32-bit DirectX games draw again, Unreal Tournament 3 gets past its start-up, and Mesa's shader cache finally
+stores what the games compile.
+
+- **Steam starts reliably.** About every other start its browser helper hung (no window, "RetryCreateBrowser" in the logs). Cause: Chromium's
+  profiler suspends other threads all the time, and Wine's suspend (a signal) can park a thread inside `dlopen()` while it holds Haiku's
+  runtime-loader lock; the thread that starts the helper processes then waits for that lock for ever. The `wine` loader now blocks the suspend
+  signal while `dlopen()` runs. 8 starts in a row: all 8 up in 12 seconds.
+- **Programs that look up host names no longer crash.** Wine's `gethostbyname()` crashed on Haiku (it used a `gethostbyname_r()` that Haiku does not
+  have in that form), so a program that asks again at once looped for ever. Unreal Tournament 3 did this at start-up (about 240 lookups a second,
+  a white window). It now starts, and shows its screens at full size.
+- **32-bit DXVK games draw.** NVK on Haiku ignores the address that a 32-bit program's memory mapping asks for, so the game wrote into pages the
+  GPU never saw and every frame was black. The mapping is now moved to the requested address.
+- **Mesa's shader cache works.** On Haiku's file system Mesa could not set up its disk cache (`posix_fallocate()` is not supported there and Mesa
+  gives up), so nothing was ever stored and every shader was compiled again at every start, which showed as pauses of seconds. The `wine` loader now
+  provides a `posix_fallocate()` that falls back to `ftruncate()`. A first start of a big game still compiles for a while (UT3: about 10,000 shaders,
+  31 MB stored); later starts reuse them. The real fix belongs into Nebula's Mesa: `dxvk-tools.zip` has the small patch
+  (`mesa-disk-cache-posix-fallocate.patch`); with it the loader's version does nothing.
+- **`wine steam.exe` starts Steam with the switches it needs** (`-cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox`), unless the command
+  line has them or `WINE_HAIKU_STEAM_GPU` / `WINE_HAIKU_STEAM_SANDBOX` is set. A buffer overflow in building that command line, which could crash
+  Steam, is fixed.
+- **Restoring a window that was saved maximized** (Steam) gives a window of 3/4 of the work area instead of the whole screen.
+- Debug aids: `WINE_HAIKU_FRAME_GAP=<ms>` logs pauses between presented frames, `WINE_HAIKU_VK_DEBUG=1` the first Vulkan calls, and
+  `WINE_HAIKU_GL_DEBUG=1` now also counts the pixels of presented frames.
+
+Wine does not switch the display mode: set the fullscreen resolution of a game to your screen's own in its settings file, or it shows a small
+picture in a white window. Unreal Tournament 2004: `FullscreenViewportX/Y` in `System/UT2004.ini`. Unreal Tournament 3: `ResX`/`ResY` in the
+`[SystemSettings]` section of `Documents/My Games/Unreal Tournament 3/UTGame/Config/UTEngine.ini` (the file has Windows line endings).
+
 ## What's new in 11.20-40
 
 11.20-39 could not start 32-bit Windows programs (the error was "ShellExecuteEx failed: File not found", or "Missing game executable" in
@@ -44,10 +74,10 @@ problems that broke Steam and the browsers are fixed.
 
 | file | what it is |
 |---|---|
-| `wine11-11.20-40-x86_64.hpkg` | Wine, install for the whole system |
+| `wine11-11.20-41-x86_64.hpkg` | Wine, install for the whole system |
 | `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
 | `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
-| `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches |
+| `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches (now with the shader cache fix) |
 | `ut4-launcher.zip` | the UT4 Community Launcher 1.9.0 built to run under Wine (needs the WebView2 runtime and `wine_int3`; steps in its README) |
 
 ## Requirements
@@ -66,7 +96,8 @@ Install `wine11-11.20-40-x86_64.hpkg` for the whole system, then make a prefix:
     wineserver -w
 
 `wineboot` returns before it has finished; `wineserver -w` waits until the prefix is complete. Do this once, and before any
-32-bit program.
+32-bit program. Install the `wine_compat` add-on (below) **before** you make the prefix: without it the 32-bit part
+of the prefix (`syswow64`) is not created, and 32-bit programs, Steam among them, do not start.
 
 ### 32-bit programs (`wine_compat`)
 
@@ -154,13 +185,14 @@ Video with DRM does not play, and `about:support` crashed an earlier build (not 
 
 ## Known problems
 
-- On one test PC the whole system sometimes froze for good while Steam's window was changing (a Library click, maximizing it, a page
-  loading). The kernel log shows nothing, and the cause has not been found.
-- Unreal Tournament 3 starts but its window stays white or tiny, and Steam's CD-key window never appears (the game does not need it).
-- Steam sometimes stalls while starting ("steamwebhelper is not responding"). Close Steam, wait about 15 seconds so that all of Wine has
-  stopped, and start it again.
+- On one test PC the whole system sometimes froze for good, usually during Steam or game activity. The kernel log of several of these freezes
+  ends with `NVRM: Assertion failed: _rmGpuAllocLockIsOwner()` from Nebula's kernel driver; the cause has not been found.
+- There is no vertical-blank sync: Haiku's graphics driver for NVIDIA (Nebula) does not offer a retrace signal (`BScreen::WaitForRetrace()`
+  answers "not supported"), so full-screen games can show a horizontal tear line. Wine's frame pacing follows the compositor, not the display.
+- Wine does not change the display mode (see the note under 11.20-41).
+- A first start of a big game compiles its shaders and can take minutes with a white or black window; Mesa's cache then keeps them.
 - Steam runs with its GPU path turned off (`-cef-disable-gpu -cef-disable-gpu-compositing`) and some pages still draw with small glitches
-  while they load, and its tab layout is not always right.
+  while they load, and its tab layout is not always right. Steam's CD-key window never appears (Unreal Tournament 3 does not need it).
 - Programs that need Wine's sandbox features (Firefox's content and DRM processes) do not start.
-- 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 (`wine_int3` on hrev60377); on another
+- 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 and hrev60382 (`wine_int3` on hrev60377); on another
   build it reports that it could not install its hook and Wine disables 32-bit programs instead of crashing.
