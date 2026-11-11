@@ -32,6 +32,7 @@
 #include <dlfcn.h>
 #include <limits.h>
 #ifdef __HAIKU__
+#include <errno.h>
 #include <image.h>
 #endif
 #ifdef HAVE_SYS_SYSCTL_H
@@ -171,6 +172,27 @@ static void *try_dlopen( const char *argv0 )
     return handle;
 }
 
+
+#ifdef __HAIKU__
+/* Haiku's file system (BFS) cannot preallocate, posix_fallocate() fails with EOPNOTSUPP. Mesa's shader disk cache, which the Vulkan
+ * driver loads into every Wine process that uses DXVK, sizes its index file with posix_fallocate() and gives up on the whole cache
+ * when that fails: nothing is ever stored and every shader is compiled again at every start (pauses of seconds in games).
+ * The symbol of the program is found before the one of libroot by every library of the process, so defining it here lets the
+ * driver use it: the system's function first, and when it answers EOPNOTSUPP the file is extended with ftruncate() instead (which
+ * is what Mesa itself does without posix_fallocate, and what recent Mesa does on EOPNOTSUPP). */
+__attribute__((visibility("default"))) int posix_fallocate( int fd, off_t offset, off_t len )
+{
+    static int (*real)( int, off_t, off_t );
+    struct stat st;
+    int ret;
+
+    if (!real) real = dlsym( RTLD_NEXT, "posix_fallocate" );
+    if (real && (ret = real( fd, offset, len )) != EOPNOTSUPP) return ret;
+    if (fstat( fd, &st )) return errno;
+    if (st.st_size >= offset + len) return 0;
+    return ftruncate( fd, offset + len ) ? errno : 0;
+}
+#endif
 
 /**********************************************************************
  *           main
