@@ -34,6 +34,7 @@
 #ifdef __HAIKU__
 #include <errno.h>
 #include <image.h>
+#include <signal.h>
 #endif
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
@@ -191,6 +192,28 @@ __attribute__((visibility("default"))) int posix_fallocate( int fd, off_t offset
     if (fstat( fd, &st )) return errno;
     if (st.st_size >= offset + len) return 0;
     return ftruncate( fd, offset + len ) ? errno : 0;
+}
+
+/* Wine suspends a thread (SuspendThread, which Chromium's stack sampling profiler calls all the time) with a signal that parks the
+ * thread wherever it is. In dlopen() Haiku's runtime loader holds its global lock, and a thread parked there with the lock keeps
+ * every thread that needs the loader (pthread_create(), dlopen(), dladdr()) waiting for ever: Steam's browser hung in its first
+ * seconds, when it loads many libraries (and the three audio drivers that are not there, which make the loader write a kernel debug
+ * line each time), and its helper processes never got started. The suspend signal (SIGUSR1) is blocked while dlopen() runs, so it is
+ * delivered when the loader lock has been released. Same way as posix_fallocate() above: the program's own symbol is found first. */
+__attribute__((visibility("default"))) void *dlopen( const char *name, int flags )
+{
+    static void *(*real)( const char *, int );
+    sigset_t set, old;
+    void *ret;
+
+    if (!real) real = dlsym( RTLD_NEXT, "dlopen" );
+    if (!real) return NULL;
+    sigemptyset( &set );
+    sigaddset( &set, SIGUSR1 );
+    pthread_sigmask( SIG_BLOCK, &set, &old );
+    ret = real( name, flags );
+    if (!sigismember( &old, SIGUSR1 )) pthread_sigmask( SIG_UNBLOCK, &set, NULL );
+    return ret;
 }
 #endif
 
