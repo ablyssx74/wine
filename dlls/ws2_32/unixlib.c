@@ -105,6 +105,15 @@
 WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
+#ifdef __HAIKU__
+/* Haiku has no gethostbyname_r()/gethostbyaddr_r() with the Linux arguments (netdb.h does not even declare them), but configure can
+ * take them for existing (the old function with another meaning is found at link time): the result pointer is then never set, and
+ * gethostbyname() (every lookup of a game that calls it) sorted a garbage address list and crashed with SIGSEGV in
+ * sort_addrs_hashed(), over and over, because the game just asks again: Unreal Tournament 3 resolved stunserver.org 240 times a
+ * second and never got any further. The plain functions with the mutex are used. */
+# undef HAVE_LINUX_GETHOSTBYNAME_R_6
+#endif
+
 #ifndef HAVE_LINUX_GETHOSTBYNAME_R_6
 static pthread_mutex_t host_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
