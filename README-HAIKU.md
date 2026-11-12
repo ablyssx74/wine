@@ -3,6 +3,20 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-42
+
+Unreal Tournament 3 comes up full-screen, and games lag much less with Mesa's shader cache on.
+
+- **Unreal Tournament 3 starts at full size.** When it lost activation at start-up (Steam's window or its own splash took the focus) it minimized
+  itself, and the compositor's reply to that, a configure for the old full-screen size, was applied to the minimized window. The window moved
+  back to full size but stayed minimized as far as the game knew, so it never got a real size again and drew into a 160x31 strip. A configure that
+  arrives right after the minimize is now ignored, and the one the compositor sends when you click the window's tab restores it.
+- **Mesa's shader cache is much smoother.** Its default stores one file per shader, and on Haiku's file system that made Unreal Tournament 4 lag
+  all the time. The `wine` loader now selects Mesa's single-file cache (`MESA_DISK_CACHE_SINGLE_FILE=true`), which was the smoothest of the three
+  kinds in tests (single file, database `MESA_DISK_CACHE_DATABASE=true`, one file per shader). Set any of those variables yourself to choose
+  another, or `MESA_SHADER_CACHE_DISABLE=true` for no cache at all. A new cache still costs some stutter while it fills during the first
+  hours of play.
+
 ## What's new in 11.20-41
 
 Steam starts reliably, 32-bit DirectX games draw again, Unreal Tournament 3 gets past its start-up, and Mesa's shader cache finally
@@ -74,7 +88,7 @@ problems that broke Steam and the browsers are fixed.
 
 | file | what it is |
 |---|---|
-| `wine11-11.20-41-x86_64.hpkg` | Wine, install for the whole system |
+| `wine11-11.20-42-x86_64.hpkg` | Wine, install for the whole system |
 | `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
 | `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
 | `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches (now with the shader cache fix) |
@@ -90,7 +104,7 @@ problems that broke Steam and the browsers are fixed.
 
 ## Install
 
-Install `wine11-11.20-40-x86_64.hpkg` for the whole system, then make a prefix:
+Install `wine11-11.20-42-x86_64.hpkg` for the whole system, then make a prefix:
 
     wineboot -u
     wineserver -w
