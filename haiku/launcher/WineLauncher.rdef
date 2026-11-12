@@ -1,0 +1,10 @@
+resource app_signature "application/x-vnd.Wine-Launcher";
+resource app_flags B_SINGLE_LAUNCH | B_BACKGROUND_APP;
+resource app_version { major = 1, middle = 0, minor = 0, variety = B_APPV_FINAL, internal = 0,
+	short_info = "Wine Launcher", long_info = "Opens Windows programs with Wine" };
+resource file_types message {
+	"types" = "application/x-dosexec",
+	"types" = "application/x-ms-installer",
+	"types" = "application/x-ms-shortcut",
+	"types" = "application/x-ms-batch"
+};
