@@ -3,6 +3,24 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-43
+
+Steam no longer hangs at start-up or locks up when you click its menus, and its menus open where they should.
+
+- **Steam's browser no longer hangs at start-up.** Haiku's `posix_spawn()` with file actions forks and then calls `malloc()` in the child; when
+  another thread of the parent was inside `malloc()` at that moment, the child waited for ever for a lock nobody could release, and the thread
+  that was starting it waited for the child (no update window, one CPU at 100%, menus and games queued behind it). Wine now starts its loader without
+  file actions, which Haiku does not fork for, and the loader does what the actions did (standard input and output, directory, new session) as its
+  first step.
+- **Steam's menus do not lock it up.** A flush of a window's picture asked Windows for the window stacking while it held the picture's lock, and
+  `SetParent()` (which a menu click does) holds the other lock and wants the picture's: two threads waited for each other. The stacking is now read first.
+- **Menus open under their titles and stay open.** A menu is an undecorated popup that Steam activates; an activated window became a top-level window,
+  which Haiku's compositor places in the middle of the screen while Wine believed it was where it had asked, so the pointer position Wine worked out for
+  the menu was wrong and Steam closed it as the mouse entered it. An undecorated popup with an owner is now drawn inside its owner, where it was asked to be.
+
+Known problem: with the Steam overlay turned on, Steam keeps showing a game it started as running after the game has quit (the game and the overlay
+process have ended; the cause is in Steam, not found yet). Turn the overlay off in Steam's settings (In Game) as a workaround.
+
 ## What's new in 11.20-42
 
 Unreal Tournament 3 comes up full-screen, and games lag much less with Mesa's shader cache on.
@@ -88,7 +106,7 @@ problems that broke Steam and the browsers are fixed.
 
 | file | what it is |
 |---|---|
-| `wine11-11.20-42-x86_64.hpkg` | Wine, install for the whole system |
+| `wine11-11.20-43-x86_64.hpkg` | Wine, install for the whole system |
 | `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
 | `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
 | `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches (now with the shader cache fix) |
@@ -104,7 +122,7 @@ problems that broke Steam and the browsers are fixed.
 
 ## Install
 
-Install `wine11-11.20-42-x86_64.hpkg` for the whole system, then make a prefix:
+Install `wine11-11.20-43-x86_64.hpkg` for the whole system, then make a prefix:
 
     wineboot -u
     wineserver -w
@@ -206,7 +224,7 @@ Video with DRM does not play, and `about:support` crashed an earlier build (not 
 - Wine does not change the display mode (see the note under 11.20-41).
 - A first start of a big game compiles its shaders and can take minutes with a white or black window; Mesa's cache then keeps them.
 - Steam runs with its GPU path turned off (`-cef-disable-gpu -cef-disable-gpu-compositing`) and some pages still draw with small glitches
-  while they load, and its tab layout is not always right. Steam's CD-key window never appears (Unreal Tournament 3 does not need it).
+  while they load. Steam streaming has not been fully tested yet.
 - Programs that need Wine's sandbox features (Firefox's content and DRM processes) do not start.
 - 32-bit programs need the `wine_compat` add-on. It depends on kernel internals and was tested on hrev60299 and hrev60382 (`wine_int3` on hrev60377); on another
   build it reports that it could not install its hook and Wine disables 32-bit programs instead of crashing.
