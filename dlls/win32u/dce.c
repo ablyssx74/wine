@@ -614,7 +614,9 @@ void window_surface_unlock( struct window_surface *surface )
 }
 
 static const struct window_surface_funcs remote_surface_funcs;
-static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits );
+static BOOL collect_remote_stacking( HWND top, HWND *stack, UINT *stack_count, UINT max );
+static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits,
+                                 const HWND *stack, UINT stack_count );
 
 void window_surface_flush( struct window_surface *surface )
 {
@@ -624,6 +626,15 @@ void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
+    HWND stack[128];
+    UINT stack_count = 0;
+    BOOL have_stack = FALSE;
+
+    /* The stacking of the windows is read before the surface is locked: it needs the user lock, and a thread that holds the user
+     * lock (SetParent, say) takes the surface lock to change the shape of the surface. Reading it under the surface lock made
+     * the two wait for each other for ever (Steam's menus). */
+    if (surface->funcs != &remote_surface_funcs)
+        have_stack = collect_remote_stacking( surface->hwnd, stack, &stack_count, ARRAY_SIZE(stack) );
 
     window_surface_lock( surface );
 
@@ -643,7 +654,7 @@ void window_surface_flush( struct window_surface *surface )
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
 
-        if (surface->funcs != &remote_surface_funcs) apply_remote_layers( surface, &dirty, color_info, color_bits );
+        if (have_stack) apply_remote_layers( surface, &dirty, color_info, color_bits, stack, stack_count );
 
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
@@ -1214,12 +1225,28 @@ static void collect_stacking( HWND hwnd, HWND *list, UINT *count, UINT max, UINT
  * go on in the order their windows are stacked (the window under first), not in the order they were changed: a window that
  * paints its background late (after a resize, say) must not end up over the content of the window above it, which only
  * sends the parts of it that changed. */
-static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits )
+/* The stacking of the windows over which the layers go (read by the caller before it locks the surface), only when there are
+ * layers for this top-level window: it asks the server, and only when it matters. */
+static BOOL collect_remote_stacking( HWND top, HWND *stack, UINT *stack_count, UINT max )
+{
+    struct remote_layer *layer;
+    UINT count = 0;
+
+    pthread_mutex_lock( &remote_lock );
+    LIST_FOR_EACH_ENTRY( layer, &remote_layers, struct remote_layer, entry ) if (layer->top == top) count++;
+    pthread_mutex_unlock( &remote_lock );
+    if (!count) return FALSE;
+    *stack_count = 0;
+    collect_stacking( top, stack, stack_count, max, 0 );
+    return TRUE;
+}
+
+static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits,
+                                 const HWND *stack, UINT stack_count )
 {
     struct { struct remote_layer *layer; ULONGLONG key; } sorted[64];
     struct remote_layer *layer;
-    HWND stack[128];
-    UINT stack_count = 0, count = 0, j, k;
+    UINT count = 0, j, k;
     int stride, height, i;
     BOOL bottom_up;
 
@@ -1228,13 +1255,6 @@ static void apply_remote_layers( struct window_surface *surface, const RECT *dir
     stride = get_dib_stride( info->bmiHeader.biWidth, 32 );
     height = abs( info->bmiHeader.biHeight );
     bottom_up = info->bmiHeader.biHeight > 0;
-
-    /* the stacking is read without the lock (it asks the server), and only when it matters */
-    pthread_mutex_lock( &remote_lock );
-    LIST_FOR_EACH_ENTRY( layer, &remote_layers, struct remote_layer, entry ) if (layer->top == surface->hwnd) count++;
-    pthread_mutex_unlock( &remote_lock );
-    if (!count) return;
-    collect_stacking( surface->hwnd, stack, &stack_count, ARRAY_SIZE(stack), 0 );
 
     pthread_mutex_lock( &remote_lock );
     count = 0;
