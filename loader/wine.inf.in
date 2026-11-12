@@ -627,6 +627,9 @@ HKCU,Software\Wine\Fonts\Replacements,"Calibri",0x10000,"Noto Sans"
 HKCU,Software\Wine\Fonts\Replacements,"Courier New",0x10000,"Noto Sans Mono"
 HKCU,Software\Wine\Fonts\Replacements,"Consolas",0x10000,"Noto Sans Mono"
 HKCU,Software\Wine\Fonts\Replacements,"Lucida Console",0x10000,"Noto Sans Mono"
+; Haiku: Wine's explorer shows the tray icons (Steam's, for one) in a window of their own, which on Haiku is a separate Wine window
+; of its own next to the application. Hide it. NOCLOBBER (0x10003): a value the user sets is kept, so set ShowSystray to 1 to get the window back.
+HKCU,Software\Wine\Explorer,"ShowSystray",0x10003,0
 HKLM,Software\Registered Applications,,16
 HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisable8dot3NameCreation",0x10003,0
 HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisableLastAccessUpdate",0x10003,0x80000002
