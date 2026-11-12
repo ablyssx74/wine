@@ -386,6 +386,13 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
     /* child windows are not managed */
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
+    /* An undecorated popup with an owner (a menu, a tooltip) is not managed even when it is activated: a managed window is a
+     * top-level, and the compositor decides where a top-level goes (Haiku's puts it in the middle of the screen) while Wine
+     * thinks it is where it asked for it. The pointer position that Wine works out for it is then wrong and Steam's menus
+     * closed as the mouse entered them. As a subsurface of its owner it is placed where it was asked to be. */
+    if ((style & WS_POPUP) && !(style & (WS_CAPTION|WS_THICKFRAME|WS_SYSMENU)) && !fullscreen &&
+        NtUserGetWindowRelative(hwnd, GW_OWNER) &&
+        !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW)) return FALSE;
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
     if (hwnd == get_active_window()) return TRUE;
