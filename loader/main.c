@@ -215,6 +215,38 @@ __attribute__((visibility("default"))) void *dlopen( const char *name, int flags
     if (!sigismember( &old, SIGUSR1 )) pthread_sigmask( SIG_UNBLOCK, &set, NULL );
     return ret;
 }
+
+/* The parent starts this loader with load_image() instead of posix_spawn() with file actions (which forks, and the child can wait for
+ * ever for a malloc lock held by another thread of the parent: see haiku_spawn_process in dlls/ntdll/unix/process.c) and tells what the
+ * actions and attributes would have done in WINE_HAIKU_SPAWN="in,out,stdin_fd,stdout_fd,unixdir,new_session". Done first thing. */
+static void haiku_spawn_prologue(void)
+{
+    int in, out, stdin_fd, stdout_fd, unixdir, new_session, fd;
+    const char *desc = getenv( "WINE_HAIKU_SPAWN" );
+
+    if (!desc) return;
+    if (sscanf( desc, "%d,%d,%d,%d,%d,%d", &in, &out, &stdin_fd, &stdout_fd, &unixdir, &new_session ) != 6) return;
+    unsetenv( "WINE_HAIKU_SPAWN" );
+    signal( SIGPIPE, SIG_DFL );
+    if (new_session) setsid();
+    if (in == -1)
+    {
+        if ((fd = open( "/dev/null", O_RDWR )) != -1 && fd != 0) { dup2( fd, 0 ); close( fd ); }
+    }
+    else if (in != 0) dup2( in, 0 );
+    if (out == -1)
+    {
+        if ((fd = open( "/dev/null", O_RDWR )) != -1 && fd != 1) { dup2( fd, 1 ); close( fd ); }
+    }
+    else if (out != 1) dup2( out, 1 );
+    if (stdin_fd > 1) close( stdin_fd );
+    if (stdout_fd > 1 && stdout_fd != stdin_fd) close( stdout_fd );
+    if (unixdir != -1)
+    {
+        if (fchdir( unixdir )) {}
+        close( unixdir );
+    }
+}
 #endif
 
 /**********************************************************************
@@ -225,6 +257,7 @@ int main( int argc, char *argv[] )
     void *handle;
 
 #ifdef __HAIKU__
+    haiku_spawn_prologue();
     /* Mesa's default shader cache writes one file per shader, and on BFS that made UT4 lag all the time (thousands of small
      * file creations while playing). Its single-file backend (one append-only file) does not: measured with UT4, per-file was
      * the worst, the database backend better, the single file the best. A choice made by the user in the environment wins. */

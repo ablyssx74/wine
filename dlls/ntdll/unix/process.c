@@ -418,48 +418,39 @@ static void *haiku_reaper( void *arg )
 static NTSTATUS haiku_spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd, int unixdir, char *winedebug,
                                      const struct pe_image_info *pe_info, int stdin_fd, int stdout_fd )
 {
-    posix_spawn_file_actions_t actions;
-    posix_spawnattr_t attr;
-    sigset_t sigdef, all, old;
+    sigset_t all, old;
     NTSTATUS status;
     pid_t pid = -1;
-    char **argv;
+    char **argv, desc[96];
     BOOL new_session = ((peb && peb->ProcessParameters &&
                          params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                         params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
                         params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
                         params->ConsoleHandle == NULL);
     int in = new_session ? -1 : stdin_fd, out = new_session ? -1 : stdout_fd;
-    short flags = POSIX_SPAWN_SETSIGDEF;
+    int fds[5] = { in, out, stdin_fd, stdout_fd, unixdir }, flags[5], i;
 
-    if (posix_spawn_file_actions_init( &actions )) return STATUS_NO_MEMORY;
-    posix_spawnattr_init( &attr );
-    sigemptyset( &sigdef );
-    sigaddset( &sigdef, SIGPIPE );
-    posix_spawnattr_setsigdefault( &attr, &sigdef );
-    if (new_session) flags |= POSIX_SPAWN_SETSID;
-    posix_spawnattr_setflags( &attr, flags );
-
-    if (in == -1) posix_spawn_file_actions_addopen( &actions, 0, "/dev/null", O_RDWR, 0 );
-    else if (in != 0) posix_spawn_file_actions_adddup2( &actions, in, 0 );
-    if (out == -1) posix_spawn_file_actions_addopen( &actions, 1, "/dev/null", O_RDWR, 0 );
-    else if (out != 1) posix_spawn_file_actions_adddup2( &actions, out, 1 );
-    if (stdin_fd > 1) posix_spawn_file_actions_addclose( &actions, stdin_fd );
-    if (stdout_fd > 1 && stdout_fd != stdin_fd) posix_spawn_file_actions_addclose( &actions, stdout_fd );
-    if (unixdir != -1)
+    /* Haiku's posix_spawn() with file actions or attributes forks and then runs exec in the child, which calls malloc(): when another
+     * thread of this process held the malloc lock at the moment of the fork the child waits for ever for a lock nobody can release
+     * (found in Steam: a child spinning in __flatten_process_args -> malloc, and its parent's launcher thread waiting for it).
+     * Without actions and attributes posix_spawn() uses load_image(), which has no fork. The new loader does what the actions
+     * and attributes would have done, as its first step (see haiku_spawn_prologue in loader/main.c), told by WINE_HAIKU_SPAWN:
+     * in,out,stdin_fd,stdout_fd,unixdir,new_session. The descriptors it needs must survive the start of the program. */
+    snprintf( desc, sizeof(desc), "%d,%d,%d,%d,%d,%d", in, out, stdin_fd, stdout_fd, unixdir, new_session );
+    for (i = 0; i < 5; i++)
     {
-        posix_spawn_file_actions_addfchdir( &actions, unixdir );
-        posix_spawn_file_actions_addclose( &actions, unixdir );
+        flags[i] = fds[i] > 2 ? fcntl( fds[i], F_GETFD ) : -1;
+        if (flags[i] != -1 && (flags[i] & FD_CLOEXEC)) fcntl( fds[i], F_SETFD, flags[i] & ~FD_CLOEXEC );
     }
 
     if (!(argv = build_argv( &params->CommandLine, 2 ))) status = STATUS_NO_MEMORY;
     else
     {
-        status = spawn_wineloader( &pid, argv, socketfd, pe_info, winedebug, &actions, &attr );
+        status = spawn_wineloader( &pid, argv, socketfd, pe_info, winedebug, desc );
         free( argv );
     }
-    posix_spawn_file_actions_destroy( &actions );
-    posix_spawnattr_destroy( &attr );
+    for (i = 0; i < 5; i++)
+        if (flags[i] != -1 && (flags[i] & FD_CLOEXEC)) fcntl( fds[i], F_SETFD, flags[i] );
 
     if (!status && pid > 0)
     {

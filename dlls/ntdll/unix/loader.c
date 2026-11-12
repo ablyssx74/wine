@@ -509,14 +509,14 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
  * Does what exec_wineloader() + loader_exec() do, with the environment passed explicitly.
  */
 NTSTATUS spawn_wineloader( pid_t *pid, char **argv, int socketfd, const struct pe_image_info *pe_info, char *winedebug,
-                           const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attr )
+                           const char *spawn_desc )
 {
     extern char **environ;
     static char noexec[] = "WINELOADERNOEXEC=1";
     WORD machine = pe_info->machine;
     ULONGLONG res_start = pe_info->base;
     ULONGLONG res_end = pe_info->base + pe_info->map_size;
-    char preloader_reserve[64], socket_env[64], *extra[4], **env, *path;
+    char preloader_reserve[64], socket_env[64], desc_env[96], *extra[5], **env, *path;
     int i, j, count = 0, n = 0, k = 0, ret;
 
     if (pe_info->wine_fakedll) res_start = res_end = 0;
@@ -530,6 +530,11 @@ NTSTATUS spawn_wineloader( pid_t *pid, char **argv, int socketfd, const struct p
     extra[n++] = preloader_reserve;
     extra[n++] = socket_env;
     if (winedebug) extra[n++] = winedebug;
+    if (spawn_desc)
+    {
+        snprintf( desc_env, sizeof(desc_env), "WINE_HAIKU_SPAWN=%s", spawn_desc );
+        extra[n++] = desc_env;
+    }
 
     while (environ && environ[count]) count++;
     if (!(env = malloc( (count + n + 1) * sizeof(*env) ))) return STATUS_NO_MEMORY;
@@ -551,14 +556,14 @@ NTSTATUS spawn_wineloader( pid_t *pid, char **argv, int socketfd, const struct p
     if ((path = get_alternate_wineloader( machine )))
     {
         argv[1] = path;
-        ret = posix_spawn( pid, path, actions, attr, argv + 1, env );
+        ret = posix_spawn( pid, path, NULL, NULL, argv + 1, env );
         free( path );
     }
     if (ret == ENOENT)
     {
         path = strdup( wineloader );
         argv[1] = path;
-        ret = posix_spawn( pid, path, actions, attr, argv + 1, env );
+        ret = posix_spawn( pid, path, NULL, NULL, argv + 1, env );
         free( path );
     }
     free( env );

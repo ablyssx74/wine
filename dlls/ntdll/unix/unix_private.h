@@ -244,7 +244,7 @@ extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_imag
 #ifdef __HAIKU__
 #include <spawn.h>
 extern NTSTATUS spawn_wineloader( pid_t *pid, char **argv, int socketfd, const struct pe_image_info *pe_info, char *winedebug,
-                                  const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attr );
+                                   const char *spawn_desc );
 #endif
 extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
                               SECTION_IMAGE_INFORMATION *info, void **module, SIZE_T *size,
