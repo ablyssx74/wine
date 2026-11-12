@@ -407,6 +407,12 @@ void HaikuSeatGlobal::DoTrack(TrackId id, const TrackInfo &info)
 			auto geometry = fPointerFocus->XdgSurface()->Geometry();
 			fTrack.wndWidth = geometry.width;
 			fTrack.wndHeight = geometry.height;
+			// the resize works from where the pointer is on the screen, and from the window as it was when it began
+			fTrack.moveStartScreen = fTrack.lastScreen;
+			fTrack.moveStartWin = fPointerFocus->View()->Window()->Frame().LeftTop();
+			fTrack.lastMoveTo = fTrack.moveStartWin;
+			fTrack.lastResizeW = fTrack.wndWidth;
+			fTrack.lastResizeH = fTrack.wndHeight;
 			break;
 		}
 	}
@@ -673,6 +679,55 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					break;
 				}
 				case trackResize: {
+					if (fTrack.haveScreen) {
+						// Every edge and corner: the size follows the pointer (as far as the screen position tells) and for the left and
+						// top edges the window also moves, so that the opposite edge stays where it was.
+						HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();
+						XdgToplevel::ResizeEdge edge = fTrack.info.resizeEdge;
+						bool left = edge == XdgToplevel::resizeEdgeLeft || edge == XdgToplevel::resizeEdgeTopLeft || edge == XdgToplevel::resizeEdgeBottomLeft;
+						bool right = edge == XdgToplevel::resizeEdgeRight || edge == XdgToplevel::resizeEdgeTopRight || edge == XdgToplevel::resizeEdgeBottomRight;
+						bool top = edge == XdgToplevel::resizeEdgeTop || edge == XdgToplevel::resizeEdgeTopLeft || edge == XdgToplevel::resizeEdgeTopRight;
+						bool bottom = edge == XdgToplevel::resizeEdgeBottom || edge == XdgToplevel::resizeEdgeBottomLeft || edge == XdgToplevel::resizeEdgeBottomRight;
+						if (!(left || right || top || bottom)) break;
+						if (!xdgSurface->SetConfigurePending()) true;
+
+						int32_t minWidth, minHeight, maxWidth, maxHeight;
+						xdgSurface->Toplevel()->MinSize(minWidth, minHeight);
+						xdgSurface->Toplevel()->MaxSize(maxWidth, maxHeight);
+						if (minWidth < 1) minWidth = 1;
+						if (minHeight < 1) minHeight = 1;
+						if (maxWidth == 0) maxWidth = INT32_MAX;
+						if (maxHeight == 0) maxHeight = INT32_MAX;
+
+						int32_t dx = (int32_t)(fTrack.lastScreen.x - fTrack.moveStartScreen.x);
+						int32_t dy = (int32_t)(fTrack.lastScreen.y - fTrack.moveStartScreen.y);
+						int32_t newWidth = fTrack.wndWidth + (right ? dx : (left ? -dx : 0));
+						int32_t newHeight = fTrack.wndHeight + (bottom ? dy : (top ? -dy : 0));
+						newWidth = std::min<int32_t>(std::max<int32_t>(newWidth, minWidth), maxWidth);
+						newHeight = std::min<int32_t>(std::max<int32_t>(newHeight, minHeight), maxHeight);
+
+						if (left || top) {
+							BPoint target(fTrack.moveStartWin.x + (left ? fTrack.wndWidth - newWidth : 0),
+								fTrack.moveStartWin.y + (top ? fTrack.wndHeight - newHeight : 0));
+							if (target != fTrack.lastMoveTo) {
+								fPointerFocus->View()->Window()->MoveTo(target);
+								fTrack.lastMoveTo = target;
+							}
+						}
+						if (newWidth != fTrack.lastResizeW || newHeight != fTrack.lastResizeH) {
+							uint32_t arrayData[] = {XdgToplevel::stateResizing};
+							struct wl_array array {
+								.size = sizeof(arrayData),
+								.alloc = sizeof(arrayData),
+								.data = &arrayData
+							};
+							xdgSurface->Toplevel()->SendConfigure(newWidth, newHeight, &array);
+							xdgSurface->SendConfigure(xdgSurface->NextSerial());
+							fTrack.lastResizeW = newWidth;
+							fTrack.lastResizeH = newHeight;
+						}
+						break;
+					}
 					switch (fTrack.info.resizeEdge) {
 						case XdgToplevel::resizeEdgeTopLeft: {
 							HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();

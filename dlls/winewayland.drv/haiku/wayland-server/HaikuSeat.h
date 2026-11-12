@@ -79,6 +79,7 @@ private:
 		bigtime_t statMoveUs, statStart, lastMoveEnd;
 		BPoint lastMoveTo;
 		int32_t wndWidth, wndHeight;
+		int32_t lastResizeW, lastResizeH;
 		TrackInfo info;
 	};
 
