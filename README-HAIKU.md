@@ -3,6 +3,16 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-46
+
+Programs Wine installs or copies now open with a double-click.
+
+- **No execute bit on files Wine creates.** Haiku treats any file with the execute bit as a program of its own, whatever its type, so Tracker
+  never handed such a `.exe` to Wine Launcher (it showed an "unsupported executable" message). Wine used to mark every `.exe` and `.com` it
+  created, installers' output included, as executable; on Haiku it no longer does. Files that are already executable (from an earlier
+  version, or copied from elsewhere) still need the bit removed, for a whole prefix with
+  `find ~/.wine/drive_c -iname '*.exe' -exec chmod -x {} +`.
+
 ## What's new in 11.20-45
 
 Double-click a Windows program to run it with Wine.
@@ -10,8 +20,8 @@ Double-click a Windows program to run it with Wine.
 - **Wine Launcher.** The package now includes a small background app, Wine Launcher (`/system/apps/WineLauncher`), and registers `.exe`, `.msi`,
   `.lnk` and `.bat` files so that Tracker opens them with it. A double-click starts the program in its own folder; shortcuts, installers and batch
   files go through `wine start`. A file with the execute bit set is treated by Haiku as a program of its own and gives an "unsupported
-  executable" message, so remove the bit (`chmod -x file.exe`) if you see it. To keep using another program for these types, change the
-  preferred application in FileTypes.
+  executable" message, so remove the bit (`chmod -x file.exe`) if you see it (11.20-46 stops Wine from setting it). To keep using another program for these types, change the
+  preferred application in FileTypes. Haiku reads the new file types when it starts, so restart the computer once after installing.
 
 ## What's new in 11.20-44
 
@@ -130,7 +140,7 @@ problems that broke Steam and the browsers are fixed.
 
 | file | what it is |
 |---|---|
-| `wine11-11.20-45-x86_64.hpkg` | Wine, install for the whole system |
+| `wine11-11.20-46-x86_64.hpkg` | Wine, install for the whole system |
 | `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
 | `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
 | `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches (now with the shader cache fix) |
@@ -146,7 +156,7 @@ problems that broke Steam and the browsers are fixed.
 
 ## Install
 
-Install `wine11-11.20-45-x86_64.hpkg` for the whole system, then make a prefix:
+Install `wine11-11.20-46-x86_64.hpkg` for the whole system, then make a prefix:
 
     wineboot -u
     wineserver -w

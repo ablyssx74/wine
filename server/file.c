@@ -236,6 +236,9 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
     else
         mode = (attrs & FILE_ATTRIBUTE_READONLY) ? 0444 : 0666;
 
+#ifndef __HAIKU__
+    /* Haiku treats any file with an execute bit as a program of its own, so Tracker cannot open a .exe
+     * through Wine Launcher (it reports an unsupported executable); leave the bit off there. */
     if (is_file_executable( name ))
     {
         if (mode & S_IRUSR)
@@ -245,6 +248,7 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
         if (mode & S_IROTH)
             mode |= S_IXOTH;
     }
+#endif
 
     access = map_access( access, &file_type.mapping );
 
