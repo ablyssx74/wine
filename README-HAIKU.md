@@ -3,6 +3,20 @@
 This is Wine 11.20 with a Haiku port: windows are drawn through Haiku's Wayland compositor, sound goes through `BSoundPlayer`,
 OpenGL through `BGLView`, and Vulkan (DXVK) through the NVK driver of Nebula. Both 64-bit and 32-bit (WoW64) programs run.
 
+## What's new in 11.20-44
+
+Steam's window resizes from every corner, and Wine no longer opens a separate tray window.
+
+- **Resizing from every edge and corner.** Haiku's compositor only followed the bottom-right corner (and its top-left code moved the window by a
+  delta that added up), so Steam's window, which draws handles on all four corners, only resized from the bottom-right one. The size now follows the
+  pointer for all eight edges, and the left and top edges also move the window so that the opposite edge stays where it was.
+- **No separate tray window.** Wine's explorer showed the tray icons (Steam's, for one) in a window of its own. New prefixes get
+  `HKCU\Software\Wine\Explorer\ShowSystray = 0`; for an existing prefix run `wineboot -u`. Set the value to 1 to get the window back. (The icons of
+  other programs are hidden too.)
+
+Note: clicking the X button of Steam's window does not quit Steam. As on Windows, it minimizes Steam to the tray and keeps it running, with no
+window; use Steam > Exit to quit it. The overlay problem described in 11.20-43 is still there.
+
 ## What's new in 11.20-43
 
 Steam no longer hangs at start-up or locks up when you click its menus, and its menus open where they should.
@@ -106,7 +120,7 @@ problems that broke Steam and the browsers are fixed.
 
 | file | what it is |
 |---|---|
-| `wine11-11.20-43-x86_64.hpkg` | Wine, install for the whole system |
+| `wine11-11.20-44-x86_64.hpkg` | Wine, install for the whole system |
 | `wine_compat-ds-es.zip` | kernel add-on for 32-bit programs |
 | `wine_int3.zip` | kernel add-on for programs that execute `int3` (Chromium, WebView2, the Firefox sandbox) |
 | `dxvk-tools.zip` | DXVK 3.1.1 (64 and 32 bit), the install script, `vkprobe`, test programs, the optional VideoStreams layer build and the optional Mesa/layer patches (now with the shader cache fix) |
@@ -122,7 +136,7 @@ problems that broke Steam and the browsers are fixed.
 
 ## Install
 
-Install `wine11-11.20-43-x86_64.hpkg` for the whole system, then make a prefix:
+Install `wine11-11.20-44-x86_64.hpkg` for the whole system, then make a prefix:
 
     wineboot -u
     wineserver -w
