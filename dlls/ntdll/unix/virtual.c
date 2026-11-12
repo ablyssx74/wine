@@ -4360,8 +4360,10 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
     vprot = get_host_page_vprot( page );
 
-#ifdef __APPLE__
-    /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
+#if defined(__APPLE__) || defined(__HAIKU__)
+    /* Rosetta on Apple Silicon misreports certain write faults as read faults. Haiku gives the signal handler no error code of the
+     * page fault at all, so every fault looks like a read; a fault in a page that Wine has as readable is a write to a page that
+     * is read-only on the host (write watch, copy on write), as Halo Infinite's allocator does. */
     if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
     {
         WARN( "treating read fault in a readable page as a write fault, addr %p\n", addr );
