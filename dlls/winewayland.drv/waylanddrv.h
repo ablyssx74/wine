@@ -307,6 +307,8 @@ struct wayland_surface
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
+    /* CLOCK_MONOTONIC milliseconds when xdg_toplevel_set_minimized was sent, 0 when not minimized. */
+    unsigned long long minimize_time;
     struct wayland_window_config window;
     int content_width, content_height;
     HCURSOR hcursor;

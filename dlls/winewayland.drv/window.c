@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "ntstatus.h"
 
@@ -130,6 +131,13 @@ void wayland_win_data_release(struct wayland_win_data *data)
 {
     assert(data);
     pthread_mutex_unlock(&win_data_mutex);
+}
+
+static unsigned long long monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static void wayland_win_data_get_config(struct wayland_win_data *data,
@@ -281,8 +289,10 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         }
         if (surface->window.minimized)
         {
+            if (!surface->minimize_time) surface->minimize_time = monotonic_ms();
             xdg_toplevel_set_minimized(surface->xdg_toplevel);
         }
+        else surface->minimize_time = 0;
     }
     else
     {
@@ -577,18 +587,23 @@ static void wayland_configure_window(HWND hwnd)
         return;
     }
 
-    /* A window that the application has just minimized (WS_MINIMIZE is set) can still receive a configure that the
-     * compositor sent before it learned about the minimize (e.g. for the deactivation that made the application
-     * minimize itself). Applying it would move and resize the minimized window back to its old rectangle without
-     * clearing WS_MINIMIZE, and the application would then never see a real size again (UE3 games kept a viewport
-     * of the minimized 160x31 size). Just acknowledge it; the compositor sends a new configure on the real restore. */
-    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE)
+    /* A window with WS_MINIMIZE keeps its old visible rectangle (a fullscreen window stays at 0,0 and its full size), so
+     * the offscreen sentinel test above does not recognise it. A configure with a size state (fullscreen, maximized) that
+     * arrives right after we told the compositor about the minimize is one it sent before it learned of it (e.g. for the
+     * deactivation that made the application minimize itself): applying it would move and resize the minimized window
+     * back without clearing WS_MINIMIZE, and the application would never see a real size again (UE3 games kept the 160x31
+     * viewport of the minimized window). Acknowledge and ignore it. A configure that comes later is the compositor
+     * restoring the window (Deskbar click): acknowledge it and send SC_RESTORE so Win32 runs the full restore. */
+    if (state && (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
     {
-        TRACE("hwnd=%p minimized, ignoring configure\n", hwnd);
+        BOOL stale = !surface->minimize_time || monotonic_ms() - surface->minimize_time < 300;
+        TRACE("hwnd=%p minimized, %s configure\n", hwnd, stale ? "ignoring" : "restoring on");
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        if (!stale) surface->minimize_time = 0;
         wayland_win_data_release(data);
+        if (!stale) send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
         return;
     }
 

@@ -224,6 +224,15 @@ int main( int argc, char *argv[] )
 {
     void *handle;
 
+#ifdef __HAIKU__
+    /* Mesa's default shader cache writes one file per shader, and on BFS that made UT4 lag all the time (thousands of small
+     * file creations while playing). Its single-file backend (one append-only file) does not: measured with UT4, per-file was
+     * the worst, the database backend better, the single file the best. A choice made by the user in the environment wins. */
+    if (!getenv( "MESA_DISK_CACHE_SINGLE_FILE" ) && !getenv( "MESA_DISK_CACHE_DATABASE" ) &&
+        !getenv( "MESA_DISK_CACHE_MULTI_FILE" ))
+        setenv( "MESA_DISK_CACHE_SINGLE_FILE", "true", 0 );
+#endif
+
     init_reserved_areas();
 
     if ((handle = try_dlopen( get_self_exe() )) ||
