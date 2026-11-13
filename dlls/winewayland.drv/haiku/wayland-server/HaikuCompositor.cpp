@@ -25,6 +25,7 @@
 #include <Bitmap.h>
 #include <Region.h>
 #include <Cursor.h>
+#include <Screen.h>
 
 extern const struct wl_interface wl_compositor_interface;
 
@@ -390,10 +391,61 @@ void HaikuSurface::Detach()
 	}
 }
 
+// Waiting for the vertical retrace before a big surface is drawn: the copy into the frame buffer then starts just after the
+// vblank and stays ahead of the scan-out, which is what keeps the horizontal tear line away (Haiku draws straight into one frame
+// buffer). It needs a driver that offers a retrace semaphore (BScreen::WaitForRetrace() works); without one it turns itself off.
+// HAIWAY_VSYNC: "off" (never), "all" (every surface), anything else/unset: surfaces that cover at least 60 percent of the screen.
+static bool VSyncWanted(const BBitmap *bitmap, bool isSubsurface)
+{
+	static int state = 0;   // 0: not decided, 1: on, -1: off
+	static int onlyBig = 1;
+	static float screenArea = 0;
+
+	if (state < 0 || isSubsurface || bitmap == NULL) {
+		return false;
+	}
+	if (state == 0) {
+		const char *env = getenv("HAIWAY_VSYNC");
+		if (env != NULL && strcmp(env, "off") == 0) {
+			state = -1;
+			return false;
+		}
+		onlyBig = !(env != NULL && strcmp(env, "all") == 0);
+		BScreen screen;
+		if (!screen.IsValid() || screen.WaitForRetrace(100000) != B_OK) {
+			fprintf(stderr, "HAIWAY: no vertical retrace from the display driver, not waiting for it\n");
+			state = -1;
+			return false;
+		}
+		BRect frame = screen.Frame();
+		screenArea = (frame.Width() + 1) * (frame.Height() + 1);
+		state = 1;
+		fprintf(stderr, "HAIWAY: waiting for the vertical retrace before drawing %s\n", onlyBig ? "big surfaces" : "all surfaces");
+	}
+	if (onlyBig) {
+		BRect b = bitmap->Bounds();
+		if ((b.Width() + 1) * (b.Height() + 1) < 0.6f * screenArea) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void VSyncWait()
+{
+	BScreen screen;
+	// a retrace that came while nobody was waiting stays counted: use it up, so that the wait below is for the next one
+	screen.WaitForRetrace(0);
+	screen.WaitForRetrace(40000);
+}
+
 void HaikuSurface::Invalidate()
 {
 	if (fView == NULL) {
 		return;
+	}
+	if (VSyncWanted(Bitmap(), fSubsurface != NULL)) {
+		VSyncWait();
 	}
 	auto viewLocked = AppKitPtrs::LockedPtr(fView);
 	if (fSubsurface != NULL) {
