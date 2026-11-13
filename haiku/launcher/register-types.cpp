@@ -11,15 +11,19 @@ int main()
 		{"application/x-ms-installer", "Windows installer", "msi"},
 		{"application/x-ms-shortcut", "Windows shortcut", "lnk"},
 		{"application/x-ms-batch", "Windows batch file", "bat"},
+		// a URL scheme, not a file type: no extension (Haiku's URL wrapper looks up the application of x-vnd.be.url.<scheme>)
+		{"application/x-vnd.be.url.steam", "Steam link", NULL},
 	};
 	for (const T &t : types) {
 		BMimeType m(t.type);
 		if (!m.IsInstalled()) m.Install();
-		BMessage ext(0xea); ext.AddString("extensions", t.ext);
-		m.SetFileExtensions(&ext);
+		if (t.ext != NULL) {
+			BMessage ext(0xea); ext.AddString("extensions", t.ext);
+			m.SetFileExtensions(&ext);
+		}
 		m.SetShortDescription(t.desc);
 		m.SetPreferredApp("application/x-vnd.Wine-Launcher");
-		printf("%s -> %s\n", t.type, t.ext);
+		printf("%s -> %s\n", t.type, t.ext ? t.ext : "(link)");
 	}
 	return 0;
 }

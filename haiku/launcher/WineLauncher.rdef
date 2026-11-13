@@ -6,5 +6,6 @@ resource file_types message {
 	"types" = "application/x-dosexec",
 	"types" = "application/x-ms-installer",
 	"types" = "application/x-ms-shortcut",
-	"types" = "application/x-ms-batch"
+	"types" = "application/x-ms-batch",
+	"types" = "application/x-vnd.be.url.steam"
 };
