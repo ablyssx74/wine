@@ -46,7 +46,7 @@ static void Assert(bool cond) {if (!cond) abort();}
 // global Wayland lock that the windows' input handling needs too (waiting there made the games lag and stopped the mouse look short).
 // The frame callbacks of such a surface are sent after it was drawn, not by the pulse timer. It needs a display driver with a retrace
 // semaphore (BScreen::WaitForRetrace() works) and turns itself off with a message otherwise.
-// HAIWAY_VSYNC: off (not set or "off"), "all" (every surface that requested a frame callback), anything else ("on"): the ones that cover
+// HAIWAY_VSYNC: "off" (never), "all" (every surface that requested a frame callback), anything else or not set (on): the ones that cover
 // at least 60 percent of the screen.
 static const uint32 kVSyncMessage = 'HVsy';
 
@@ -61,11 +61,11 @@ static bool VSyncWanted(const BBitmap *bitmap, bool isSubsurface)
 	}
 	if (state == 0) {
 		const char *env = getenv("HAIWAY_VSYNC");
-		if (env == NULL || strcmp(env, "off") == 0) {
+		if (env != NULL && strcmp(env, "off") == 0) {
 			state = -1;
 			return false;
 		}
-		onlyBig = !(strcmp(env, "all") == 0);
+		onlyBig = !(env != NULL && strcmp(env, "all") == 0);
 		BScreen screen;
 		if (!screen.IsValid() || screen.WaitForRetrace(100000) != B_OK) {
 			fprintf(stderr, "HAIWAY: no vertical retrace from the display driver, not waiting for it\n");
