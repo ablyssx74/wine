@@ -24,7 +24,10 @@
 
 #include "config.h"
 
-#ifdef HAVE_RESOLV
+/* Haiku has the BSD resolver (res_init, _res, res_query) in libnetwork, which the configure test for -lresolv does not look at: without
+ * this a build made from the source has an empty unix side of dnsapi (it is 4 KB instead of 29), and a program that asks Wine for the DNS
+ * servers or queries DNS itself (curl built with c-ares) gets nothing. */
+#if defined(HAVE_RESOLV) || defined(__HAIKU__)
 #include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
@@ -471,4 +474,4 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
 
 #endif  /* _WIN64 */
 
-#endif /* HAVE_RESOLV */
+#endif /* HAVE_RESOLV || __HAIKU__ */

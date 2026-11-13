@@ -118,6 +118,59 @@ WINE_DECLARE_DEBUG_CHANNEL(winediag);
 static pthread_mutex_t host_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+#ifdef __HAIKU__
+/* Haiku's resolver (libnetwork) stops working when the socket it opens gets a descriptor number of 1024 or more (FD_SETSIZE: it fails
+ * before it sends anything, and every lookup answers "no address associated with hostname"). A game that has some 1500 files open (Splitgate:
+ * the Epic Online Services SDK could not resolve api.epicgames.dev, the game stayed at its login screen) has no number below 1024 left for
+ * it. So that the resolver finds one, a few low descriptors are kept in reserve and let go for the time of a lookup. */
+# include <fcntl.h>
+# define HAIKU_LOW_FDS 4
+# define HAIKU_FD_LIMIT 1000
+static int haiku_low_fd[HAIKU_LOW_FDS] = { -1, -1, -1, -1 };
+static pthread_mutex_t haiku_resolver_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void __attribute__((constructor)) haiku_reserve_low_fds(void)
+{
+    int i, fd;
+    for (i = 0; i < HAIKU_LOW_FDS; i++)
+    {
+        if ((fd = open( "/dev/null", O_RDONLY | O_CLOEXEC )) < 0) break;
+        if (fd >= HAIKU_FD_LIMIT) { close( fd ); break; }
+        haiku_low_fd[i] = fd;
+    }
+}
+
+/* One lookup at a time: Haiku's libnetwork takes a write lock inside every lookup (_nsconfigure) and a thread that has to wait for it
+ * spins (block_thread() returns B_INTERRUPTED at once, about 12000 times a second), so a browser's resolver threads burn cores while
+ * lookups overlap. They queue on this mutex instead. */
+static void haiku_resolver_begin(void)
+{
+    int i;
+    pthread_mutex_lock( &haiku_resolver_mutex );
+    for (i = 0; i < HAIKU_LOW_FDS; i++)
+    {
+        if (haiku_low_fd[i] < 0) continue;
+        close( haiku_low_fd[i] );
+        haiku_low_fd[i] = -1;
+    }
+}
+
+static void haiku_resolver_end(void)
+{
+    int i, fd;
+    for (i = 0; i < HAIKU_LOW_FDS; i++)
+    {
+        if ((fd = open( "/dev/null", O_RDONLY | O_CLOEXEC )) < 0) break;
+        if (fd >= HAIKU_FD_LIMIT) { close( fd ); break; }
+        haiku_low_fd[i] = fd;
+    }
+    pthread_mutex_unlock( &haiku_resolver_mutex );
+}
+#else
+# define haiku_resolver_begin() ((void)0)
+# define haiku_resolver_end() ((void)0)
+#endif
+
 #define MAP(x) {WS_ ## x, x}
 
 static const int addrinfo_flag_map[][2] =
@@ -766,17 +819,9 @@ static NTSTATUS unix_getaddrinfo( void *args )
         }
     }
 
-#ifdef __HAIKU__
-    /* Haiku's libnetwork takes a write lock inside every getaddrinfo() (_nsconfigure) and a thread that has to wait for it spins:
-     * block_thread() returns B_INTERRUPTED at once, about 12000 times a second, so a browser's resolver threads burn cores while
-     * lookups overlap. Let them queue on a plain mutex instead. */
-    static pthread_mutex_t haiku_getaddrinfo_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock( &haiku_getaddrinfo_mutex );
-#endif
+    haiku_resolver_begin();
     ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
-#ifdef __HAIKU__
-    pthread_mutex_unlock( &haiku_getaddrinfo_mutex );
-#endif
+    haiku_resolver_end();
     if (ret)
         return addrinfo_err_from_unix( ret );
 
@@ -950,7 +995,10 @@ static NTSTATUS unix_gethostbyaddr( void *args )
 #else
     pthread_mutex_lock( &host_mutex );
 
-    if (!(unix_host = gethostbyaddr( addr, params->len, unix_family )))
+    haiku_resolver_begin();
+    unix_host = gethostbyaddr( addr, params->len, unix_family );
+    haiku_resolver_end();
+    if (!unix_host)
     {
         ret = (h_errno < 0 ? errno_from_unix( errno ) : host_errno_from_unix( h_errno ));
         pthread_mutex_unlock( &host_mutex );
@@ -1049,7 +1097,10 @@ static NTSTATUS unix_gethostbyname( void *args )
 
     pthread_mutex_lock( &host_mutex );
 
-    if (!(unix_host = gethostbyname( params->name )))
+    haiku_resolver_begin();
+    unix_host = gethostbyname( params->name );
+    haiku_resolver_end();
+    if (!unix_host)
     {
         ret = (h_errno < 0 ? errno_from_unix( errno ) : host_errno_from_unix( h_errno ));
         pthread_mutex_unlock( &host_mutex );
@@ -1080,12 +1131,15 @@ static NTSTATUS unix_getnameinfo( void *args )
     struct getnameinfo_params *params = args;
     union unix_sockaddr unix_addr;
     socklen_t unix_addr_len;
+    int ret;
 
     unix_addr_len = sockaddr_to_unix( params->addr, params->addr_len, &unix_addr );
 
-    return addrinfo_err_from_unix( getnameinfo( &unix_addr.addr, unix_addr_len, params->host, params->host_len,
-                                                params->serv, params->serv_len,
-                                                nameinfo_flags_to_unix( params->flags ) ) );
+    haiku_resolver_begin();
+    ret = getnameinfo( &unix_addr.addr, unix_addr_len, params->host, params->host_len,
+                       params->serv, params->serv_len, nameinfo_flags_to_unix( params->flags ) );
+    haiku_resolver_end();
+    return addrinfo_err_from_unix( ret );
 }
 
 
