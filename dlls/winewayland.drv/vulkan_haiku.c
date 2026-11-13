@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <image.h>
 
 #include "ntstatus.h"
 #include "waylanddrv.h"
@@ -53,27 +54,61 @@ static struct
 struct haiku_vk_surface
 {
     struct wayland_client_surface *client;
+    void *vk_surface;       /* the layer's surface (the VkSurfaceKHR handle) */
     struct wayland_shm_buffer *pool[BUFFER_POOL];
     pthread_mutex_t lock;
     pthread_cond_t cond;
     BOOL frame_pending;     /* the compositor has not yet said that it showed the last frame */
 };
 
-/* The layer offers FIFO and nothing else, so every program presents at the pace of the display: before it puts a frame in the window
- * the one before has to be shown (the compositor's frame callback, which it sends at the refresh rate of the display), as a Wayland
- * client does with Vulkan's own Wayland surface. WINE_HAIKU_VK_VSYNC=0 shows frames as fast as they come (to measure). A window
- * that shows nothing (hidden, minimized) never answers: waiting gives up after a while. */
+/* Showing a frame is paced by the display only when the program asks for it, with the FIFO present mode (V-sync on in its settings: DXVK and
+ * vkd3d-proton use FIFO for a swap interval above 0 and IMMEDIATE for 0): before it puts a frame in the window the one before has to be
+ * shown (the compositor's frame callback), as a Wayland client does with Vulkan's own Wayland surface, and the compositor draws such a
+ * surface in step with the vertical retrace. Any other present mode shows frames as fast as they come. A layer that cannot tell the mode
+ * counts as FIFO (what every program got before). WINE_HAIKU_VK_VSYNC=0 shows frames as fast as they come whatever the program asks,
+ * =1 always paces them. A window that shows nothing (hidden, minimized) never answers: waiting gives up after a while. */
 #define FRAME_WAIT_NS 100000000
 
-static BOOL vsync_enabled(void)
+/* The present mode that the program chose for the swapchain of the surface (a VkPresentModeKHR number), or -1 when it is not known (no
+ * swapchain yet, or a layer that cannot tell: the function is looked up in the layer's image, so an older layer just has none). */
+static int layer_present_mode(void *surface)
 {
-    static int enabled = -1;
-    if (enabled < 0)
+    static int (*query)(void *);
+    static BOOL looked;
+
+    if (!looked)
+    {
+        image_info info;
+        int32_t cookie = 0;
+
+        looked = TRUE;
+        while (get_next_image_info(0, &cookie, &info) == B_OK)
+        {
+            void *symbol = NULL;
+            if (strstr(info.name, "VideoStreamsWsi") &&
+                get_image_symbol(info.id, "VideoStreamsWsi_PresentMode", B_SYMBOL_TYPE_TEXT, &symbol) == B_OK)
+            {
+                query = symbol;
+                break;
+            }
+        }
+    }
+    return query && surface ? query(surface) : -1;
+}
+
+static BOOL surface_vsync(struct haiku_vk_surface *surface)
+{
+    static int forced = -2;
+    int mode;
+
+    if (forced == -2)
     {
         const char *env = getenv("WINE_HAIKU_VK_VSYNC");
-        enabled = !(env && !strcmp(env, "0"));
+        forced = env ? !!strcmp(env, "0") : -1;
     }
-    return enabled;
+    if (forced >= 0) return forced;
+    mode = layer_present_mode(surface->vk_surface);
+    return mode < 0 || mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
 }
 
 static BOOL load_shim(void)
@@ -224,6 +259,7 @@ static void surface_frame(void *user, const void *bits, int width, int height, i
 {
     struct haiku_vk_surface *surface = user;
     struct wayland_shm_buffer *buffer;
+    BOOL vsync = surface_vsync(surface);
     int y;
 
     if (getenv("WINE_HAIKU_GL_DEBUG"))
@@ -269,7 +305,7 @@ static void surface_frame(void *user, const void *bits, int width, int height, i
                 fprintf(stderr, "hvk: PAUSE %s: %.0f ms between presented frames\n", hms, now - last_entry);
             }
             last_entry = now;
-            if (vsync_enabled()) wait_for_frame(surface);
+            if (vsync) wait_for_frame(surface);
             clock_gettime(CLOCK_MONOTONIC, &ts);
             t_wait = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6 - now;
             buffer = get_buffer(surface, width, height);
@@ -280,12 +316,14 @@ static void surface_frame(void *user, const void *bits, int width, int height, i
             goto have_buffer;
         }
     }
-    if (vsync_enabled()) wait_for_frame(surface);
+    if (vsync) wait_for_frame(surface);
     buffer = get_buffer(surface, width, height);
 have_buffer:
     if (!buffer)
     {
-        ERR("No buffer available, dropping the frame\n");
+        /* without V-sync the frames come faster than the compositor lets go of buffers: dropping some is what is asked for */
+        if (vsync) ERR("No buffer available, dropping the frame\n");
+        else TRACE("No buffer available, dropping the frame\n");
         return;
     }
 
@@ -299,7 +337,7 @@ have_buffer:
     wayland_shm_buffer_ref(buffer);
     wl_surface_attach(surface->client->wl_surface, buffer->wl_buffer, 0, 0);
     wl_surface_damage_buffer(surface->client->wl_surface, 0, 0, width, height);
-    if (vsync_enabled())
+    if (vsync)
     {
         struct wl_callback *callback = wl_surface_frame(surface->client->wl_surface);
 
@@ -335,6 +373,7 @@ static VkResult haiku_vulkan_surface_create(struct client_surface *client, const
         free(surface);
         return res;
     }
+    surface->vk_surface = (void *)(ULONG_PTR)*handle;
     /* (the surface, its hook and the buffers live as long as the process: the layer tells nothing when a surface goes) */
     if (!shim.surface_attach((void *)(ULONG_PTR)*handle, surface_size, surface_frame, surface))
     {

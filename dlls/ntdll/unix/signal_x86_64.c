@@ -77,6 +77,7 @@ extern void _thread_set_tsd_base(uint64_t);
 
 #ifdef __HAIKU__
 # include <SupportDefs.h>
+# include <image.h>
 #if 0
 # include <private/system/syscalls.h>
 # include <private/system/arch/x86/arch_thread_defs.h>
@@ -2569,7 +2570,24 @@ static void WriteModuleName(addr_t address)
 	hModule = pmod == NULL ? NULL : pmod->DllBase;
 	printf("  hModule: %p\n", hModule);
 	if (hModule != NULL)
-	printf("  BaseDllName: %s\n", debugstr_w(pmod->BaseDllName.Buffer)); printf("\n");
+	printf("  BaseDllName: %s\n", debugstr_w(pmod->BaseDllName.Buffer));
+#ifdef __HAIKU__
+	/* an address in a Unix library (the Vulkan driver, say) is not a PE module: look in the images of the team */
+	{
+		image_info info;
+		int32 cookie = 0;
+		while (get_next_image_info( 0, &cookie, &info ) == B_OK)
+		{
+			if ((address >= (addr_t)info.text && address < (addr_t)info.text + info.text_size) ||
+			    (address >= (addr_t)info.data && address < (addr_t)info.data + info.data_size))
+			{
+				printf("  image: %s (text at %p, offset %#lx)\n", info.name, info.text, (unsigned long)(address - (addr_t)info.text));
+				break;
+			}
+		}
+	}
+#endif
+	printf("\n");
 }
 
 /**********************************************************************

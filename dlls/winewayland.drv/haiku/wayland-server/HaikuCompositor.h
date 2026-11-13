@@ -104,6 +104,8 @@ private:
 	uint32 fPendingFields{};
 	BRegion fDirty;
 	WaylandView *fView{};
+	volatile bool fVSyncActive{};   // drawn in step with the vertical retrace (see Invalidate()): its frame callbacks come after the draw
+	volatile bigtime_t fLastDrawTime{};
 	HaikuXdgSurface *fXdgSurface{};
 	HaikuServerDecoration *fServerDecoration{};
 	HaikuSubsurface *fSubsurface{};
@@ -129,6 +131,11 @@ public:
 	void AttachViewsToEarlierSubsurfaces();
 	void Detach();
 	void Invalidate();
+	void InvalidateNow();
+	bool VSyncActive() const {return fVSyncActive;}
+	void NoteDrawn() {fLastDrawTime = system_time();}
+	// a window that shows nothing (hidden, minimized) is never drawn: the pulse then answers for it, or its client would wait for ever
+	bool VSyncIdle() const {return system_time() - fLastDrawTime > 50000;}
 	void CallFrameCallbacks();
 
 	void SetHook(Hook *hook);

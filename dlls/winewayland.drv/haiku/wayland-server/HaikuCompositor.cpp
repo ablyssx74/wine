@@ -26,6 +26,10 @@
 #include <Region.h>
 #include <Cursor.h>
 #include <Screen.h>
+#include <Messenger.h>
+#include <pthread.h>
+#include <vector>
+#include <map>
 
 extern const struct wl_interface wl_compositor_interface;
 
@@ -33,6 +37,240 @@ extern const struct wl_interface wl_compositor_interface;
 #define COMPOSITOR_VERSION 4
 
 static void Assert(bool cond) {if (!cond) abort();}
+
+
+// Drawing in step with the vertical retrace (V-sync). A surface that asks for it (its client requested a frame callback with the commit, which
+// Wine does only when the program presents with the FIFO mode) and is big enough is not drawn at once: it is registered with the vsync thread
+// below, which waits for the retrace and then tells the window, in a message, to draw. The copy into Haiku's single frame buffer then starts
+// right after the vblank and stays ahead of the scan-out (no tear line). Nothing waits in the thread that handles the commit: it holds the
+// global Wayland lock that the windows' input handling needs too (waiting there made the games lag and stopped the mouse look short).
+// The frame callbacks of such a surface are sent after it was drawn, not by the pulse timer. It needs a display driver with a retrace
+// semaphore (BScreen::WaitForRetrace() works) and turns itself off with a message otherwise.
+// HAIWAY_VSYNC: off (not set or "off"), "all" (every surface that requested a frame callback), anything else ("on"): the ones that cover
+// at least 60 percent of the screen.
+static const uint32 kVSyncMessage = 'HVsy';
+
+static bool VSyncWanted(const BBitmap *bitmap, bool isSubsurface)
+{
+	static int state = 0;   // 0: not decided, 1: on, -1: off
+	static int onlyBig = 1;
+	static float screenArea = 0;
+
+	if (state < 0 || isSubsurface || bitmap == NULL) {
+		return false;
+	}
+	if (state == 0) {
+		const char *env = getenv("HAIWAY_VSYNC");
+		if (env == NULL || strcmp(env, "off") == 0) {
+			state = -1;
+			return false;
+		}
+		onlyBig = !(strcmp(env, "all") == 0);
+		BScreen screen;
+		if (!screen.IsValid() || screen.WaitForRetrace(100000) != B_OK) {
+			fprintf(stderr, "HAIWAY: no vertical retrace from the display driver, not waiting for it\n");
+			state = -1;
+			return false;
+		}
+		BRect frame = screen.Frame();
+		screenArea = (frame.Width() + 1) * (frame.Height() + 1);
+		state = 1;
+		fprintf(stderr, "HAIWAY: drawing %s in step with the vertical retrace when they ask for it\n", onlyBig ? "big surfaces" : "surfaces");
+	}
+	if (onlyBig) {
+		BRect b = bitmap->Bounds();
+		if ((b.Width() + 1) * (b.Height() + 1) < 0.6f * screenArea) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Where in the refresh cycle the draws of big surfaces start (HAIWAY_VSYNC_STATS=<file>, for testing): the vsync thread then follows every
+// retrace and notes when it came; each draw adds its delay after the last retrace to a histogram, and a line per 5 seconds is appended to the
+// file. With V-sync working nearly all draws start in the first milliseconds of the cycle; without it they are spread evenly over it.
+static const char *StatsFile()
+{
+	static const char *path = getenv("HAIWAY_VSYNC_STATS");
+	return path != NULL && *path != '\0' ? path : NULL;
+}
+
+static volatile bigtime_t sLastRetrace = 0;
+static const bigtime_t kRefreshPeriod = 16650;   // 60.06 Hz
+
+class VSyncStats {
+private:
+	// no lock: a window thread that stopped inside one would stop every other draw (a draw only adds to the counters)
+	volatile uint32 fBucket[17] = {};
+	volatile uint32 fDraws = 0;
+	volatile int64 fDrawTime = 0, fDrawMax = 0;
+	volatile bigtime_t fSince = 0;
+	volatile int32 fReporting = 0;
+	float fScreenArea = 0;
+
+public:
+	static VSyncStats &Instance()
+	{
+		static VSyncStats instance;
+		return instance;
+	}
+
+	bool Big(const BBitmap *bitmap)
+	{
+		if (fScreenArea == 0) {
+			BScreen screen;
+			BRect frame = screen.Frame();
+			fScreenArea = (frame.Width() + 1) * (frame.Height() + 1);
+		}
+		BRect b = bitmap->Bounds();
+		return (b.Width() + 1) * (b.Height() + 1) >= 0.6f * fScreenArea;
+	}
+
+	bigtime_t DrawStart(const BBitmap *bitmap)
+	{
+		if (sLastRetrace == 0 || !Big(bitmap)) {
+			return 0;
+		}
+		return system_time();
+	}
+
+	void DrawEnd(bigtime_t start)
+	{
+		if (start == 0) {
+			return;
+		}
+		const bigtime_t now = system_time();
+		const bigtime_t phase = (start - sLastRetrace) % kRefreshPeriod;
+		if (phase < 0) {
+			return;
+		}
+		__atomic_add_fetch(&fBucket[phase * 17 / kRefreshPeriod], 1, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&fDraws, 1, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&fDrawTime, now - start, __ATOMIC_RELAXED);
+		if (now - start > fDrawMax) {
+			fDrawMax = now - start;
+		}
+		if (fSince == 0) {
+			fSince = now;
+		}
+		if (now - fSince >= 5000000 && __atomic_exchange_n(&fReporting, 1, __ATOMIC_ACQUIRE) == 0) {
+			uint32 bucket[17];
+			for (int i = 0; i < 17; i++) {
+				bucket[i] = __atomic_exchange_n(&fBucket[i], 0, __ATOMIC_RELAXED);
+			}
+			const uint32 draws = __atomic_exchange_n(&fDraws, 0, __ATOMIC_RELAXED);
+			const int64 drawTime = __atomic_exchange_n(&fDrawTime, 0, __ATOMIC_RELAXED);
+			const int64 drawMax = __atomic_exchange_n(&fDrawMax, 0, __ATOMIC_RELAXED);
+			const bigtime_t span = now - fSince;
+			fSince = now;
+			if (draws > 0) {
+				if (FILE *f = fopen(StatsFile(), "a")) {
+					uint32 early = bucket[0] + bucket[1] + bucket[2];   // the first ~2.9 ms of the cycle
+					fprintf(f, "%.1f s: %u draws (%.1f/s), %.0f%% start in the first 3 ms of the cycle, draw call avg %lld max %lld us; start by ms:",
+						span / 1e6, draws, draws * 1e6 / span, early * 100.0 / draws, (long long)(drawTime / draws), (long long)drawMax);
+					for (int i = 0; i < 17; i++) {
+						fprintf(f, " %u", bucket[i]);
+					}
+					fprintf(f, "\n");
+					fclose(f);
+				}
+			}
+			__atomic_store_n(&fReporting, 0, __ATOMIC_RELEASE);
+		}
+	}
+};
+
+// The vsync thread. It holds no lock but its own, and takes none of the others.
+class VSyncDispatcher {
+private:
+	pthread_mutex_t fLock = PTHREAD_MUTEX_INITIALIZER;
+	pthread_cond_t fCond = PTHREAD_COND_INITIALIZER;
+	std::map<const void*, BMessenger> fPending;   // keyed by the surface only to take it out again; never used as a pointer
+	bool fStarted = false;
+
+	static void *ThreadEntry(void *arg) {((VSyncDispatcher*)arg)->Loop(); return NULL;}
+
+	void Loop()
+	{
+		BScreen screen;
+		for (;;) {
+			pthread_mutex_lock(&fLock);
+			while (fPending.empty() && StatsFile() == NULL) {
+				pthread_cond_wait(&fCond, &fLock);
+			}
+			pthread_mutex_unlock(&fLock);
+
+			// a retrace that came while nobody waited stays counted: use it up, then wait for the next one
+			screen.WaitForRetrace(0);
+			status_t result = screen.WaitForRetrace(40000);
+			if (result == B_OK) {
+				sLastRetrace = system_time();
+			}
+			if (result != B_OK && result != B_TIMED_OUT) {
+				snooze(16000);   // no retrace after all: do not spin
+			}
+
+			std::vector<BMessenger> targets;
+			pthread_mutex_lock(&fLock);
+			for (auto &entry: fPending) {
+				targets.push_back(entry.second);
+			}
+			fPending.clear();
+			pthread_mutex_unlock(&fLock);
+
+			for (BMessenger &target: targets) {
+				BMessage message(kVSyncMessage);
+				target.SendMessage(&message, (BHandler*)NULL, 0);   // a window that is gone just does not get it
+			}
+		}
+	}
+
+public:
+	static VSyncDispatcher &Instance()
+	{
+		static VSyncDispatcher instance;
+		return instance;
+	}
+
+	void Request(const void *key, const BMessenger &target)
+	{
+		pthread_mutex_lock(&fLock);
+		fPending[key] = target;
+		StartLocked();
+		pthread_cond_signal(&fCond);
+		pthread_mutex_unlock(&fLock);
+	}
+
+	void EnsureStarted()
+	{
+		pthread_mutex_lock(&fLock);
+		StartLocked();
+		pthread_cond_signal(&fCond);
+		pthread_mutex_unlock(&fLock);
+	}
+
+	void StartLocked()
+	{
+		if (!fStarted) {
+			pthread_t thread;
+			pthread_attr_t attr;
+			pthread_attr_init(&attr);
+			pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+			if (pthread_create(&thread, &attr, ThreadEntry, this) == 0) {
+				fStarted = true;
+			}
+			pthread_attr_destroy(&attr);
+		}
+	}
+
+	void Cancel(const void *key)
+	{
+		pthread_mutex_lock(&fLock);
+		fPending.erase(key);
+		pthread_mutex_unlock(&fLock);
+	}
+};
+
 
 
 //#pragma mark - HaikuRegion
@@ -202,6 +440,14 @@ void WaylandView::WindowActivated(bool active)
 
 void WaylandView::MessageReceived(BMessage *msg)
 {
+	if (msg->what == kVSyncMessage) {
+		// the retrace came: draw what was committed
+		WaylandEnv wlEnv(this, &fActiveWlEnv);
+		if (fSurface != NULL) {
+			fSurface->InvalidateNow();
+		}
+		return;
+	}
 	{
 		WaylandEnv wlEnv(this, &fActiveWlEnv);
 
@@ -247,6 +493,11 @@ void WaylandView::Draw(BRect dirty)
 	WaylandEnv wlEnv(this, &fActiveWlEnv);
 
 	BBitmap *bmp = fSurface->Bitmap();
+	bigtime_t statsStart = 0;
+	if (StatsFile() != NULL && bmp != NULL) {
+		VSyncDispatcher::Instance().EnsureStarted();
+		statsStart = VSyncStats::Instance().DrawStart(bmp);
+	}
 	if (bmp != NULL) {
 		auto viewLocked = AppKitPtrs::LockedPtr(this);
 		drawing_mode mode;
@@ -283,13 +534,17 @@ void WaylandView::Draw(BRect dirty)
 		}
 	}
 
-	if (fSurface && fFramerateLimitDisabled)
+	if (statsStart != 0)
+		VSyncStats::Instance().DrawEnd(statsStart);
+	if (fSurface)
+		fSurface->NoteDrawn();
+	if (fSurface && (fFramerateLimitDisabled || fSurface->VSyncActive()))
 		fSurface->CallFrameCallbacks();
 }
 
 void WaylandView::Pulse(void)
 {
-	if (fSurface && !fFramerateLimitDisabled)
+	if (fSurface && !fFramerateLimitDisabled && (!fSurface->VSyncActive() || fSurface->VSyncIdle()))
 		fSurface->CallFrameCallbacks();
 }
 
@@ -315,6 +570,7 @@ HaikuSurface *HaikuSurface::Create(struct wl_client *client, uint32_t version, u
 
 HaikuSurface::~HaikuSurface()
 {
+	VSyncDispatcher::Instance().Cancel(this);
 	HaikuPointerSurfaceDestroyed(this);
 	HaikuSeatGlobal *seat = HaikuGetSeat(Client());
 	if (seat != NULL) {
@@ -391,61 +647,34 @@ void HaikuSurface::Detach()
 	}
 }
 
-// Waiting for the vertical retrace before a big surface is drawn: the copy into the frame buffer then starts just after the
-// vblank and stays ahead of the scan-out, which is what keeps the horizontal tear line away (Haiku draws straight into one frame
-// buffer). It needs a driver that offers a retrace semaphore (BScreen::WaitForRetrace() works); without one it turns itself off.
-// HAIWAY_VSYNC: "off" (never), "all" (every surface), anything else/unset: surfaces that cover at least 60 percent of the screen.
-static bool VSyncWanted(const BBitmap *bitmap, bool isSubsurface)
-{
-	static int state = 0;   // 0: not decided, 1: on, -1: off
-	static int onlyBig = 1;
-	static float screenArea = 0;
-
-	if (state < 0 || isSubsurface || bitmap == NULL) {
-		return false;
-	}
-	if (state == 0) {
-		const char *env = getenv("HAIWAY_VSYNC");
-		if (env != NULL && strcmp(env, "off") == 0) {
-			state = -1;
-			return false;
-		}
-		onlyBig = !(env != NULL && strcmp(env, "all") == 0);
-		BScreen screen;
-		if (!screen.IsValid() || screen.WaitForRetrace(100000) != B_OK) {
-			fprintf(stderr, "HAIWAY: no vertical retrace from the display driver, not waiting for it\n");
-			state = -1;
-			return false;
-		}
-		BRect frame = screen.Frame();
-		screenArea = (frame.Width() + 1) * (frame.Height() + 1);
-		state = 1;
-		fprintf(stderr, "HAIWAY: waiting for the vertical retrace before drawing %s\n", onlyBig ? "big surfaces" : "all surfaces");
-	}
-	if (onlyBig) {
-		BRect b = bitmap->Bounds();
-		if ((b.Width() + 1) * (b.Height() + 1) < 0.6f * screenArea) {
-			return false;
-		}
-	}
-	return true;
-}
-
-static void VSyncWait()
-{
-	BScreen screen;
-	// a retrace that came while nobody was waiting stays counted: use it up, so that the wait below is for the next one
-	screen.WaitForRetrace(0);
-	screen.WaitForRetrace(40000);
-}
-
 void HaikuSurface::Invalidate()
 {
 	if (fView == NULL) {
 		return;
 	}
-	if (VSyncWanted(Bitmap(), fSubsurface != NULL)) {
-		VSyncWait();
+	const bool sync = !fState.frameCallbacks.IsEmpty() && VSyncWanted(Bitmap(), fSubsurface != NULL);
+	if (sync) {
+		fVSyncActive = true;
+		BMessenger target;
+		{
+			auto viewLocked = AppKitPtrs::LockedPtr(fView);
+			target = BMessenger(fView);
+		}
+		VSyncDispatcher::Instance().Request(this, target);
+		return;
+	}
+	if (fVSyncActive) {
+		fVSyncActive = false;
+		VSyncDispatcher::Instance().Cancel(this);
+	}
+	InvalidateNow();
+}
+
+// Draw what was committed: at once, or when the vsync thread says so (called in the window's thread then)
+void HaikuSurface::InvalidateNow()
+{
+	if (fView == NULL) {
+		return;
 	}
 	auto viewLocked = AppKitPtrs::LockedPtr(fView);
 	if (fSubsurface != NULL) {
