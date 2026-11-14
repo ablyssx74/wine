@@ -25,10 +25,13 @@
 #include "config.h"
 
 #include "waylanddrv.h"
+#include "winternl.h"
+#include "winreg.h"
 
 #include "wine/debug.h"
 
 #include <stdlib.h>
+#include <stdint.h>
 #ifdef __HAIKU__
 # include <dlfcn.h>
 # include <stdio.h>
@@ -310,6 +313,168 @@ static void haiku_preload_wayland_server(void)
 }
 #endif
 
+
+/* System colours from Haiku's interface colours.
+ *
+ * Wine takes the colours of window frames, buttons, menus and dialogs from "Control Panel\Colors" of the prefix, which has the light
+ * colours of Windows: the windows of a program that lets Wine draw its frame (Brave, Firefox) got a white border, and Wine's own dialogs were light
+ * on a dark Haiku. The compositor library tells the colours of the user's Haiku theme (haiku_get_ui_colors(), in this order), they are turned into
+ * the 31 system colours and written to the registry when they are not there yet, so that the programs that start from then on use them.
+ * WINE_HAIKU_SYSTEM_COLORS=0 leaves the colours of the prefix alone. */
+enum
+{
+    HC_PANEL_BG, HC_PANEL_TEXT, HC_DOC_BG, HC_DOC_TEXT, HC_CTRL_BG, HC_CTRL_TEXT, HC_CTRL_BORDER, HC_CTRL_HIGHLIGHT,
+    HC_MENU_BG, HC_MENU_TEXT, HC_MENU_SEL_BG, HC_MENU_SEL_TEXT, HC_LIST_SEL_BG, HC_LIST_SEL_TEXT, HC_TIP_BG, HC_TIP_TEXT,
+    HC_TAB, HC_TAB_TEXT, HC_TAB_INACTIVE, HC_TAB_INACTIVE_TEXT, HC_SHINE, HC_SHADOW, HC_NAV,
+    HC_COUNT
+};
+
+static unsigned int haiku_mix(unsigned int a, unsigned int b, int percent_b)
+{
+    unsigned int shift, out = 0;
+    for (shift = 0; shift <= 16; shift += 8)
+    {
+        int ca = (a >> shift) & 0xff, cb = (b >> shift) & 0xff;
+        out |= (unsigned int)((ca * (100 - percent_b) + cb * percent_b + 50) / 100) << shift;
+    }
+    return out;
+}
+static unsigned int haiku_lighter(unsigned int c, int percent) { return haiku_mix(c, 0xffffff, percent); }
+static unsigned int haiku_darker(unsigned int c, int percent) { return haiku_mix(c, 0x000000, percent); }
+
+/* HKEY_CURRENT_USER, as a handle (the user's key under \\Registry\\User, from the SID of the thread) */
+static HANDLE haiku_open_hkcu(void)
+{
+    WCHAR pathW[128];
+    char path[128];
+    DWORD_PTR sid_data[(sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE) / sizeof(DWORD_PTR)];
+    ULONG i, len = sizeof(sid_data);
+    SID *sid;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attr;
+    HANDLE key = 0;
+
+    if (NtQueryInformationToken(GetCurrentThreadEffectiveToken(), TokenUser, sid_data, len, &len)) return 0;
+    sid = ((TOKEN_USER *)sid_data)->User.Sid;
+    len = snprintf(path, sizeof(path), "\\Registry\\User\\S-%u-%u", sid->Revision,
+                   MAKELONG(MAKEWORD(sid->IdentifierAuthority.Value[5], sid->IdentifierAuthority.Value[4]),
+                            MAKEWORD(sid->IdentifierAuthority.Value[3], sid->IdentifierAuthority.Value[2])));
+    for (i = 0; i < sid->SubAuthorityCount; i++) len += snprintf(path + len, sizeof(path) - len, "-%u", sid->SubAuthority[i]);
+    for (i = 0; i <= len; i++) pathW[i] = (unsigned char)path[i];
+    name.Buffer = pathW;
+    name.Length = name.MaximumLength = len * sizeof(WCHAR);
+    attr.Length = sizeof(attr);
+    attr.RootDirectory = 0;
+    attr.ObjectName = &name;
+    attr.Attributes = 0;
+    attr.SecurityDescriptor = NULL;
+    attr.SecurityQualityOfService = NULL;
+    return NtOpenKeyEx(&key, MAXIMUM_ALLOWED, &attr, 0) ? 0 : key;
+}
+
+static void haiku_registry_value(HANDLE key, const char *name, unsigned int rgb)
+{
+    WCHAR nameW[64], valueW[16];
+    UNICODE_STRING nameStr;
+    char buffer[16];
+    KEY_VALUE_PARTIAL_INFORMATION *info;
+    char info_buffer[sizeof(*info) + 64];
+    ULONG size = sizeof(info_buffer), i, len;
+
+    for (len = 0; name[len] && len < ARRAY_SIZE(nameW) - 1; len++) nameW[len] = (unsigned char)name[len];
+    nameW[len] = 0;
+    nameStr.Buffer = nameW;
+    nameStr.Length = nameStr.MaximumLength = len * sizeof(WCHAR);
+
+    len = snprintf(buffer, sizeof(buffer), "%u %u %u", (rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+    for (i = 0; i <= len; i++) valueW[i] = (unsigned char)buffer[i];
+
+    info = (KEY_VALUE_PARTIAL_INFORMATION *)info_buffer;
+    if (!NtQueryValueKey(key, &nameStr, KeyValuePartialInformation, info, size, &size) && info->Type == REG_SZ &&
+        info->DataLength == (len + 1) * sizeof(WCHAR) && !memcmp(info->Data, valueW, info->DataLength))
+        return;   /* already as it should be */
+    NtSetValueKey(key, &nameStr, 0, REG_SZ, valueW, (len + 1) * sizeof(WCHAR));
+}
+
+static void haiku_sync_system_colors(void)
+{
+    static const WCHAR colors_keyW[] = {'C','o','n','t','r','o','l',' ','P','a','n','e','l','\\','C','o','l','o','r','s'};
+    int (*get_colors)(uint32_t *, int);
+    uint32_t c[HC_COUNT];
+    HANDLE hkcu, key;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    const char *env = getenv("WINE_HAIKU_SYSTEM_COLORS");
+    unsigned int face, text, window, window_text, hilight, hilight_text, caption, caption_text, inactive_caption, inactive_text, i;
+
+    if (env && !strcmp(env, "0")) return;
+    if (!(get_colors = dlsym(RTLD_DEFAULT, "haiku_get_ui_colors"))) return;
+    if (get_colors(c, HC_COUNT) < HC_COUNT) return;
+
+    face = c[HC_PANEL_BG];
+    text = c[HC_PANEL_TEXT];
+    window = c[HC_DOC_BG];
+    window_text = c[HC_DOC_TEXT];
+    hilight = c[HC_LIST_SEL_BG];
+    hilight_text = c[HC_LIST_SEL_TEXT];
+    caption = c[HC_TAB];
+    caption_text = c[HC_TAB_TEXT];
+    inactive_caption = c[HC_TAB_INACTIVE];
+    inactive_text = c[HC_TAB_INACTIVE_TEXT];
+
+    {
+        const struct { const char *name; unsigned int rgb; } colors[] =
+        {
+            { "Scrollbar", face },
+            { "ActiveTitle", caption },
+            { "InactiveTitle", inactive_caption },
+            { "Menu", c[HC_MENU_BG] },
+            { "MenuBar", c[HC_MENU_BG] },
+            { "MenuText", c[HC_MENU_TEXT] },
+            { "MenuHilight", c[HC_MENU_SEL_BG] },
+            { "Window", window },
+            { "WindowText", window_text },
+            { "WindowFrame", haiku_darker(face, 55) },
+            { "TitleText", caption_text },
+            { "InactiveTitleText", inactive_text },
+            { "GradientActiveTitle", caption },
+            { "GradientInactiveTitle", inactive_caption },
+            { "ActiveBorder", face },
+            { "InactiveBorder", face },
+            { "AppWorkSpace", haiku_darker(face, 20) },
+            { "Hilight", hilight },
+            { "HilightText", hilight_text },
+            { "HotTrackingColor", c[HC_NAV] },
+            { "ButtonFace", face },
+            { "ButtonAlternateFace", haiku_lighter(face, 8) },
+            { "ButtonHilight", haiku_lighter(face, 40) },
+            { "ButtonLight", haiku_lighter(face, 15) },
+            { "ButtonShadow", haiku_darker(face, 25) },
+            { "ButtonDkShadow", haiku_darker(face, 55) },
+            { "ButtonText", text },
+            { "GrayText", haiku_mix(text, face, 55) },
+            { "InfoText", c[HC_TIP_TEXT] },
+            { "InfoWindow", c[HC_TIP_BG] },
+        };
+
+        if (!(hkcu = haiku_open_hkcu())) return;
+        name.Buffer = (WCHAR *)colors_keyW;
+        name.Length = name.MaximumLength = sizeof(colors_keyW);
+        attr.Length = sizeof(attr);
+        attr.RootDirectory = hkcu;
+        attr.ObjectName = &name;
+        attr.Attributes = 0;
+        attr.SecurityDescriptor = NULL;
+        attr.SecurityQualityOfService = NULL;
+        if (!NtCreateKey(&key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, NULL))
+        {
+            for (i = 0; i < ARRAY_SIZE(colors); i++) haiku_registry_value(key, colors[i].name, colors[i].rgb);
+            NtClose(key);
+        }
+        NtClose(hkcu);
+    }
+}
+
 BOOL wayland_process_init(void)
 {
     struct wl_display *wl_display_wrapper;
@@ -322,6 +487,9 @@ BOOL wayland_process_init(void)
         return FALSE;
 
     TRACE("wl_display=%p\n", process_wayland.wl_display);
+#ifdef __HAIKU__
+    haiku_sync_system_colors();
+#endif
 
 #if (WAYLAND_VERSION_MAJOR == 1 && WAYLAND_VERSION_MINOR >= 23)
     if (!(process_wayland.wl_event_queue =

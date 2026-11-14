@@ -1027,3 +1027,25 @@ void HaikuSurface::HandleOffset(int32_t x, int32_t y)
 	fPendingFields |= (1 << fieldOffset);
 }
 
+
+// The user's colours of Haiku's interface, for the system colours of Wine (winewayland.drv turns them into the "Control Panel\\Colors" of the
+// prefix): out[i] = 0xRRGGBB of the i-th entry of the list below, in this order. Returns how many were filled in.
+extern "C" __attribute__((visibility("default"))) int haiku_get_ui_colors(uint32_t *out, int count)
+{
+	static const color_which which[] = {
+		B_PANEL_BACKGROUND_COLOR, B_PANEL_TEXT_COLOR, B_DOCUMENT_BACKGROUND_COLOR, B_DOCUMENT_TEXT_COLOR,
+		B_CONTROL_BACKGROUND_COLOR, B_CONTROL_TEXT_COLOR, B_CONTROL_BORDER_COLOR, B_CONTROL_HIGHLIGHT_COLOR,
+		B_MENU_BACKGROUND_COLOR, B_MENU_ITEM_TEXT_COLOR, B_MENU_SELECTED_BACKGROUND_COLOR, B_MENU_SELECTED_ITEM_TEXT_COLOR,
+		B_LIST_SELECTED_BACKGROUND_COLOR, B_LIST_SELECTED_ITEM_TEXT_COLOR,
+		B_TOOL_TIP_BACKGROUND_COLOR, B_TOOL_TIP_TEXT_COLOR,
+		B_WINDOW_TAB_COLOR, B_WINDOW_TEXT_COLOR, B_WINDOW_INACTIVE_TAB_COLOR, B_WINDOW_INACTIVE_TEXT_COLOR,
+		B_SHINE_COLOR, B_SHADOW_COLOR, B_NAVIGATION_BASE_COLOR,
+	};
+	const int n = (int)(sizeof(which) / sizeof(which[0]));
+	int i;
+	for (i = 0; i < n && i < count; i++) {
+		rgb_color c = ui_color(which[i]);
+		out[i] = ((uint32_t)c.red << 16) | ((uint32_t)c.green << 8) | c.blue;
+	}
+	return i;
+}
