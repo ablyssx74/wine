@@ -20,6 +20,7 @@
 
 #include "AppKitPtrs.h"
 #include <Application.h>
+#include <InterfaceDefs.h>
 #include <View.h>
 #include <Window.h>
 #include <Bitmap.h>
@@ -500,6 +501,11 @@ void WaylandView::Draw(BRect dirty)
 	}
 	if (bmp != NULL) {
 		auto viewLocked = AppKitPtrs::LockedPtr(this);
+		if (fSurface->fBackdrop != NULL) {
+			// a surface in a window of its own (a menu that sticks out of its owner): what was under the window first
+			viewLocked->SetDrawingMode(B_OP_COPY);
+			viewLocked->DrawBitmap(fSurface->fBackdrop, BPoint(0, 0));
+		}
 		drawing_mode mode;
 		switch (bmp->ColorSpace()) {
 			case B_RGBA64:
@@ -598,6 +604,136 @@ BSize HaikuSurface::Size() const
 	return BSize(-1, -1);
 }
 
+// A subsurface is a view in the window of its root surface, so it is cut off at that window's edge. Wine draws owned popups, Chromium's menus
+// for one, as subsurfaces of their owner, and a menu or submenu that opens beyond the browser window was cut off or not drawn at all. A
+// subsurface that sticks out of the root window is therefore shown in a window of its own (like an xdg_popup): borderless, without focus,
+// in the subset of the root window, at the screen position of the root window plus the offset of the subsurface.
+class WaylandSubsurfaceWindow: public BWindow {
+public:
+	WaylandSubsurfaceWindow(BRect frame):
+		BWindow(frame, "", B_NO_BORDER_WINDOW_LOOK, B_FLOATING_SUBSET_WINDOW_FEEL, B_AVOID_FOCUS | B_NOT_RESIZABLE | B_NOT_ZOOMABLE)
+	{
+	}
+	bool QuitRequested() override {return true;}
+};
+
+bool HaikuSurface::NeedsOwnWindow()
+{
+	if (fSubsurface == NULL || fSubWindow != NULL || Bitmap() == NULL) {
+		return false;
+	}
+	HaikuSurface *root = fSubsurface->Root();
+	if (root == NULL || root->View() == NULL || root->View()->Window() == NULL) {
+		return false;
+	}
+	int32_t ox = 0, oy = 0;
+	fSubsurface->GetOffset(ox, oy);
+	const BSize size = Size();
+	if (size.width < 8 || size.height < 8) {
+		return false;
+	}
+	auto rootLocked = AppKitPtrs::LockedPtr(root->View());
+	const BRect bounds = root->View()->Bounds();
+	const float slack = 4;
+	const float rootWidth = bounds.Width(), rootHeight = bounds.Height();
+	// not the client area of the window itself (a subsurface that covers most of the root, which may be bigger than the root for a
+	// moment while the window is resized), and it has to overlap the root (it opens from something in the window)
+	if (size.width >= 0.9f * rootWidth && size.height >= 0.9f * rootHeight) {
+		return false;
+	}
+	if (ox + size.width < 0 || oy + size.height < 0 || ox > rootWidth || oy > rootHeight) {
+		return false;
+	}
+	return ox < -slack || oy < -slack || ox + size.width > rootWidth + slack || oy + size.height > rootHeight + slack;
+}
+
+void HaikuSurface::MoveToOwnWindow()
+{
+	HaikuSurface *root = fSubsurface->Root();
+	int32_t ox = 0, oy = 0;
+	fSubsurface->GetOffset(ox, oy);
+	const BSize size = Size();
+
+	BWindow *rootWindow;
+	BPoint screenPoint;
+	{
+		auto rootLocked = AppKitPtrs::LockedPtr(root->View());
+		rootWindow = root->View()->Window();
+		screenPoint = root->View()->ConvertToScreen(BPoint(ox, oy));
+	}
+
+	WaylandSubsurfaceWindow *window = new(std::nothrow) WaylandSubsurfaceWindow(
+		BRect(screenPoint.x, screenPoint.y, screenPoint.x + size.width, screenPoint.y + size.height));
+	if (window == NULL) {
+		return;
+	}
+
+	// take the view out of the window of its parent
+	BWindow *parentWindow = fView->Window();
+	if (parentWindow != NULL && parentWindow->Lock()) {
+		fView->RemoveSelf();
+		parentWindow->Unlock();
+	}
+
+	// the transparent pixels of the surface (the soft shadow and the corners of a menu) show what is under the window: take that from the
+	// screen before the window is there
+	{
+		BScreen screen;
+		BRect area = window->Frame();
+		if (screen.IsValid() && area.IsValid()) {
+			BBitmap *backdrop = new(std::nothrow) BBitmap(BRect(0, 0, area.Width(), area.Height()), B_RGB32);
+			if (backdrop != NULL && backdrop->IsValid() && screen.ReadBitmap(backdrop, false, &area) == B_OK) {
+				fBackdrop = backdrop;
+			} else {
+				delete backdrop;
+			}
+		}
+	}
+
+	window->Lock();
+	window->AddChild(fView);
+	fView->MoveTo(0, 0);
+	fView->ResizeTo(size.width, size.height);
+	if (rootWindow != NULL) {
+		window->AddToSubset(rootWindow);
+	}
+	fSubWindow = window;
+	window->Show();
+	window->Unlock();
+}
+
+void HaikuSurface::PlaceOwnWindow()
+{
+	HaikuSurface *root = fSubsurface != NULL ? fSubsurface->Root() : NULL;
+	if (fSubWindow == NULL || root == NULL || root->View() == NULL || root->View()->Window() == NULL) {
+		return;
+	}
+	int32_t ox = 0, oy = 0;
+	fSubsurface->GetOffset(ox, oy);
+	const BSize size = Size();
+
+	BPoint screenPoint;
+	{
+		auto rootLocked = AppKitPtrs::LockedPtr(root->View());
+		screenPoint = root->View()->ConvertToScreen(BPoint(ox, oy));
+	}
+
+	if (fSubWindow->Lock()) {
+		fSubWindow->MoveTo(screenPoint.x, screenPoint.y);
+		fSubWindow->ResizeTo(size.width, size.height);
+		if (fView != NULL) {
+			fView->MoveTo(0, 0);
+			fView->ResizeTo(size.width, size.height);
+		}
+		if (Bitmap() == NULL) {
+			if (!fSubWindow->IsHidden()) fSubWindow->Hide();
+		} else if (fSubWindow->IsHidden()) {
+			fSubWindow->Show();
+		}
+		fSubWindow->Unlock();
+	}
+}
+
 void HaikuSurface::AttachWindow(BWindow *window)
 {
 	Assert(fView == NULL);
@@ -645,6 +781,16 @@ void HaikuSurface::Detach()
 	if (looper != NULL) {
 		looper->Unlock();
 	}
+
+	if (fSubWindow != NULL) {
+		BWindow *window = fSubWindow;
+		fSubWindow = NULL;
+		if (window->Lock()) {
+			window->Quit();
+		}
+	}
+	delete fBackdrop;
+	fBackdrop = NULL;
 }
 
 void HaikuSurface::Invalidate()
@@ -829,7 +975,13 @@ void HaikuSurface::HandleCommit()
 		}
 	}
 
-	if (View() != NULL && View()->Window() != NULL) {
+	if (fSubsurface != NULL && View() != NULL && View()->Window() != NULL && NeedsOwnWindow()) {
+		MoveToOwnWindow();
+	}
+	if (fSubWindow != NULL && View() != NULL) {
+		PlaceOwnWindow();
+		Invalidate();
+	} else if (View() != NULL && View()->Window() != NULL) {
 		auto viewLocked = AppKitPtrs::LockedPtr(View());
 		if (fSubsurface != NULL) {
 			viewLocked->MoveTo(fSubsurface->GetState().x, fSubsurface->GetState().y);
@@ -874,3 +1026,4 @@ void HaikuSurface::HandleOffset(int32_t x, int32_t y)
 	fPendingState.dy = y;
 	fPendingFields |= (1 << fieldOffset);
 }
+

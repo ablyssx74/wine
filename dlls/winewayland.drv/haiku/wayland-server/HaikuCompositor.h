@@ -109,8 +109,14 @@ private:
 	HaikuXdgSurface *fXdgSurface{};
 	HaikuServerDecoration *fServerDecoration{};
 	HaikuSubsurface *fSubsurface{};
+	BWindow *fSubWindow{};   // a subsurface that sticks out of its root window (a menu, a submenu) is shown in a window of its own
+	BBitmap *fBackdrop{};    // what was on the screen under that window (a window is not transparent: the shadow and the rounded corners of a menu show it)
 
 	HaikuSubsurface::SurfaceList fSurfaceList;
+
+	bool NeedsOwnWindow();
+	void MoveToOwnWindow();
+	void PlaceOwnWindow();
 
 public:
 	static HaikuSurface *Create(struct wl_client *client, uint32_t version, uint32_t id);
