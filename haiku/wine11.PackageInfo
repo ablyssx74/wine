@@ -1,0 +1,31 @@
+name			wine11
+version		11.20-51
+architecture	x86_64
+summary		"Wine (64 and 32-bit), built from the ablyssx74/wine Haiku fork (release 51: menus that stick out of a window get a window of their own, Wine's colours follow the Haiku theme, requires gnutls; 50: Splitgate: Arena Reloaded starts (loader fix for read-only DLL pages); 49: steam:// links (the Steam shortcuts on the Desktop) open through Wine Launcher; 48: name lookups work in games with many files open (Splitgate login); 47: V-sync for games that use it (on by default, HAIWAY_VSYNC=off turns it off), fix for a crash in games that read memory Wine write-watches, Wine Launcher moved to bin; 46: files Wine creates no longer get the execute bit, so they open with a double-click; 45: Wine Launcher opens .exe, .msi, .lnk and .bat files with a double-click; 44: resize from every corner, no separate tray window; 43: Steam start-up and menu lock-up fixes, menus under their titles)"
+description		"Wine 11.20 from https://github.com/ablyssx74/wine for Haiku, with 32-bit (WoW64) support
+on a stock kernel through the separate wine_compat kernel add-on (not part of this package; Windows int3/DebugBreak, used by Chromium and the
+Firefox sandbox, works with the separate wine_int3 add-on), processor
+information, sound through BSoundPlayer (winehaiku.drv), OpenGL through BGLView (libwinehglshim.so) and its own copy
+of the Wayland server (wayland-server-inproc.so) with relative pointer, pointer lock, pointer warp and cursor hiding.
+Set WINE_HAIKU_SYSTEM_WAYLAND=1 to use the system Wayland server instead.
+
+Without the add-on, 64-bit programs run as before and a 32-bit program stops with a message. Run
+`wine --version` to check it works, and `wineboot -u` to create a fresh prefix the first time.
+
+The windows are drawn through Wayland, so the wayland_server compositor has to be running. Sound, video
+decoding, USB and Kerberos support are separate modules that load only if their libraries are installed:
+gettext_libintl, glib2, gstreamer, ffmpeg8, libusb and krb5."
+packager		"ablyssx74 <ablyssx74@users.noreply.github.com>"
+vendor			ablyssx74
+copyrights		{ "1993-2026 the Wine project authors" "2026 ablyssx74" }
+licenses		{ "GNU LGPL v2.1" }
+provides		{
+	wine11 = 11.20
+	cmd:wine11 = 11.20
+}
+requires		{
+	haiku >= r1~beta6
+	wayland
+	libxkbcommon
+	gnutls
+}
