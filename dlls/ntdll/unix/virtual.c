@@ -4353,6 +4353,7 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
 {
     NTSTATUS ret = STATUS_ACCESS_VIOLATION;
     ULONG_PTR err = rec->ExceptionInformation[0];
+    const ULONG_PTR reported_err = err;
     void *addr = (void *)rec->ExceptionInformation[1];
     char *page = ROUND_ADDR( addr, host_page_mask );
     BYTE vprot;
@@ -4419,8 +4420,10 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
         int prot = get_unix_prot( vprot ), need, i;
         struct file_view *view;
 
-        if (err == EXCEPTION_EXECUTE_FAULT) need = PROT_EXEC;
-        else if (err == EXCEPTION_WRITE_FAULT) need = PROT_WRITE;
+        /* (what the kernel reported, not err: a read fault in a readable page was turned into a write fault above, and a read-only
+         * page of an image, a DLL's export table for one, would never have the write access that the repair then asks for) */
+        if (reported_err == EXCEPTION_EXECUTE_FAULT) need = PROT_EXEC;
+        else if (reported_err == EXCEPTION_WRITE_FAULT) need = PROT_WRITE;
         else need = PROT_READ;
 
         /* Only the image of a program is repaired (that is what the writes of the sandbox launcher damage), and only a few
