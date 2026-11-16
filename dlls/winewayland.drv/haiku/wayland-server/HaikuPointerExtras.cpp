@@ -41,7 +41,12 @@ bool sHavePrev = false;
 bool sAbsoluteDevice = false;
 int sAbsoluteVotes = 0;
 bool sAfterWarp = false;
-bigtime_t sWarpWhen = 0;    // when the pointer was last put back
+bigtime_t sWarpWhen = 0;    // when the pointer was last put back: the time the warp was done, not the time of the event that asked for it.
+                            // (An event is stamped when the input server makes it, so with the program or the machine busy an event made
+                            // before the pointer was put back can be handled long after it, and one stamped 30 ms after the event that
+                            // asked for the warp is then not "after the warp": it is near where the pointer was. A mouse was taken for a
+                            // tablet that way, and a lock that is not held lets the pointer leave a window and stops the view at the
+                            // edge of the screen.)
 BPoint sLastReal;
 bool sHaveLastReal = false;
 
@@ -494,7 +499,13 @@ HaikuPointerMotion(HaikuSurface *surface, BPoint &where, bigtime_t when)
 			bool nearLock = fabs(now.x - hold.x) <= 40 && fabs(now.y - hold.y) <= 40;
 			bool nearLast = fabs(now.x - sLastReal.x) <= 12 && fabs(now.y - sLastReal.y) <= 12;
 			if (!nearLock && nearLast) {
-				if (++sAbsoluteVotes >= 4) sAbsoluteDevice = true;
+				if (TraceWanted())
+					fprintf(stderr, "pointer: vote %d for an absolute device: event %ld us after the warp, %.0f,%.0f is %.0f,%.0f from the hold point and %.0f,%.0f from the last real one\n",
+						sAbsoluteVotes + 1, (long)(when - sWarpWhen), now.x, now.y, now.x - hold.x, now.y - hold.y, now.x - sLastReal.x, now.y - sLastReal.y);
+				if (++sAbsoluteVotes >= 4) {
+					sAbsoluteDevice = true;
+					if (TraceWanted()) fprintf(stderr, "pointer: taken for a device that reports absolute positions\n");
+				}
 			} else {
 				sAbsoluteVotes = 0;
 			}
@@ -525,7 +536,7 @@ HaikuPointerMotion(HaikuSurface *surface, BPoint &where, bigtime_t when)
 			sHaveLastReal = true;
 			WarpToScreen(constraint->lockScreen);
 			sAfterWarp = true;
-			sWarpWhen = when;
+			sWarpWhen = system_time();
 			return true;
 		}
 		if (!sHaveHold) {
@@ -543,7 +554,7 @@ HaikuPointerMotion(HaikuSurface *surface, BPoint &where, bigtime_t when)
 				sSettling = true;
 				sSettleSince = when;
 				sAfterWarp = true;
-				sWarpWhen = when;
+				sWarpWhen = system_time();
 			}
 		}
 		bool far = fabs(now.x - sHold.x) > kHoldRadius || fabs(now.y - sHold.y) > kHoldRadius;
@@ -568,7 +579,7 @@ HaikuPointerMotion(HaikuSurface *surface, BPoint &where, bigtime_t when)
 			sSettling = true;
 			sSettleSince = when;
 			sAfterWarp = true;
-			sWarpWhen = when;
+			sWarpWhen = system_time();
 		}
 		return true;
 	}
