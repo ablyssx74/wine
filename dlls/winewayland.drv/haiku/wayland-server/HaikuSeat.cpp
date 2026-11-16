@@ -453,6 +453,8 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					break;
 				}
 				case B_EXITED_VIEW:
+					// a pointer that is confined to the window is put back inside it: leaving would end the confinement
+					if (HaikuPointerConfineExit(surface, *msg)) break;
 					SetPointerFocus(surface, false, BMessage());
 					break;
 			}

@@ -2,6 +2,7 @@
 #include "Wayland.h"
 #include "WlGlobal.h"
 #include <Point.h>
+#include <Message.h>
 #include <OS.h>
 
 class HaikuSurface;
@@ -43,3 +44,9 @@ void HaikuPointerFocusChanged(HaikuSurface *oldSurface, HaikuSurface *newSurface
 // The pointer moved to `where` (in the surface's coordinates). Sends the relative motion, keeps a lock or a confinement. `where` is
 // moved back inside a confinement. Returns true if the motion is not to be reported as a position (the pointer is locked).
 bool HaikuPointerMotion(HaikuSurface *surface, BPoint &where, bigtime_t when);
+
+// The pointer left the view of `surface` (msg is the B_MOUSE_MOVED that says so). If a confinement is active on the window and the
+// pointer is now outside the area it is confined to, the pointer is put back inside, just in from the edge, and true is returned: the
+// seat then keeps the pointer's focus on the surface (a confinement ends when the pointer leaves, and nothing would bring it back).
+// False when nothing is confined, the window is not the active one, or the pointer only went to another part of the same window.
+bool HaikuPointerConfineExit(HaikuSurface *surface, const BMessage &msg);

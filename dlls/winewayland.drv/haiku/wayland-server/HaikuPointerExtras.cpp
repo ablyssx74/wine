@@ -10,6 +10,7 @@
 #include <Screen.h>
 #include <Rect.h>
 #include <View.h>
+#include <Window.h>
 #include <vector>
 #include <algorithm>
 #include <new>
@@ -392,6 +393,48 @@ BindObject(struct wl_client *wl_client, uint32_t version, uint32_t id)
 GLOBAL(HaikuRelativePointerManagerGlobal, HaikuRelativePointerManager, zwp_relative_pointer_manager_v1_interface, 1)
 GLOBAL(HaikuPointerConstraintsGlobal, HaikuPointerConstraints, zwp_pointer_constraints_v1_interface, 1)
 GLOBAL(HaikuPointerWarpGlobal, HaikuPointerWarp, wp_pointer_warp_v1_interface, 1)
+
+
+bool
+HaikuPointerConfineExit(HaikuSurface *surface, const BMessage &msg)
+{
+	Constraint *constraint = ActiveConstraint(surface);
+	if (constraint == NULL || constraint->IsLock() || constraint->surface == NULL) return false;
+	HaikuSurface *top = constraint->surface;
+	BView *view = top->View();
+	if (view == NULL) return false;
+	// a window that is not the active one does not hold the pointer: the user has to be able to leave it
+	BWindow *window = AppKitPtrs::LockedPtr(view)->Window();
+	if (window == NULL || !window->IsActive()) return false;
+
+	BPoint screen;
+	if (msg.FindPoint("screen_where", &screen) != B_OK) {
+		BPoint local;
+		if (msg.FindPoint("be:view_where", &local) != B_OK) return false;
+		screen = ToScreen(surface, local);
+	}
+	BPoint where = screen;
+	AppKitPtrs::LockedPtr(view)->ConvertFromScreen(&where);
+
+	BSize size = top->Size();
+	BRect bounds(0, 0, size.width - 1, size.height - 1);
+	if (constraint->hasRegion) bounds = bounds & constraint->region;
+	if (!bounds.IsValid()) return false;
+	// from a subsurface to its window, or from one part of the window to another: not leaving the confinement
+	if (bounds.Contains(where)) return false;
+
+	// just in from the edge, so that the pointer is not on the border of the window
+	float left = bounds.left, right = bounds.right, top_ = bounds.top, bottom = bounds.bottom;
+	if (right - left >= 2) { left += 1; right -= 1; }
+	if (bottom - top_ >= 2) { top_ += 1; bottom -= 1; }
+	BPoint clamped(std::min<float>(std::max<float>(where.x, left), right), std::min<float>(std::max<float>(where.y, top_), bottom));
+	if (TraceWanted())
+		fprintf(stderr, "pointer: left a confinement at %.0f,%.0f, put back at %.0f,%.0f\n", where.x, where.y, clamped.x, clamped.y);
+	WarpTo(top, clamped);
+	sPrev = clamped;
+	sHavePrev = true;
+	return true;
+}
 
 
 #pragma mark - what the seat reports
