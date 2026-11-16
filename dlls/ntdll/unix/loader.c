@@ -599,6 +599,33 @@ static int exec_wineserver( pid_t *pid, char **argv )
 }
 
 
+#ifdef __HAIKU__
+/* The programs of Wine run with mimalloc (see haiku_load_mimalloc in loader/main.c), the wine server does not: a game hung at start-up with
+ * it in the server. Takes mimalloc out of LD_PRELOAD for the time the server is started; returns the old value to put back. */
+static char *haiku_hide_mimalloc(void)
+{
+    const char *old = getenv( "LD_PRELOAD" );
+    char *saved, *copy, *out, *tok, *save = NULL;
+
+    if (!old || !strstr( old, "libmimalloc" )) return NULL;
+    saved = strdup( old );
+    copy = strdup( old );
+    out = calloc( 1, strlen( old ) + 1 );
+    if (!saved || !copy || !out) { free( saved ); free( copy ); free( out ); return NULL; }
+    for (tok = strtok_r( copy, ": ", &save ); tok; tok = strtok_r( NULL, ": ", &save ))
+    {
+        if (strstr( tok, "libmimalloc" )) continue;
+        if (*out) strcat( out, ":" );
+        strcat( out, tok );
+    }
+    if (*out) setenv( "LD_PRELOAD", out, 1 ); else unsetenv( "LD_PRELOAD" );
+    free( copy );
+    free( out );
+    return saved;
+}
+#endif
+
+
 /***********************************************************************
  *           start_server
  *
@@ -614,10 +641,16 @@ void start_server( BOOL debug )
     {
         int status;
         pid_t pid;
+#ifdef __HAIKU__
+        char *preload = haiku_hide_mimalloc();
+#endif
 
         argv[1] = debug ? debug_flag : NULL;
         argv[2] = NULL;
         if (exec_wineserver( &pid, argv )) fatal_error( "could not exec wineserver\n" );
+#ifdef __HAIKU__
+        if (preload) { setenv( "LD_PRELOAD", preload, 1 ); free( preload ); }
+#endif
         waitpid( pid, &status, 0 );
         status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
         if (status == 2) return;  /* server lock held by someone else, will retry later */

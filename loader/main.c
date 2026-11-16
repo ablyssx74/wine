@@ -249,6 +249,43 @@ static void haiku_spawn_prologue(void)
 }
 #endif
 
+#ifdef __HAIKU__
+/* Haiku's allocator takes one lock for every malloc and free, and the threads of a program that allocates a lot wait for each other: 12
+ * threads of the shader compiler of a game ran at a quarter of a core each (12 threads allocating at once: 68 s with it, 0.3 s with
+ * mimalloc). The programs of Wine get mimalloc (HaikuPorts' package, which this package requires): it is put in LD_PRELOAD and the loader
+ * starts again, as the runtime loader only reads it at the start. The wine server does not get it (start_server in ntdll takes it out of
+ * the environment): a game hung at start-up with mimalloc in the server. mimalloc reserves 1 GiB and commits it all by default, which
+ * Haiku's accounting of committed memory does not allow for the many processes of Wine: it commits as it goes and reserves in small
+ * pieces. WINE_HAIKU_MIMALLOC=0 turns it off; a mimalloc already in LD_PRELOAD (or a choice of the options) is left as it is. */
+static void haiku_load_mimalloc( char *argv[] )
+{
+    static const char *libs[] = { "/boot/system/lib/libmimalloc.so.2", "/boot/home/config/lib/libmimalloc.so.2" };
+    const char *want = getenv( "WINE_HAIKU_MIMALLOC" ), *old = getenv( "LD_PRELOAD" ), *self;
+    size_t i;
+    char *value;
+
+    if (want && !strcmp( want, "0" )) return;
+    if (old && strstr( old, "mimalloc" )) return;
+    if (getenv( "WINE_HAIKU_MIMALLOC_DONE" )) return;  /* it was tried: do not start again for ever */
+    for (i = 0; i < sizeof(libs) / sizeof(libs[0]); i++) if (!access( libs[i], R_OK )) break;
+    if (i == sizeof(libs) / sizeof(libs[0])) return;   /* the package is not installed: as before */
+    if (!(self = get_self_exe())) return;
+
+    value = malloc( strlen( libs[i] ) + (old ? strlen( old ) : 0) + 2 );
+    if (!value) return;
+    strcpy( value, libs[i] );
+    if (old && *old) { strcat( value, ":" ); strcat( value, old ); }
+    setenv( "LD_PRELOAD", value, 1 );
+    free( value );
+    setenv( "WINE_HAIKU_MIMALLOC_DONE", "1", 1 );
+    setenv( "MIMALLOC_ARENA_EAGER_COMMIT", "0", 0 );
+    setenv( "MIMALLOC_ARENA_RESERVE", "64MiB", 0 );
+    execv( self, argv );
+    /* could not start again: go on as before, without it */
+    if (old) setenv( "LD_PRELOAD", old, 1 ); else unsetenv( "LD_PRELOAD" );
+}
+#endif
+
 /**********************************************************************
  *           main
  */
@@ -258,6 +295,7 @@ int main( int argc, char *argv[] )
 
 #ifdef __HAIKU__
     haiku_spawn_prologue();
+    haiku_load_mimalloc( argv );
     /* Mesa's default shader cache writes one file per shader, and on BFS that made UT4 lag all the time (thousands of small
      * file creations while playing). Its single-file backend (one append-only file) does not: measured with UT4, per-file was
      * the worst, the database backend better, the single file the best. A choice made by the user in the environment wins. */
