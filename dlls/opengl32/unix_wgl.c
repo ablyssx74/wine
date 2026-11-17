@@ -29,6 +29,13 @@
 #include <assert.h>
 
 #include <pthread.h>
+#ifdef __HAIKU__
+#include <sys/mman.h>
+/* (<OS.h> has a type called system_info, which other Wine headers have a variable of) */
+#define system_info haiku_os_system_info
+#include <OS.h>
+#undef system_info
+#endif
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -70,6 +77,10 @@ struct buffer
     struct vk_device *vk_device;
     VkDeviceMemory vk_memory;
     GLuint gl_memory;
+#ifdef __HAIKU__
+    area_id haiku_clone;    /* the clone of the driver's mapping at vm_ptr, while the buffer is mapped (0: none) */
+    SIZE_T haiku_clone_size;
+#endif
 };
 
 struct vk_device
@@ -136,6 +147,16 @@ static void unmap_vk_buffer( struct buffer *buffer )
 
     vr = buffer->vk_device->p_vkUnmapMemory2KHR( buffer->vk_device->vk_device, &unmap_info );
     if (vr) ERR( "VkMemoryUnmapInfoKHR failed: %x\n", vr);
+#ifdef __HAIKU__
+    if (buffer->haiku_clone)
+    {
+        /* the driver's own mapping went with the unmap; take the clone away and keep the address reserved for the next map */
+        delete_area( buffer->haiku_clone );
+        mmap( buffer->vm_ptr, buffer->haiku_clone_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0 );
+        buffer->haiku_clone = 0;
+        buffer->haiku_clone_size = 0;
+    }
+#endif
 }
 
 static int compare_buffer_name( const void *key, const struct rb_entry *entry )
@@ -1472,6 +1493,53 @@ static struct buffer *create_buffer_storage( TEB *teb, GLenum target, GLuint nam
     return buffer;
 }
 
+#ifdef __HAIKU__
+/* The NVIDIA driver of Haiku (NVK) maps memory where it likes and ignores the address that VK_EXT_map_memory_placed gave it. A 32-bit
+ * program needs the mapping below 4 GB, at the address Wine reserved (vm_ptr). The driver's mapping is an area: clone it to vm_ptr
+ * (the same thing win32u does for the Vulkan memory of a 32-bit program, which this code, calling the driver directly, did not get). */
+static BOOL haiku_move_mapping( struct buffer *buffer )
+{
+    void *host = buffer->host_ptr, *dest;
+    area_id area = area_for( host ), clone;
+    area_info ai;
+
+    if (area < 0 || get_area_info( area, &ai ) != B_OK || ai.address != host)
+    {
+        ERR( "No area at the driver's mapping %p (area_for: %d)\n", host, (int)area );
+        return FALSE;
+    }
+    if (ai.size > buffer->vm_size)
+    {
+        /* the driver's area is larger than the range reserved for the buffer: reserve one that fits (below 4 GB, wherever it is) */
+        SIZE_T size = ai.size;
+        NtFreeVirtualMemory( GetCurrentProcess(), &buffer->vm_ptr, &buffer->vm_size, MEM_RELEASE );
+        buffer->vm_ptr = NULL;
+        buffer->vm_size = 0;
+        if (NtAllocateVirtualMemory( GetCurrentProcess(), &buffer->vm_ptr, zero_bits, &size, MEM_COMMIT, PAGE_READWRITE ))
+        {
+            ERR( "Cannot reserve %#lx bytes for the driver's mapping at %p\n", (unsigned long)ai.size, host );
+            return FALSE;
+        }
+        buffer->vm_size = size;
+    }
+    dest = buffer->vm_ptr;
+    munmap( dest, ai.size );    /* (Wine's own reservation of the address) */
+    clone = clone_area( "wine gl map", &dest, B_EXACT_ADDRESS, B_READ_AREA | B_WRITE_AREA, area );
+    if (clone < 0 || dest != buffer->vm_ptr)
+    {
+        ERR( "clone_area of the driver's mapping %p (%#lx bytes) to %p failed: %d\n", host, (unsigned long)ai.size, buffer->vm_ptr, (int)clone );
+        if (clone >= 0) delete_area( clone );
+        mmap( buffer->vm_ptr, ai.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0 );
+        return FALSE;
+    }
+    buffer->haiku_clone = clone;
+    buffer->haiku_clone_size = ai.size;
+    buffer->host_ptr = dest;
+    TRACE( "the driver mapped the memory at %p, cloned its area to %p\n", host, dest );
+    return TRUE;
+}
+#endif
+
 static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, GLuint name, GLintptr offset,
                                size_t length, GLbitfield access, void *ptr )
 {
@@ -1508,6 +1576,16 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
             ERR( "vkMapMemory2KHR failed: %d\n", vr );
             return NULL;
         }
+#ifdef __HAIKU__
+        if (buffer->host_ptr != buffer->vm_ptr && !haiku_move_mapping( buffer ))
+        {
+            ERR( "The driver mapped the memory at %p, not at the address %p it was asked for, and it cannot be moved there\n",
+                 buffer->host_ptr, buffer->vm_ptr );
+            unmap_vk_buffer( buffer );
+            buffer->host_ptr = NULL;
+            return NULL;
+        }
+#endif
         assert( buffer->host_ptr == buffer->vm_ptr );
         buffer->map_ptr = (char *)buffer->vm_ptr + offset;
         TRACE( "returning vk mapping %p\n", buffer->map_ptr );
