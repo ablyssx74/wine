@@ -14,8 +14,16 @@ kernel driver provides it, without patching or replacing the kernel.
   (`dlls/ntdll/unix/signal_x86_64.c`) opens it, checks that the signal hook is active and uses it; without it, 64-bit programs run as
   before and a 32-bit program stops with a message.
 
-Tested on hrev60299+6 (x86_64). It depends on kernel internals, so another build may not be supported: the driver then reports that it could
+Tested on hrev60299+6 and hrev60419 (x86_64). It depends on kernel internals, so another build may not be supported: the driver then reports that it could
 not install its hook and Wine disables 32-bit programs instead of crashing. It is not part of Haiku.
+
+## Loading address (hrev60419 and later)
+
+The call it patches is a 5-byte `call rel32`, which reaches 2 GB. A newer kernel loads add-ons at varying addresses, sometimes about 64 GB from the kernel's
+code: the driver then logs `the driver (...) is out of reach of the call (...); not patching` and Wine disables 32-bit programs (Steam: "Failed to start
+process", error 0x54F). Remove the add-on, wait about 10 seconds and install it again until the syslog says `patched the call at ...` (a load can land near
+enough). A stub placed near the call is in the source behind `-DWINE_COMPAT_TRY_STUB`: the first version of it froze a machine while it loaded, the second
+placement was never exercised, so the default build leaves it out.
 
 ## Install
 

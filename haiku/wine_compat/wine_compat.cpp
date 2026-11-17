@@ -193,6 +193,43 @@ hook_setup_signal_frame(void* thread, void* action, void* frameData)
 }
 
 
+// When the driver is loaded too far from the call to reach it with a rel32 (the kernel may load add-ons anywhere in its address space: on
+// hrev60419 it was about 64 GB away), the call goes to a small stub that is allocated within reach of the call and jumps to the hook with
+// an absolute address (movabs r11, hook; jmp r11: r11 is a scratch register at a call site).
+static area_id sStubArea = -1;
+
+static status_t
+make_stub(addr_t site, addr_t hook, addr_t* stubOut)
+{
+#ifndef WINE_COMPAT_TRY_STUB		// (a stub placed near the call has frozen a machine once; only a build with -DWINE_COMPAT_TRY_STUB tries it)
+	(void)site; (void)hook; (void)stubOut;
+	return B_NOT_SUPPORTED;
+#endif
+	// Try page-aligned addresses BELOW the call, starting 1 GB away: the memory right after the kernel image is mapped with large pages by
+	// the boot loader (an area created there froze the machine), while the address space 1 to 1.75 GB below is free. A rel32 reaches 2 GB.
+	for (int dir = 0; dir < 1; dir++) {
+		for (addr_t step = 0x40000000; step < 0x70000000; step += 0x1000000) {
+			addr_t candidate = (site - step) & ~(addr_t)(B_PAGE_SIZE - 1);
+			void* address = (void*)candidate;
+			area_id area = create_area("wine_compat stub", &address, B_EXACT_ADDRESS, B_PAGE_SIZE, B_FULL_LOCK,
+				B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_KERNEL_EXECUTE_AREA);
+			if (area < 0)
+				continue;
+			unsigned char* p = (unsigned char*)address;
+			memset(p, 0xCC, 32);
+			p[0] = 0x49; p[1] = 0xBB;					// movabs r11, imm64
+			memcpy(p + 2, &hook, 8);
+			p[10] = 0x41; p[11] = 0xFF; p[12] = 0xE3;	// jmp r11
+			__asm__ volatile("mfence" ::: "memory");
+			sStubArea = area;
+			*stubOut = (addr_t)address;
+			return B_OK;
+		}
+	}
+	return B_NOT_SUPPORTED;
+}
+
+
 static status_t
 apply_patch()
 {
@@ -222,12 +259,26 @@ apply_patch()
 	memcpy(&rel, code + 1, 4);
 	sGetCurrentIframe = &x86_get_current_iframe;
 
-	// can the new call reach us?
-	int64 newRel = (int64)((addr_t)&hook_setup_signal_frame - (site + 5));
+	// can the new call reach us? If not, through a stub that is within reach
+	addr_t target = (addr_t)&hook_setup_signal_frame;
+	int64 newRel = (int64)(target - (site + 5));
 	if (newRel != (int64)(int32)newRel) {
-		dprintf("wine_compat: the driver (%p) is out of reach of the call (%p); not patching\n",
-				(void*)&hook_setup_signal_frame, (void*)site);
-		return B_NOT_SUPPORTED;
+		addr_t stub = 0;
+		if (make_stub(site, (addr_t)&hook_setup_signal_frame, &stub) != B_OK) {
+			dprintf("wine_compat: the driver (%p) is out of reach of the call (%p) and no stub could be placed near it; not patching\n",
+					(void*)&hook_setup_signal_frame, (void*)site);
+			return B_NOT_SUPPORTED;
+		}
+		target = stub;
+		newRel = (int64)(target - (site + 5));
+		if (newRel != (int64)(int32)newRel) {
+			dprintf("wine_compat: the stub (%p) is out of reach of the call (%p); not patching\n", (void*)stub, (void*)site);
+			delete_area(sStubArea);
+			sStubArea = -1;
+			return B_NOT_SUPPORTED;
+		}
+		dprintf("wine_compat: the driver (%p) is out of reach of the call (%p): using a stub at %p\n",
+				(void*)&hook_setup_signal_frame, (void*)site, (void*)stub);
 	}
 
 	// the text is read-only: write through a second mapping of the same physical page
@@ -235,6 +286,7 @@ apply_patch()
 	status_t status = get_memory_map((const void*)(site + 1), 4, &entry, 1);
 	if (status != B_OK) {
 		dprintf("wine_compat: get_memory_map failed: %d\n", (int)status);
+		if (sStubArea >= 0) { delete_area(sStubArea); sStubArea = -1; }
 		return status;
 	}
 	phys_addr_t page = (phys_addr_t)entry.address & ~(phys_addr_t)(B_PAGE_SIZE - 1);
@@ -244,6 +296,7 @@ apply_patch()
 									 B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &mapped);
 	if (sPatchArea < 0) {
 		dprintf("wine_compat: map_physical_memory failed: %d\n", (int)sPatchArea);
+		if (sStubArea >= 0) { delete_area(sStubArea); sStubArea = -1; }
 		return sPatchArea;
 	}
 	sPatchAddress = (volatile unsigned char*)mapped + offset;
@@ -260,9 +313,10 @@ apply_patch()
 		memcpy((void*)sPatchAddress, &sOriginalOperand, 4);
 		delete_area(sPatchArea);
 		sPatchArea = -1;
+		if (sStubArea >= 0) { delete_area(sStubArea); sStubArea = -1; }
 		return B_ERROR;
 	}
-	dprintf("wine_compat: patched the call at %p to go through %p\n", (void*)site, (void*)&hook_setup_signal_frame);
+	dprintf("wine_compat: patched the call at %p to go through %p\n", (void*)site, (void*)target);
 	sPatched = true;
 	return B_OK;
 }
@@ -281,6 +335,10 @@ remove_patch()
 	snooze(100000);
 	delete_area(sPatchArea);
 	sPatchArea = -1;
+	if (sStubArea >= 0) {
+		delete_area(sStubArea);
+		sStubArea = -1;
+	}
 	dprintf("wine_compat: patch removed\n");
 }
 
