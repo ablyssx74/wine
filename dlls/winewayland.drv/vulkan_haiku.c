@@ -59,7 +59,37 @@ struct haiku_vk_surface
     pthread_mutex_t lock;
     pthread_cond_t cond;
     BOOL frame_pending;     /* the compositor has not yet said that it showed the last frame */
+    int refs;               /* the surface itself (until the layer destroys it) and every frame callback that is still to come */
 };
+
+/* the surface is freed when the layer has destroyed it and no frame callback of the compositor points at it any more */
+static void surface_unref(struct haiku_vk_surface *surface)
+{
+    if (__atomic_sub_fetch(&surface->refs, 1, __ATOMIC_ACQ_REL) != 0) return;
+    pthread_cond_destroy(&surface->cond);
+    pthread_mutex_destroy(&surface->lock);
+    free(surface);
+}
+
+/* The layer destroyed the Vulkan surface (DXVK makes a new one for every swapchain it makes): nothing is presented on it any more, so
+ * its buffers can go. Without this each swapchain that showed a frame kept its pool of buffers until the program ended (the size of
+ * four frames in the program and as much in the window system for every swapchain). The compositor keeps what it has been given:
+ * the last frame stays in the window until the next one. */
+static void surface_gone(void *user)
+{
+    struct haiku_vk_surface *surface = user;
+    int i;
+
+    pthread_mutex_lock(&surface->lock);
+    for (i = 0; i < BUFFER_POOL; i++)
+    {
+        if (surface->pool[i]) wayland_shm_buffer_unref(surface->pool[i]);
+        surface->pool[i] = NULL;
+    }
+    surface->frame_pending = FALSE;
+    pthread_mutex_unlock(&surface->lock);
+    surface_unref(surface);
+}
 
 /* Showing a frame is paced by the display only when the program asks for it, with the FIFO present mode (V-sync on in its settings: DXVK and
  * vkd3d-proton use FIFO for a swap interval above 0 and IMMEDIATE for 0): before it puts a frame in the window the one before has to be
@@ -94,6 +124,33 @@ static int layer_present_mode(void *surface)
         }
     }
     return query && surface ? query(surface) : -1;
+}
+
+/* Ask the layer to call gone(user) when the program destroys the surface (the function is looked up in the layer's image, so an older
+ * layer just has none and the call does nothing). */
+static void layer_set_surface_gone(void *surface, void (*gone)(void *), void *user)
+{
+    static void (*set_gone)(void *, void (*)(void *), void *);
+    static BOOL looked;
+
+    if (!looked)
+    {
+        image_info info;
+        int32_t cookie = 0;
+
+        looked = TRUE;
+        while (get_next_image_info(0, &cookie, &info) == B_OK)
+        {
+            void *symbol = NULL;
+            if (strstr(info.name, "VideoStreamsWsi") &&
+                get_image_symbol(info.id, "VideoStreamsWsi_SetSurfaceGone", B_SYMBOL_TYPE_TEXT, &symbol) == B_OK)
+            {
+                set_gone = symbol;
+                break;
+            }
+        }
+    }
+    if (set_gone && surface) set_gone(surface, gone, user);
 }
 
 static BOOL surface_vsync(struct haiku_vk_surface *surface)
@@ -182,6 +239,7 @@ static void frame_done(void *data, struct wl_callback *callback, uint32_t time)
     pthread_cond_signal(&surface->cond);
     pthread_mutex_unlock(&surface->lock);
     wl_callback_destroy(callback);
+    surface_unref(surface);
 }
 
 static const struct wl_callback_listener frame_listener = { frame_done };
@@ -344,6 +402,7 @@ have_buffer:
         if (callback)
         {
             wl_proxy_set_queue((struct wl_proxy *)callback, process_wayland.wl_event_queue);
+            __atomic_add_fetch(&surface->refs, 1, __ATOMIC_ACQ_REL);    /* frame_done gives it back */
             pthread_mutex_lock(&surface->lock);
             surface->frame_pending = TRUE;
             pthread_mutex_unlock(&surface->lock);
@@ -365,6 +424,7 @@ static VkResult haiku_vulkan_surface_create(struct client_surface *client, const
 
     if (!(surface = calloc(1, sizeof(*surface)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     surface->client = wayland_client;
+    surface->refs = 1;
     pthread_mutex_init(&surface->lock, NULL);
     pthread_cond_init(&surface->cond, NULL);
 
@@ -374,13 +434,15 @@ static VkResult haiku_vulkan_surface_create(struct client_surface *client, const
         return res;
     }
     surface->vk_surface = (void *)(ULONG_PTR)*handle;
-    /* (the surface, its hook and the buffers live as long as the process: the layer tells nothing when a surface goes) */
     if (!shim.surface_attach((void *)(ULONG_PTR)*handle, surface_size, surface_frame, surface))
     {
         WARN("The layer's surface took no hook, nothing will be shown\n");
         free(surface);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    /* A layer that tells when the surface is destroyed gets surface_gone() to call, which frees the surface and its buffers. An older
+     * layer has no such function: then they live as long as the process, as before. */
+    layer_set_surface_gone(surface->vk_surface, surface_gone, surface);
     set_client_surface(client->hwnd, wayland_client);
 
     TRACE("Created surface=0x%s\n", wine_dbgstr_longlong(*handle));
