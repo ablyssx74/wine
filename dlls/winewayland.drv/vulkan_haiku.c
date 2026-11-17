@@ -48,6 +48,8 @@ static struct
     int (*init)(void);
     void *(*surface_attach)(void *surface, void (*size)(void *, unsigned *, unsigned *),
                             void (*frame)(void *, const void *, int, int, int), void *user);
+    /* frees a hook made by surface_attach (surface NULL when the layer's surface is already going) */
+    void (*surface_detach)(void *surface, void *hook);
 } shim;
 
 /* what the window shows of one headless surface */
@@ -56,6 +58,7 @@ struct haiku_vk_surface
     struct wayland_client_surface *client;
     void *vk_surface;       /* the layer's surface (the VkSurfaceKHR handle) */
     struct wayland_shm_buffer *pool[BUFFER_POOL];
+    void *hook;             /* what the bridge library made for the layer's surface (it holds the last bitmap) */
     pthread_mutex_t lock;
     pthread_cond_t cond;
     BOOL frame_pending;     /* the compositor has not yet said that it showed the last frame */
@@ -88,6 +91,10 @@ static void surface_gone(void *user)
     }
     surface->frame_pending = FALSE;
     pthread_mutex_unlock(&surface->lock);
+    /* the hook is ours (the layer does not free what it did not make): it goes with its last bitmap; the layer's surface is going,
+     * so it is not touched */
+    if (shim.surface_detach && surface->hook) shim.surface_detach(NULL, surface->hook);
+    surface->hook = NULL;
     surface_unref(surface);
 }
 
@@ -204,6 +211,7 @@ static BOOL load_shim(void)
         dlclose(handle);
         return FALSE;
     }
+    shim.surface_detach = dlsym(handle, "hvk_surface_detach");
     shim.handle = handle;
     return TRUE;
 }
@@ -434,7 +442,7 @@ static VkResult haiku_vulkan_surface_create(struct client_surface *client, const
         return res;
     }
     surface->vk_surface = (void *)(ULONG_PTR)*handle;
-    if (!shim.surface_attach((void *)(ULONG_PTR)*handle, surface_size, surface_frame, surface))
+    if (!(surface->hook = shim.surface_attach((void *)(ULONG_PTR)*handle, surface_size, surface_frame, surface)))
     {
         WARN("The layer's surface took no hook, nothing will be shown\n");
         free(surface);
