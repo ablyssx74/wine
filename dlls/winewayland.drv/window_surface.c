@@ -46,6 +46,9 @@ struct wayland_window_surface
     struct window_surface header;
     struct wayland_buffer_queue *wayland_buffer_queue;
     BOOL layered;
+#ifdef __HAIKU__
+    BOOL hold_first_flush; /* an unmanaged popup (a menu): hold back its first flush while the program has drawn nothing in it */
+#endif
 };
 
 static struct wayland_window_surface *wayland_window_surface_cast(
@@ -380,6 +383,58 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     HRGN copy_from_window_region;
     uint32_t buffer_format;
 
+#ifdef __HAIKU__
+    /* win32u flushes a popup's surface when the popup is shown, before the program has drawn anything in it (Steam's menus draw
+     * their items about 10 ms later). The surface is still all black then, and the compositor shows that first frame as a solid black
+     * box until the next flush. Hold that one flush back while nothing has been drawn: the surface stays unmapped until the
+     * program draws (win32u keeps the bounds dirty, so the next flush takes everything). Only the first flush is held back. */
+    if (wws->hold_first_flush)
+    {
+        const UINT32 *bits = color_bits;
+        int x, y, stride = color_info->bmiHeader.biWidth;
+        struct wayland_win_data *win_data;
+        BOOL popup, empty = TRUE;
+        int win_width = 0, win_height = 0;
+        RECT area = *dirty;
+
+        wws->hold_first_flush = FALSE;
+        /* (whether the window is an unmanaged popup is only known now: the surface is made before the window's role is) */
+        win_data = wayland_win_data_get(window_surface->hwnd);
+        popup = win_data && !win_data->managed;
+        if (win_data)
+        {
+            win_width = win_data->rects.window.right - win_data->rects.window.left;
+            win_height = win_data->rects.window.bottom - win_data->rects.window.top;
+            wayland_win_data_release(win_data);
+        }
+        /* (only the flushed area counts: the surface is larger than the window, and its margin is not zero) */
+        if (area.left < 0) area.left = 0;
+        if (area.top < 0) area.top = 0;
+        if (area.right > surface_rect.right) area.right = surface_rect.right;
+        if (area.bottom > surface_rect.bottom) area.bottom = surface_rect.bottom;
+        /* (and only the window itself: the flushed area is aligned to 8 pixels and reaches into the white margin of the surface) */
+        if (win_width > 0 && area.right > win_width) area.right = win_width;
+        if (win_height > 0 && area.bottom > win_height) area.bottom = win_height;
+        TRACE("first flush of %p: popup %d, window %dx%d, bpp %d, height %d, area %s, surface %s\n", window_surface->hwnd, popup, win_width, win_height,
+              color_info->bmiHeader.biBitCount, (int)color_info->bmiHeader.biHeight, wine_dbgstr_rect(&area),
+              wine_dbgstr_rect(&surface_rect));
+        if (popup && color_info->bmiHeader.biBitCount == 32 && color_info->bmiHeader.biHeight < 0 &&
+            (area.right - area.left) * (area.bottom - area.top) <= 1024 * 1024)
+        {
+            for (y = area.top; y < area.bottom && empty; y++)
+                for (x = area.left; x < area.right; x++)
+                    if (bits[(size_t)y * stride + x] & 0x00ffffff) { empty = FALSE; break; }   /* (the alpha byte is ignored: a new surface is opaque black) */
+            TRACE("first flush of %p: empty %d\n", window_surface->hwnd, empty);
+            if (empty)
+            {
+                TRACE("holding back the first flush of the popup %p, nothing is drawn in %s yet\n", window_surface->hwnd,
+                      wine_dbgstr_rect(&area));
+                return FALSE;
+            }
+        }
+    }
+#endif
+
     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
                                                rect->left + dirty->right, rect->top + dirty->bottom);
     if (!surface_damage_region)
@@ -525,6 +580,9 @@ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_re
 
     if (layered) data->layered_attribs_set = TRUE;
     *surface = wayland_window_surface_create(data->hwnd, surface_rect, layered);
+#ifdef __HAIKU__
+    if (*surface) wayland_window_surface_cast(*surface)->hold_first_flush = !layered;
+#endif
 
     wayland_win_data_release(data);
     return TRUE;
