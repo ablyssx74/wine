@@ -616,7 +616,7 @@ void window_surface_unlock( struct window_surface *surface )
 static const struct window_surface_funcs remote_surface_funcs;
 static BOOL collect_remote_stacking( HWND top, HWND *stack, UINT *stack_count, UINT max );
 static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits,
-                                 const HWND *stack, UINT stack_count );
+                                 const HWND *stack, UINT stack_count, UINT stack_max );
 
 void window_surface_flush( struct window_surface *surface )
 {
@@ -654,7 +654,7 @@ void window_surface_flush( struct window_surface *surface )
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
 
-        if (have_stack) apply_remote_layers( surface, &dirty, color_info, color_bits, stack, stack_count );
+        if (have_stack) apply_remote_layers( surface, &dirty, color_info, color_bits, stack, stack_count, ARRAY_SIZE(stack) );
 
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
@@ -1242,7 +1242,7 @@ static BOOL collect_remote_stacking( HWND top, HWND *stack, UINT *stack_count, U
 }
 
 static void apply_remote_layers( struct window_surface *surface, const RECT *dirty, const BITMAPINFO *info, void *bits,
-                                 const HWND *stack, UINT stack_count )
+                                 const HWND *stack, UINT stack_count, UINT stack_max )
 {
     struct { struct remote_layer *layer; ULONGLONG key; } sorted[64];
     struct remote_layer *layer;
@@ -1266,7 +1266,7 @@ static void apply_remote_layers( struct window_surface *surface, const RECT *dir
         for (j = 0; j < stack_count; j++) if (stack[j] == layer->hwnd) break;
         /* a window that is not found is hidden (or gone since, or in a hidden window): it is not painted. Only when the list of
          * the stacking was cut short (too many windows) does it go over the others, last changed last */
-        if (j == stack_count && stack_count < ARRAY_SIZE(stack)) continue;
+        if (j == stack_count && stack_count < stack_max) continue;
         key = j < stack_count ? j : (ULONGLONG)stack_count + 1 + layer->order;
         /* The window a DirectComposition target shows its visuals in: they go over the window (and over the windows in it,
          * for the target made "topmost", which is what Chromium does), whatever the stacking says. The windows around it
