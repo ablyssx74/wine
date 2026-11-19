@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -311,8 +312,21 @@ static int check_current_dir_for_exec(void)
     return (ret != MAP_FAILED);
 }
 
-/* create a temp file for anonymous mappings */
-static int create_temp_file( file_pos_t size )
+#ifdef __HAIKU__
+/* remove the tmpmap-* files of the current directory (anonymous sections are kept by name, see set_fd_anon_name) */
+static void remove_stale_temp_files(void)
+{
+    DIR *dir = opendir( "." );
+    struct dirent *ent;
+
+    if (!dir) return;
+    while ((ent = readdir( dir ))) if (!strncmp( ent->d_name, "tmpmap-", 7 )) unlink( ent->d_name );
+    closedir( dir );
+}
+#endif
+
+/* create a temp file for anonymous mappings; if name is not NULL the file is not unlinked: its name is returned in name and the directory fd in dirfd */
+static int create_temp_file_named( file_pos_t size, char name[16], int *dirfd )
 {
     static int temp_dir_fd = -1;
     char tmpfn[16];
@@ -337,6 +351,9 @@ static int create_temp_file( file_pos_t size )
             else  /* neither works, fall back to server dir */
                 fchdir( server_dir_fd );
         }
+#ifdef __HAIKU__
+        remove_stale_temp_files();  /* left behind by a server that crashed */
+#endif
     }
     else if (temp_dir_fd != server_dir_fd) fchdir( temp_dir_fd );
 
@@ -346,14 +363,26 @@ static int create_temp_file( file_pos_t size )
         if (!grow_file( fd, size ))
         {
             close( fd );
+            unlink( tmpfn );
             fd = -1;
         }
-        unlink( tmpfn );
+        else if (name)  /* kept by name, see set_fd_anon_name */
+        {
+            memcpy( name, tmpfn, sizeof(tmpfn) );
+            *dirfd = temp_dir_fd;
+        }
+        else unlink( tmpfn );
     }
     else file_set_error();
 
     if (temp_dir_fd != server_dir_fd) fchdir( server_dir_fd );
     return fd;
+}
+
+/* create a temp file for anonymous mappings */
+static int create_temp_file( file_pos_t size )
+{
+    return create_temp_file_named( size, NULL, NULL );
 }
 
 /* find a memory view from its base address */
@@ -1137,9 +1166,24 @@ static bool mapping_init( struct object *obj, const void *init_data )
         }
         if ((data->flags & SEC_RESERVE) && !(mapping->committed = create_ranges())) return false;
         mapping->size = round_size( mapping->size, page_mask );
+#ifdef __HAIKU__
+        /* keep the file by name: the server holds an open fd only for the sections used last (the limit is 8192 per process) */
+        char name[16];
+        int dirfd = -1;
+
+        if ((unix_fd = create_temp_file_named( mapping->size, name, &dirfd )) == -1) goto error;
+        if (!(mapping->fd = create_anonymous_fd( &mapping_fd_ops, unix_fd, &mapping->obj,
+                                                 FILE_SYNCHRONOUS_IO_NONALERT )))
+        {
+            unlinkat( dirfd, name, 0 );
+            goto error;
+        }
+        set_fd_anon_name( mapping->fd, dirfd, name );
+#else
         if ((unix_fd = create_temp_file( mapping->size )) == -1) goto error;
         if (!(mapping->fd = create_anonymous_fd( &mapping_fd_ops, unix_fd, &mapping->obj,
                                                  FILE_SYNCHRONOUS_IO_NONALERT ))) goto error;
+#endif
         allow_fd_caching( mapping->fd );
     }
     return true;

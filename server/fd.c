@@ -160,6 +160,9 @@ struct fd
     WCHAR               *nt_name;     /* NT file name */
     data_size_t          nt_namelen;  /* length of NT file name */
     int                  unix_fd;     /* unix file descriptor */
+    char                *anon_name;   /* anonymous file kept by name (closed and reopened as needed), or NULL */
+    int                  anon_dirfd;  /* directory fd of the anonymous file */
+    struct list          anon_entry;  /* entry in the list of the anonymous files with an open unix fd */
     unsigned int         no_fd_status;/* status to return when unix_fd is -1 */
     unsigned int         cacheable :1;/* can the fd be cached on the client side? */
     unsigned int         fs_locks :1; /* can we use filesystem locks for this fd? */
@@ -1587,6 +1590,72 @@ static struct object *fd_get_sync( struct object *obj )
     return grab_object( fd->sync );
 }
 
+/* Anonymous files (the backing files of anonymous sections) can be kept by name: the server then holds an open
+ * unix fd only for the most recently used ones and reopens the others when a process maps them.  The number of
+ * open files of a process is limited (8192 on Haiku) and a program like a web view makes thousands of sections. */
+#define ANON_FD_OPEN_MAX 256
+static struct list anon_open_list = LIST_INIT( anon_open_list );
+static int anon_open_count;
+
+/* close the unix fds of the least recently used anonymous files */
+static void anon_fd_trim(void)
+{
+    while (anon_open_count > ANON_FD_OPEN_MAX)
+    {
+        struct fd *fd = LIST_ENTRY( list_tail( &anon_open_list ), struct fd, anon_entry );
+        list_remove( &fd->anon_entry );
+        anon_open_count--;
+        close( fd->unix_fd );
+        fd->unix_fd = -1;
+    }
+}
+
+/* the anonymous file is gone: forget its name and unlink the file */
+static void anon_fd_free( struct fd *fd )
+{
+    if (fd->unix_fd != -1)
+    {
+        list_remove( &fd->anon_entry );
+        anon_open_count--;
+    }
+    unlinkat( fd->anon_dirfd, fd->anon_name, 0 );
+    free( fd->anon_name );
+    fd->anon_name = NULL;
+}
+
+/* the unix fd of the fd is the anonymous file called name in the directory dirfd; the file is unlinked when the fd is destroyed */
+void set_fd_anon_name( struct fd *fd, int dirfd, const char *name )
+{
+    if (!(fd->anon_name = strdup( name )))
+    {
+        unlinkat( dirfd, name, 0 );  /* as before: only the open fd keeps the file */
+        return;
+    }
+    fd->anon_dirfd = dirfd;
+    list_add_head( &anon_open_list, &fd->anon_entry );
+    anon_open_count++;
+    anon_fd_trim();
+}
+
+static int get_anon_unix_fd( struct fd *fd )
+{
+    if (fd->unix_fd != -1)  /* most recently used */
+    {
+        list_remove( &fd->anon_entry );
+        list_add_head( &anon_open_list, &fd->anon_entry );
+        return fd->unix_fd;
+    }
+    if ((fd->unix_fd = openat( fd->anon_dirfd, fd->anon_name, O_RDWR )) == -1)
+    {
+        file_set_error();
+        return -1;
+    }
+    list_add_head( &anon_open_list, &fd->anon_entry );
+    anon_open_count++;
+    anon_fd_trim();
+    return fd->unix_fd;
+}
+
 static void fd_destroy( struct object *obj )
 {
     struct fd *fd = (struct fd *)obj;
@@ -1608,6 +1677,7 @@ static void fd_destroy( struct object *obj )
     }
     else  /* no inode, close it right away */
     {
+        if (fd->anon_name) anon_fd_free( fd );
         if (fd->unix_fd != -1) close( fd->unix_fd );
         free( fd->unix_name );
     }
@@ -1726,6 +1796,8 @@ static struct fd *alloc_fd_object(void)
     fd->options    = 0;
     fd->sharing    = 0;
     fd->unix_fd    = -1;
+    fd->anon_name  = NULL;
+    fd->anon_dirfd = -1;
     fd->unix_name  = NULL;
     fd->nt_name    = NULL;
     fd->nt_namelen = 0;
@@ -1771,6 +1843,8 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
     fd->nt_name    = NULL;
     fd->nt_namelen = 0;
     fd->unix_fd    = -1;
+    fd->anon_name  = NULL;
+    fd->anon_dirfd = -1;
     fd->cacheable  = 0;
     fd->fs_locks   = 0;
     fd->poll_index = -1;
@@ -2151,6 +2225,7 @@ int is_fd_overlapped( struct fd *fd )
 /* retrieve the unix fd for an object */
 int get_unix_fd( struct fd *fd )
 {
+    if (fd->anon_name) return get_anon_unix_fd( fd );
     if (fd->unix_fd == -1) set_error( fd->no_fd_status );
     return fd->unix_fd;
 }
