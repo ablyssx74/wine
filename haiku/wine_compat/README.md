@@ -14,7 +14,7 @@ kernel driver provides it, without patching or replacing the kernel.
   (`dlls/ntdll/unix/signal_x86_64.c`) opens it, checks that the signal hook is active and uses it; without it, 64-bit programs run as
   before and a 32-bit program stops with a message.
 
-Tested on hrev60299+6 and hrev60419 (x86_64). It depends on kernel internals, so another build may not be supported: the driver then reports that it could
+Tested on hrev60299+6, hrev60419 and hrev60437 (x86_64). It depends on kernel internals, so another build may not be supported: the driver then reports that it could
 not install its hook and Wine disables 32-bit programs instead of crashing. It is not part of Haiku.
 
 ## Loading address
@@ -44,6 +44,12 @@ Tested on hrev60419 with the jump used on every load (even when the driver was w
 After the first load and after each of the last ten, a test program that makes a fault in 32-bit code (`compat_test`: the handler runs, the 32-bit code resumes and returns)
 passed, including after the far load among them; a 32-bit Windows program (`syswow64\cmd.exe`) ran through Wine after the first load. Build options: `make EXTRA=-DWINE_COMPAT_CAVE_ALWAYS` uses
 the jump on every load (a test build), `make EXTRA=-DWINE_COMPAT_NO_CAVE` leaves it out. The default build, which uses the jump only when the driver is out of reach, was tested with 14 further loads: two were out of reach (62 GB below the call), went through the jump and passed `compat_test`, and so did the 12 direct loads.
+On hrev60437 (a nightly installed over hrev60419) the kernel file is almost the same: the same size, the same end of the executable segment, the call at the same address
+(its target moved by 16 bytes) and the same 2,000 zero bytes at `0xffffffff801ce830`. The default build patched the call at boot, `compat_test` passed, and a 64-bit and a 32-bit
+Windows program (`system32\cmd.exe`, `syswow64\cmd.exe`) ran under Wine. Reloading the add-on 10 times on a fresh boot gave 10 loads within reach, all followed by a passing
+`compat_test`; the build that uses the jump on every load, 8 loads, all passed; and after about 5 minutes of a Wine game (CS2) 12 reloads of the default build gave one load
+61.9 GB below the call, which went through the jump and passed, and 11 direct loads that passed. Close every Wine program (`wineserver -k`, then check that no `wine` or `wineserver` process is
+left) before reloading the add-on.
 If the kernel has no unused space there, the driver falls back as before. A stub placed near the call is also in the source behind `-DWINE_COMPAT_TRY_STUB`: the first version of
 it froze a machine while it loaded, the second placement was never exercised, so the default build leaves it out.
 
