@@ -415,6 +415,87 @@ HRESULT WINAPI CreateTypeLib(
     return E_FAIL;
 }
 
+/* LoadTypeLib() registers a library that it was given by a bare file name, every time. A program that loads its own library again and again
+ * (TextMaker does it for each automation object it makes) then registers all the type infos of the library, hundreds of registry keys and
+ * as many round trips to the server, with every call. A library that this process has already registered, from a file that has not changed
+ * since, is not registered again by LoadTypeLib(). (An explicit REGKIND_REGISTER and RegisterTypeLib() always register.) Any
+ * UnRegisterTypeLib() makes the process forget what it has registered. */
+struct registered_tlb
+{
+    struct list entry;
+    FILETIME write_time;
+    DWORD size_low, size_high;
+    LONG generation;
+    WCHAR path[1];
+};
+
+static struct list registered_tlbs = LIST_INIT( registered_tlbs );
+static LONG unregister_generation;
+
+static CRITICAL_SECTION registered_tlbs_cs;
+static CRITICAL_SECTION_DEBUG registered_tlbs_cs_debug =
+{
+    0, 0, &registered_tlbs_cs,
+    { &registered_tlbs_cs_debug.ProcessLocksList, &registered_tlbs_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": registered_tlbs_cs") }
+};
+static CRITICAL_SECTION registered_tlbs_cs = { &registered_tlbs_cs_debug, -1, 0, 0, 0, 0 };
+
+static struct registered_tlb *find_registered_tlb( const WCHAR *path )
+{
+    struct registered_tlb *tlb;
+
+    LIST_FOR_EACH_ENTRY( tlb, &registered_tlbs, struct registered_tlb, entry )
+    {
+        if (!wcsicmp( tlb->path, path )) return tlb;
+    }
+    return NULL;
+}
+
+static BOOL tlb_registered_by_this_process( const WCHAR *path )
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    struct registered_tlb *tlb;
+    BOOL ret = FALSE;
+
+    if (!GetFileAttributesExW( path, GetFileExInfoStandard, &data )) return FALSE;
+
+    EnterCriticalSection( &registered_tlbs_cs );
+    if ((tlb = find_registered_tlb( path )))
+        ret = tlb->generation == unregister_generation
+              && !CompareFileTime( &tlb->write_time, &data.ftLastWriteTime )
+              && tlb->size_low == data.nFileSizeLow && tlb->size_high == data.nFileSizeHigh;
+    LeaveCriticalSection( &registered_tlbs_cs );
+    return ret;
+}
+
+static void note_tlb_registered( const WCHAR *path )
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    struct registered_tlb *tlb, *new_tlb = NULL;
+
+    if (!GetFileAttributesExW( path, GetFileExInfoStandard, &data )) return;
+
+    EnterCriticalSection( &registered_tlbs_cs );
+    if (!(tlb = find_registered_tlb( path )))
+    {
+        if ((new_tlb = malloc( offsetof( struct registered_tlb, path[lstrlenW( path ) + 1] ) )))
+        {
+            lstrcpyW( new_tlb->path, path );
+            list_add_head( &registered_tlbs, &new_tlb->entry );
+            tlb = new_tlb;
+        }
+    }
+    if (tlb)
+    {
+        tlb->write_time = data.ftLastWriteTime;
+        tlb->size_low = data.nFileSizeLow;
+        tlb->size_high = data.nFileSizeHigh;
+        tlb->generation = unregister_generation;
+    }
+    LeaveCriticalSection( &registered_tlbs_cs );
+}
+
 /******************************************************************************
  *		LoadTypeLib	[OLEAUT32.161]
  *
@@ -470,6 +551,8 @@ HRESULT WINAPI LoadTypeLibEx(
                 /* don't register typelibs supplied with full path. Experimentation confirms the following */
                 if (((szFile[0] == '\\') && (szFile[1] == '\\')) ||
                     (szFile[0] && (szFile[1] == ':'))) break;
+                /* already registered by this process, from the same unchanged file */
+                if (tlb_registered_by_this_process(szPath)) break;
                 /* else fall-through */
 
             case REGKIND_REGISTER:
@@ -478,6 +561,7 @@ HRESULT WINAPI LoadTypeLibEx(
                     ITypeLib_Release(*pptLib);
                     *pptLib = 0;
                 }
+                else note_tlb_registered(szPath);
                 break;
             case REGKIND_NONE:
                 break;
@@ -867,6 +951,8 @@ HRESULT WINAPI UnRegisterTypeLib(
     int numTypes;
 
     TRACE("(IID: %s)\n",debugstr_guid(libid));
+
+    InterlockedIncrement( &unregister_generation );    /* LoadTypeLib() must register again what it had registered before */
 
     /* Create the path to the key */
     get_typelib_key( libid, wVerMajor, wVerMinor, keyName );
