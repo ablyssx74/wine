@@ -10,7 +10,7 @@ ADDONS = $(HOME)/config/non-packaged/add-ons/kernel/drivers
 all: wine_compat compat_test fsbase_driver_test fs32_test
 
 wine_compat: wine_compat.cpp
-	$(CXX) $(KFLAGS) -fPIC -c wine_compat.cpp -o wine_compat.o
+	$(CXX) $(KFLAGS) $(EXTRA) -fPIC -c wine_compat.cpp -o wine_compat.o
 	$(CXX) -shared -nostdlib -Xlinker -soname=wine_compat -o wine_compat wine_compat.o /boot/system/develop/lib/_KERNEL_
 
 compat_test: compat_test.c

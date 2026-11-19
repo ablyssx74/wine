@@ -23,6 +23,12 @@
 
 #define DEVICE_NAME "misc/wine_compat"
 
+// The jump in the unused end of the kernel's text (see make_cave() below) is how the call is reached when the driver is loaded more than 2 GB
+// away from it. It is built in by default; -DWINE_COMPAT_NO_CAVE leaves it out (then only a direct call, or the optional stub, is tried).
+#ifndef WINE_COMPAT_NO_CAVE
+#define WINE_COMPAT_CAVE
+#endif
+
 // The call to arch_setup_signal_frame() inside handle_signals() is found at load time (the only E8 rel32 in the body of
 // handle_signals() whose target is arch_setup_signal_frame()); nothing here depends on the kernel's build.
 extern "C" void handle_signals();
@@ -230,6 +236,163 @@ make_stub(addr_t site, addr_t hook, addr_t* stubOut)
 }
 
 
+#ifdef WINE_COMPAT_CAVE
+// A second way to get past the 2 GB reach of the call: the end of the kernel image's executable segment is padding. The kernel image is
+// mapped in whole pages, so the part of the last page of the segment after the last byte of the text is zero, executable and always within
+// reach of any call in the image. A 14-byte absolute jump (jmp [rip+0] followed by the 8-byte address of the hook) is written there and the
+// call is pointed at it, wherever the driver was loaded. Nothing is allocated and no address is guessed: the place is read from the kernel's
+// own ELF program headers (the image is mapped from its first byte), must be inside the page and must hold zeros (or our own earlier jump).
+// It is written through a second mapping of the physical page, like the call itself. It is used only when the driver is out of reach of the
+// call; with -DWINE_COMPAT_CAVE_ALWAYS it is used on every load (to test it), and -DWINE_COMPAT_NO_CAVE leaves it out.
+struct elf64_header {
+	uint8 ident[16];
+	uint16 type, machine;
+	uint32 version;
+	uint64 entry, phoff, shoff;
+	uint32 flags;
+	uint16 ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+};
+struct elf64_program_header {
+	uint32 type, flags;
+	uint64 offset, vaddr, paddr, filesz, memsz, align;
+};
+#define KERNEL_IMAGE_BASE_MIN	0xffffffff80000000ULL
+#define CAVE_JUMP_SIZE			14
+
+static area_id sCaveArea = -1;
+static volatile unsigned char* sCaveMapped = NULL;
+
+static const unsigned char kJumpHead[6] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };		// jmp [rip+0]
+
+
+static bool
+cave_is_free(const volatile unsigned char* p)
+{
+	bool zero = true;
+	for (int i = 0; i < CAVE_JUMP_SIZE; i++) {
+		if (p[i] != 0)
+			zero = false;
+	}
+	return zero || memcmp((const void*)p, kJumpHead, sizeof(kJumpHead)) == 0;		// (or our own jump from a load that was not removed)
+}
+
+
+// the first address after the last byte of the executable segment that holds site, if at least 16 bytes of its last page are left
+static bool
+find_text_cave(addr_t site, addr_t* caveOut)
+{
+	addr_t page = site & ~(addr_t)(B_PAGE_SIZE - 1);
+	const unsigned char* image = NULL;
+	// (the image starts at its lowest address with the ELF header; never read below the lowest address a kernel image can have)
+	for (int n = 0; n < 4096 && page >= KERNEL_IMAGE_BASE_MIN; n++, page -= B_PAGE_SIZE) {
+		const unsigned char* p = (const unsigned char*)page;
+		if (p[0] != 0x7F || p[1] != 'E' || p[2] != 'L' || p[3] != 'F')
+			continue;
+		elf64_header header;
+		memcpy(&header, p, sizeof(header));
+		if (header.type == 2 && header.machine == 62 && header.phentsize == sizeof(elf64_program_header)
+				&& header.phnum > 0 && header.phnum <= 32
+				&& header.phoff + (uint64)header.phnum * header.phentsize <= B_PAGE_SIZE) {
+			image = p;
+			break;
+		}
+	}
+	if (image == NULL)
+		return false;
+	elf64_header header;
+	memcpy(&header, image, sizeof(header));
+	for (int i = 0; i < header.phnum; i++) {
+		elf64_program_header ph;
+		memcpy(&ph, image + header.phoff + (size_t)i * header.phentsize, sizeof(ph));
+		if (ph.type != 1 || (ph.flags & 1) == 0 || site < ph.vaddr || site >= ph.vaddr + ph.memsz)
+			continue;
+		const addr_t end = (addr_t)(ph.vaddr + ph.memsz);
+		const addr_t cave = (end + 15) & ~(addr_t)15;
+		const addr_t pageEnd = (end + B_PAGE_SIZE - 1) & ~(addr_t)(B_PAGE_SIZE - 1);
+		if (cave + 16 > pageEnd)
+			return false;
+		*caveOut = cave;
+		return true;
+	}
+	return false;
+}
+
+
+static void
+drop_cave()
+{
+	if (sCaveMapped != NULL) {
+		for (int i = 0; i < CAVE_JUMP_SIZE; i++)
+			sCaveMapped[i] = 0;
+		__asm__ volatile("mfence" ::: "memory");
+		sCaveMapped = NULL;
+	}
+	if (sCaveArea >= 0) {
+		delete_area(sCaveArea);
+		sCaveArea = -1;
+	}
+}
+
+
+static status_t
+make_cave(addr_t site, addr_t hook, addr_t* caveOut)
+{
+	addr_t cave = 0;
+	if (!find_text_cave(site, &cave)) {
+		dprintf("wine_compat: no unused space at the end of the kernel's text\n");
+		return B_NOT_SUPPORTED;
+	}
+	const addr_t from = site + 5;
+	if ((cave > from ? cave - from : from - cave) >= 0x70000000) {
+		dprintf("wine_compat: the unused space (%p) is out of reach of the call (%p)\n", (void*)cave, (void*)site);
+		return B_NOT_SUPPORTED;
+	}
+	physical_entry entry;
+	status_t status = get_memory_map((const void*)cave, 16, &entry, 1);		// (fails if the page is not mapped: nothing is read before this)
+	if (status != B_OK) {
+		dprintf("wine_compat: get_memory_map of the unused space failed: %d\n", (int)status);
+		return status;
+	}
+	phys_addr_t page = (phys_addr_t)entry.address & ~(phys_addr_t)(B_PAGE_SIZE - 1);
+	size_t offset = (size_t)((phys_addr_t)entry.address - page);
+	if (offset + 16 > B_PAGE_SIZE)
+		return B_NOT_SUPPORTED;
+	void* mapped = NULL;
+	area_id area = map_physical_memory("wine_compat cave", page, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &mapped);
+	if (area < 0) {
+		dprintf("wine_compat: map_physical_memory of the unused space failed: %d\n", (int)area);
+		return area;
+	}
+	volatile unsigned char* write = (volatile unsigned char*)mapped + offset;
+	// the two views of the page must agree, and the place must be free
+	if (memcmp((const void*)cave, (const void*)write, 16) != 0 || !cave_is_free(write)) {
+		dprintf("wine_compat: the unused space (%p) is not free or not the same page; not using it\n", (void*)cave);
+		delete_area(area);
+		return B_NOT_SUPPORTED;
+	}
+	unsigned char code[CAVE_JUMP_SIZE];
+	memcpy(code, kJumpHead, sizeof(kJumpHead));
+	memcpy(code + sizeof(kJumpHead), &hook, 8);
+	memcpy((void*)write, code, sizeof(code));
+	__asm__ volatile("mfence" ::: "memory");
+	if (memcmp((const void*)cave, code, sizeof(code)) != 0) {			// look at it from the kernel's own address
+		dprintf("wine_compat: the jump did not show in the kernel's text\n");
+		for (int i = 0; i < CAVE_JUMP_SIZE; i++)
+			write[i] = 0;
+		delete_area(area);
+		return B_ERROR;
+	}
+	sCaveArea = area;
+	sCaveMapped = write;
+	*caveOut = cave;
+	return B_OK;
+}
+#else
+static void drop_cave() {}
+#endif	// WINE_COMPAT_CAVE
+
+
 static status_t
 apply_patch()
 {
@@ -262,6 +425,22 @@ apply_patch()
 	// can the new call reach us? If not, through a stub that is within reach
 	addr_t target = (addr_t)&hook_setup_signal_frame;
 	int64 newRel = (int64)(target - (site + 5));
+#ifdef WINE_COMPAT_CAVE
+#ifdef WINE_COMPAT_CAVE_ALWAYS
+	const bool wantCave = true;
+#else
+	const bool wantCave = newRel != (int64)(int32)newRel;
+#endif
+	if (wantCave) {
+		addr_t cave = 0;
+		if (make_cave(site, (addr_t)&hook_setup_signal_frame, &cave) == B_OK) {
+			dprintf("wine_compat: the driver (%p) is %s the call (%p): the call goes through a jump at %p in the unused end of the kernel's text\n",
+					(void*)&hook_setup_signal_frame, newRel != (int64)(int32)newRel ? "out of reach of" : "within reach of", (void*)site, (void*)cave);
+			target = cave;
+			newRel = (int64)(target - (site + 5));
+		}
+	}
+#endif
 	if (newRel != (int64)(int32)newRel) {
 		addr_t stub = 0;
 		if (make_stub(site, (addr_t)&hook_setup_signal_frame, &stub) != B_OK) {
@@ -275,6 +454,7 @@ apply_patch()
 			dprintf("wine_compat: the stub (%p) is out of reach of the call (%p); not patching\n", (void*)stub, (void*)site);
 			delete_area(sStubArea);
 			sStubArea = -1;
+			drop_cave();
 			return B_NOT_SUPPORTED;
 		}
 		dprintf("wine_compat: the driver (%p) is out of reach of the call (%p): using a stub at %p\n",
@@ -287,6 +467,7 @@ apply_patch()
 	if (status != B_OK) {
 		dprintf("wine_compat: get_memory_map failed: %d\n", (int)status);
 		if (sStubArea >= 0) { delete_area(sStubArea); sStubArea = -1; }
+		drop_cave();
 		return status;
 	}
 	phys_addr_t page = (phys_addr_t)entry.address & ~(phys_addr_t)(B_PAGE_SIZE - 1);
@@ -297,6 +478,7 @@ apply_patch()
 	if (sPatchArea < 0) {
 		dprintf("wine_compat: map_physical_memory failed: %d\n", (int)sPatchArea);
 		if (sStubArea >= 0) { delete_area(sStubArea); sStubArea = -1; }
+		drop_cave();
 		return sPatchArea;
 	}
 	sPatchAddress = (volatile unsigned char*)mapped + offset;
@@ -314,6 +496,7 @@ apply_patch()
 		delete_area(sPatchArea);
 		sPatchArea = -1;
 		if (sStubArea >= 0) { delete_area(sStubArea); sStubArea = -1; }
+		drop_cave();
 		return B_ERROR;
 	}
 	dprintf("wine_compat: patched the call at %p to go through %p\n", (void*)site, (void*)target);
@@ -339,6 +522,7 @@ remove_patch()
 		delete_area(sStubArea);
 		sStubArea = -1;
 	}
+	drop_cave();
 	dprintf("wine_compat: patch removed\n");
 }
 
