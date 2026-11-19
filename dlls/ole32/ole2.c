@@ -627,6 +627,7 @@ HRESULT WINAPI RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
  */
 HRESULT WINAPI RevokeDragDrop(HWND hwnd)
 {
+  DWORD pid = 0;
   HANDLE map;
   IStream *stream;
   IDropTarget *drop_target;
@@ -637,6 +638,15 @@ HRESULT WINAPI RevokeDragDrop(HWND hwnd)
   if (!IsWindow(hwnd))
   {
     ERR("invalid hwnd %p\n", hwnd);
+    return DRAGDROP_E_INVALIDHWND;
+  }
+
+  /* RegisterDragDrop does not register windows of other processes; the props of such a window
+   * hold a pointer and a handle of that process, which mean nothing (or something else) here */
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != GetCurrentProcessId())
+  {
+    FIXME("revoke for another process windows is disabled\n");
     return DRAGDROP_E_INVALIDHWND;
   }
 
