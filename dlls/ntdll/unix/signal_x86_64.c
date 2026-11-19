@@ -2119,17 +2119,33 @@ static inline DWORD is_privileged_instr( CONTEXT *context )
 }
 
 
+#ifdef __HAIKU__
+/* Haiku's ucontext has no error code (ERROR_sig is 0), so a "int $n" that faults (n is not one of the interrupts user code may
+ * use) could not be told from a privileged instruction: __fastfail (int $0x29), int $0x2c and int $0x2d, which Windows programs use,
+ * were all reported as EXCEPTION_PRIV_INSTRUCTION.  The error code the CPU pushes for "int $n" is (n << 3) | 2: work it out from
+ * the instruction. */
+static WORD haiku_int_error_code( const CONTEXT *context )
+{
+    BYTE instr[2];
+
+    if (virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) ) == sizeof(instr) && instr[0] == 0xcd)
+        return (instr[1] << 3) | 2;
+    return 0;
+}
+#endif
+
+
 /***********************************************************************
  *           handle_interrupt
  *
  * Handle an interrupt.
  */
-static inline BOOL handle_interrupt( struct thread_data *data, ucontext_t *sigcontext,
+static inline BOOL handle_interrupt( struct thread_data *data, unsigned int interrupt, ucontext_t *sigcontext,
                                      EXCEPTION_RECORD *rec, struct xcontext *xcontext )
 {
     CONTEXT *context = &xcontext->c;
 
-    switch (ERROR_sig(sigcontext) >> 3)
+    switch (interrupt)
     {
     case 0x29:
         /* __fastfail: process state is corrupted */
@@ -2142,7 +2158,6 @@ static inline BOOL handle_interrupt( struct thread_data *data, ucontext_t *sigco
     case 0x2c:
         rec->ExceptionCode = STATUS_ASSERTION_FAILURE;
         break;
-#ifndef __HAIKU__
     case 0x2d:
         if (CS_sig(sigcontext) == cs64_sel)
         {
@@ -2163,7 +2178,6 @@ static inline BOOL handle_interrupt( struct thread_data *data, ucontext_t *sigco
         rec->NumberParameters = 1;
         rec->ExceptionInformation[0] = context->Rax;
         break;
-#endif
     default:
         return FALSE;
     }
@@ -2644,8 +2658,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     case TRAP_x86_PROTFLT:   /* General protection fault */
         {
             WORD err = ERROR_sig(sigcontext);
+#ifdef __HAIKU__
+            if (!err) err = haiku_int_error_code( &context.c );
+#endif
             if (!err && (rec.ExceptionCode = is_privileged_instr( &context.c ))) break;
-            if ((err & 7) == 2 && handle_interrupt( data, sigcontext, &rec, &context )) return;
+            if ((err & 7) == 2 && handle_interrupt( data, err >> 3, sigcontext, &rec, &context )) return;
             rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
             rec.NumberParameters = 2;
             rec.ExceptionInformation[0] = 0;
