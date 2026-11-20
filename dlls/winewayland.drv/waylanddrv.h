@@ -301,6 +301,8 @@ struct wayland_surface
         {
             struct wl_subsurface *wl_subsurface;
             HWND owner_hwnd;
+            /* a subsurface that is the menu of a menu: the window it is stacked above (its parent menu, a sibling), 0 otherwise */
+            HWND stack_hwnd;
         };
     };
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;

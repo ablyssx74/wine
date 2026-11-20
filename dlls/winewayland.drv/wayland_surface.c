@@ -849,8 +849,9 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
  */
 static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface)
 {
-    struct wayland_win_data *owner_data;
+    struct wayland_win_data *owner_data, *stack_data;
     struct wayland_surface *owner_surface;
+    struct wl_surface *stacked;
 
     if (!surface->processing.serial || !surface->processing.processed) return;
     if (!(owner_data = wayland_win_data_get(surface->owner_hwnd))) return;
@@ -865,7 +866,18 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
         TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
 
         wl_subsurface_set_position(surface->wl_subsurface, rect.left, rect.top);
-        if (owner_data->client_surface && owner_data->client_surface->wl_subsurface)
+        stacked = NULL;
+        if (surface->stack_hwnd && (stack_data = wayland_win_data_get(surface->stack_hwnd)))
+        {
+            /* the parent menu, a sibling of this one under the window at the bottom of the chain */
+            if (stack_data->wayland_surface && stack_data->wayland_surface->wl_subsurface &&
+                stack_data->wayland_surface->owner_hwnd == surface->owner_hwnd)
+                stacked = stack_data->wayland_surface->wl_surface;
+            wayland_win_data_release(stack_data);
+        }
+        if (stacked)
+            wl_subsurface_place_above(surface->wl_subsurface, stacked);
+        else if (owner_data->client_surface && owner_data->client_surface->wl_subsurface)
             wl_subsurface_place_above(surface->wl_subsurface, owner_data->client_surface->wl_surface);
         else
             wl_subsurface_place_above(surface->wl_subsurface, owner_surface->wl_surface);

@@ -454,6 +454,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     HWND owner = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_surface *owner_surface;
     struct wayland_win_data *data, *owner_data;
+    HWND stack_owner;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
@@ -465,6 +466,22 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
+    stack_owner = owner;
+#ifdef __HAIKU__
+    /* A menu inside a menu (a submenu lies beside its parent menu): the view of a subsurface clips what lies outside it, so
+     * a subsurface of a menu showed nothing of a submenu (Ardour's context menus). The submenu is a subsurface of the
+     * window at the bottom of the chain instead, stacked above its parent menu. */
+    while (owner_data && owner_data->wayland_surface &&
+           owner_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+           owner_data->wayland_surface->owner_hwnd && owner_data->wayland_surface->owner_hwnd != owner &&
+           owner_data->wayland_surface->owner_hwnd != hwnd)
+    {
+        HWND up = owner_data->wayland_surface->owner_hwnd;
+        wayland_win_data_release(owner_data);
+        owner = up;
+        owner_data = wayland_win_data_get(owner);
+    }
+#endif
     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
 
     data->rects = *new_rects;
@@ -482,6 +499,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     else if (wayland_win_data_create_wayland_surface(data, owner_surface))
     {
+        /* (only a subsurface has the field: it shares its memory with the pointers of a toplevel) */
+        if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
+            data->wayland_surface->stack_hwnd = stack_owner != owner ? stack_owner : 0;
         wayland_win_data_update_wayland_state(data);
     }
 
