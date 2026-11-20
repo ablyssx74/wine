@@ -155,23 +155,30 @@ struct hs_recorder
     int channels, format;    /* what the caller wants: format as in haiku_audio_open */
     int running;
     int old_input;           /* the input that was chosen before, given back when the recording is over */
-    media_node node;
+    media_node node;         /* where the recording comes from: the system's default audio input (hrecord's input hub when it shares the input), or the hardware */
+    media_node hardware;     /* the sound hardware: its input selector chooses Mic in, Line in ... */
+    bool starts_hardware;    /* the node is the hardware itself, so this recorder starts it and stops it again */
 };
 
-/* the physical input node of the sound hardware, the one that has a choice of inputs if there are several */
+/* the physical input node of the sound hardware (not a hub that shares it: hrecord's input hub is a physical input node too) */
 static bool find_input_node(BMediaRoster *roster, media_node *node)
 {
     live_node_info infos[32];
     int32 count = 32;
+    bool found = false;
 
     if (roster->GetLiveNodes(infos, &count) != B_OK) return false;
     for (int32 i = 0; i < count; i++)
     {
         if (!(infos[i].node.kind & B_PHYSICAL_INPUT) || !(infos[i].node.kind & B_BUFFER_PRODUCER)) continue;
+        if (!strncmp(infos[i].name, "hrecord ", 8)) continue;
         *node = infos[i].node;
         return true;
     }
-    return false;
+    /* nothing else: whatever physical input there is */
+    for (int32 i = 0; i < count && !found; i++)
+        if ((infos[i].node.kind & B_PHYSICAL_INPUT) && (infos[i].node.kind & B_BUFFER_PRODUCER)) { *node = infos[i].node; found = true; }
+    return found;
 }
 
 /* the parameters of the node that choose the input */
@@ -238,7 +245,6 @@ int haiku_audio_list_inputs(char names[][64], int *values, int max, int *current
         if (p->GetValue(&value, &size, &when) == B_OK && size >= sizeof(value)) *current = value;
     }
     delete web;
-    roster->ReleaseNode(node);
     return n;
 }
 
@@ -316,23 +322,44 @@ void *haiku_audio_record_open(int channels, int format, int input_value, hs_reco
     r->cookie = cookie;
     r->channels = channels;
     r->format = format;
-    if (!find_input_node(roster, &r->node)) { free(r); return NULL; }
+    if (!find_input_node(roster, &r->hardware)) { free(r); return NULL; }
 
-    r->old_input = choose_input(roster, r->node, input_value);
+    /* the system's default audio input is where programs get their input from: with hrecord's input hub on it is the hub, which has
+     * a free output for every program (the hardware has one only, and hrecord holds it). Without a usable default, the hardware. */
+    {
+        media_node def;
+        live_node_info info;
+
+        if (roster->GetAudioInput(&def) == B_OK && roster->GetLiveNodeInfo(def, &info) == B_OK)
+            r->node = def;
+        else if (roster->GetNodeFor(r->hardware.node, &r->node) != B_OK)
+        {
+            free(r);
+            return NULL;
+        }
+    }
+    r->starts_hardware = r->node.node == r->hardware.node;
+
+    r->old_input = choose_input(roster, r->hardware, input_value);
 
     fmt.type = B_MEDIA_RAW_AUDIO;
     fmt.u.raw_audio = media_raw_audio_format::wildcard;
     r->recorder = new BMediaRecorder("Wine", B_MEDIA_RAW_AUDIO);
     if (r->recorder->InitCheck() != B_OK) goto fail;
     r->recorder->SetHooks(record_buffer, NULL, r);
-    if (roster->GetAllOutputsFor(r->node, outputs, 8, &output_count) != B_OK || output_count < 1) goto fail;
+    /* an output that is free; if none is, the first one (the connection then fails: the input is in use) */
+    if (roster->GetFreeOutputsFor(r->node, outputs, 8, &output_count, B_MEDIA_RAW_AUDIO) != B_OK || output_count < 1)
+    {
+        output_count = 8;
+        if (roster->GetAllOutputsFor(r->node, outputs, 8, &output_count) != B_OK || output_count < 1) goto fail;
+    }
     if (r->recorder->Connect(r->node, &outputs[0], &fmt) != B_OK) goto fail;
     *rate = (int)r->recorder->Format().u.raw_audio.frame_rate;
     return r;
 
 fail:
     delete r->recorder;
-    if (r->old_input >= 0) choose_input(roster, r->node, r->old_input);
+    if (r->old_input >= 0) choose_input(roster, r->hardware, r->old_input);
     roster->ReleaseNode(r->node);
     free(r);
     return NULL;
@@ -342,8 +369,8 @@ int haiku_audio_record_start(void *handle)
 {
     hs_recorder *r = (hs_recorder *)handle;
     if (r->recorder->Start() != B_OK) return 0;
-    /* the hardware does not send anything until its own node is started */
-    BMediaRoster::Roster()->StartNode(r->node, 0);
+    /* the hardware does not send anything until its own node is started (a hub is started by whoever made it) */
+    if (r->starts_hardware) BMediaRoster::Roster()->StartNode(r->node, 0);
     r->running = 1;
     return 1;
 }
@@ -353,7 +380,7 @@ void haiku_audio_record_stop(void *handle)
     hs_recorder *r = (hs_recorder *)handle;
     if (r->running)
     {
-        BMediaRoster::Roster()->StopNode(r->node, 0, true);
+        if (r->starts_hardware) BMediaRoster::Roster()->StopNode(r->node, 0, true);
         r->recorder->Stop();
     }
     r->running = 0;
@@ -365,7 +392,7 @@ void haiku_audio_record_close(void *handle)
     haiku_audio_record_stop(handle);
     r->recorder->Disconnect();
     delete r->recorder;
-    if (r->old_input >= 0) choose_input(BMediaRoster::Roster(), r->node, r->old_input);
+    if (r->old_input >= 0) choose_input(BMediaRoster::Roster(), r->hardware, r->old_input);
     BMediaRoster::Roster()->ReleaseNode(r->node);
     free(r);
 }
