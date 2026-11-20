@@ -1,8 +1,9 @@
 /*
  * Unixlib for the winehaiku audio driver: plays through BSoundPlayer (see haikushim.cpp).
  *
- * Modelled on the winecoreaudio driver, which is also a driver that is called back for its data by the system. Only playback
- * is implemented so far: there is no capture device.
+ * Modelled on the winecoreaudio driver, which is also a driver that is called back for its data by the system. Playback goes
+ * through BSoundPlayer, capture through BMediaRecorder; every input of the sound hardware (Mic in, Line in ...) is a capture
+ * endpoint of its own.
  *
  * Copyright 2011 Andrew Eikum for CodeWeavers
  * Copyright 2021 Huw Davies
@@ -57,6 +58,8 @@
 WINE_DEFAULT_DEBUG_CHANNEL(haiku);
 
 #define DEVICE_ID "haiku-default"
+#define INPUT_ID_PREFIX "haiku-in-"
+#define MAX_INPUTS 16
 #define MIX_RATE 48000
 #define MAX_CHANNELS 8
 #define PERIOD_FRAMES 480      /* 10 ms */
@@ -72,12 +75,21 @@ static struct
     void (*stop)(void *player);
     void (*close)(void *player);
     long long (*latency)(void *player);
+    /* capture; may be missing */
+    int (*list_inputs)(char names[][64], int *values, int max, int *current);
+    void *(*record_open)(int channels, int format, int input_value, void (*record)(void *, const void *, size_t),
+                         void *cookie, int *rate);
+    int (*record_start)(void *recorder);
+    void (*record_stop)(void *recorder);
+    void (*record_close)(void *recorder);
 } hs;
 
 struct haiku_stream
 {
     pthread_mutex_t lock;
     void *player;
+    void *recorder;
+    BOOL capture;
     DWORD flags;
     AUDCLNT_SHAREMODE share;
     HANDLE event;
@@ -159,6 +171,9 @@ static BOOL load_shim(void)
 
 #define LOAD(name) if (!(hs.name = dlsym(handle, "haiku_audio_" #name))) { WARN("Missing haiku_audio_" #name "\n"); dlclose(handle); return FALSE; }
     LOAD(open) LOAD(start) LOAD(stop) LOAD(close) LOAD(latency)
+#undef LOAD
+#define LOAD(name) hs.name = dlsym(handle, "haiku_audio_" #name);
+    LOAD(list_inputs) LOAD(record_open) LOAD(record_start) LOAD(record_stop) LOAD(record_close)
 #undef LOAD
     hs.handle = handle;
     return TRUE;
@@ -289,19 +304,70 @@ static void wrap_buffer(BYTE *dst, UINT32 dst_offs, UINT32 dst_bytes, BYTE *src,
         memcpy(dst + dst_offs, src, src_bytes);
 }
 
+/* the inputs of the hardware: names and the values that choose them */
+static int list_inputs(char names[][64], int *values, int *current)
+{
+    *current = -1;
+    if (!load_shim() || !hs.list_inputs) return 0;
+    return hs.list_inputs(names, values, MAX_INPUTS, current);
+}
+
+/* the value of the input an endpoint id names, or -1 */
+static int input_from_device(const char *device)
+{
+    if (!device || strncmp(device, INPUT_ID_PREFIX, sizeof(INPUT_ID_PREFIX) - 1)) return -1;
+    return atoi(device + sizeof(INPUT_ID_PREFIX) - 1);
+}
+
 static NTSTATUS unix_get_endpoint_ids(void *args)
 {
     struct get_endpoint_ids_params *params = args;
     static const WCHAR name[] = { 'H', 'a', 'i', 'k', 'u', ' ', 'a', 'u', 'd', 'i', 'o', ' ', 'o', 'u', 't', 'p', 'u', 't', 0 };
+    static const WCHAR in_prefix[] = { 'H', 'a', 'i', 'k', 'u', ' ', 0 };
     const SIZE_T name_bytes = sizeof(name), device_bytes = (sizeof(DEVICE_ID) + 1) & ~1;
-    unsigned int needed;
+    unsigned int needed, i;
     struct endpoint *endpoint = params->endpoints;
+    char names[MAX_INPUTS][64];
+    int values[MAX_INPUTS], current, count;
 
     params->num = 0;
     params->default_idx = 0;
 
-    if (params->flow == eCapture)    /* no capture yet */
+    if (params->flow == eCapture)
     {
+        char device[32];
+        char *p;
+
+        count = list_inputs(names, values, &current);
+        needed = 0;
+        for (i = 0; i < count; i++)
+        {
+            sprintf(device, INPUT_ID_PREFIX "%d", values[i]);
+            needed += sizeof(*endpoint) + sizeof(in_prefix) - sizeof(WCHAR) + (strlen(names[i]) + 1) * sizeof(WCHAR)
+                      + ((strlen(device) + 2) & ~1);
+        }
+        params->num = count;
+        if (needed > params->size)
+        {
+            params->size = needed;
+            params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+            return STATUS_SUCCESS;
+        }
+        p = (char *)params->endpoints + count * sizeof(*endpoint);
+        for (i = 0; i < count; i++)
+        {
+            SIZE_T j, len = strlen(names[i]);
+
+            endpoint[i].name = p - (char *)params->endpoints;
+            memcpy(p, in_prefix, sizeof(in_prefix) - sizeof(WCHAR));
+            p += sizeof(in_prefix) - sizeof(WCHAR);
+            for (j = 0; j <= len; j++, p += sizeof(WCHAR)) *(WCHAR *)p = (unsigned char)names[i][j];
+            sprintf(device, INPUT_ID_PREFIX "%d", values[i]);
+            endpoint[i].device = p - (char *)params->endpoints;
+            memcpy(p, device, strlen(device) + 1);
+            p += (strlen(device) + 2) & ~1;
+            if (values[i] == current) params->default_idx = i;
+        }
         params->result = S_OK;
         return STATUS_SUCCESS;
     }
@@ -328,6 +394,37 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
     return STATUS_SUCCESS;
 }
 
+/* the capture side: data comes from a thread of BMediaRecorder, which must not call anything of Wine */
+static void record_buffer(void *cookie, const void *data, size_t frames)
+{
+    struct haiku_stream *stream = cookie;
+    UINT32 block = stream->fmt->nBlockAlign, n = frames, chunk;
+
+    pthread_mutex_lock(&stream->lock);
+    if (stream->playing)
+    {
+        if (n > stream->bufsize_frames) n = stream->bufsize_frames;
+        if (stream->held_frames + n > stream->bufsize_frames)    /* overrun: the oldest data goes */
+        {
+            UINT32 drop = stream->held_frames + n - stream->bufsize_frames;
+
+            stream->lcl_offs_frames = (stream->lcl_offs_frames + drop) % stream->bufsize_frames;
+            stream->held_frames -= drop;
+        }
+        chunk = stream->bufsize_frames - stream->wri_offs_frames;
+        if (n > chunk)
+        {
+            memcpy(stream->local_buffer + stream->wri_offs_frames * block, data, chunk * block);
+            memcpy(stream->local_buffer, (const BYTE *)data + chunk * block, (n - chunk) * block);
+        }
+        else
+            memcpy(stream->local_buffer + stream->wri_offs_frames * block, data, n * block);
+        stream->wri_offs_frames = (stream->wri_offs_frames + n) % stream->bufsize_frames;
+        stream->held_frames += n;
+    }
+    pthread_mutex_unlock(&stream->lock);
+}
+
 static NTSTATUS unix_create_stream(void *args)
 {
     struct create_stream_params *params = args;
@@ -337,7 +434,7 @@ static NTSTATUS unix_create_stream(void *args)
 
     params->result = S_OK;
 
-    if (params->flow != eRender)
+    if (params->flow != eRender && params->flow != eCapture)
     {
         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
         return STATUS_SUCCESS;
@@ -386,6 +483,39 @@ static NTSTATUS unix_create_stream(void *args)
     }
     silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
 
+    if (params->flow == eCapture)
+    {
+        int rate = 0, input = input_from_device(params->device);
+
+        stream->capture = TRUE;
+        if (input < 0 || !hs.record_open)
+        {
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+            goto end;
+        }
+        if (!(stream->recorder = hs.record_open(stream->fmt->nChannels, kind, input, record_buffer, stream, &rate)))
+        {
+            WARN("The input could not be opened for recording\n");
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+            goto end;
+        }
+        if (rate && rate != stream->fmt->nSamplesPerSec)
+        {
+            WARN("The input records at %d Hz, not %d\n", rate, (int)stream->fmt->nSamplesPerSec);
+            params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
+            goto end;
+        }
+        /* like the playback, record from the start; what comes while the stream is stopped is dropped */
+        if (!hs.record_start(stream->recorder))
+        {
+            WARN("The recording did not start\n");
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+            goto end;
+        }
+        params->result = S_OK;
+        goto end;
+    }
+
     if (!(stream->player = hs.open(stream->fmt->nSamplesPerSec, stream->fmt->nChannels, kind, stream->period_frames,
                                    fill_buffer, stream)))
     {
@@ -406,6 +536,7 @@ end:
     if (FAILED(params->result))
     {
         if (stream->player) hs.close(stream->player);
+        if (stream->recorder) hs.record_close(stream->recorder);
         if (stream->local_buffer)
         {
             size = 0;
@@ -436,6 +567,7 @@ static NTSTATUS unix_release_stream(void *args)
     }
 
     if (stream->player) hs.close(stream->player);    /* waits for the callback to be over */
+    if (stream->recorder) hs.record_close(stream->recorder);
 
     if (stream->local_buffer)
     {
@@ -459,7 +591,7 @@ static NTSTATUS unix_get_mix_format(void *args)
     struct get_mix_format_params *params = args;
     WAVEFORMATEXTENSIBLE *fmt = params->fmt;
 
-    if (params->flow != eRender)
+    if (params->flow != eRender && params->flow != eCapture)
     {
         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
         return STATUS_SUCCESS;
@@ -483,8 +615,9 @@ static NTSTATUS unix_is_format_supported(void *args)
 {
     struct is_format_supported_params *params = args;
 
-    if (params->flow != eRender) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    if (params->flow != eRender && params->flow != eCapture) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
     else if (sample_kind(params->fmt_in) < 0) params->result = S_FALSE;
+    else if (params->flow == eCapture && params->fmt_in->nSamplesPerSec != MIX_RATE) params->result = S_FALSE;
     else params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -518,7 +651,8 @@ static NTSTATUS unix_get_latency(void *args)
 
     pthread_mutex_lock(&stream->lock);
     /* BSoundPlayer's latency is in microseconds; pretend we process audio in Period chunks, so the latency includes one */
-    *params->latency = hs.latency(stream->player) * 10 + stream->period;
+    if (stream->capture) *params->latency = stream->period;
+    else *params->latency = hs.latency(stream->player) * 10 + stream->period;
     pthread_mutex_unlock(&stream->lock);
     params->result = S_OK;
     return STATUS_SUCCESS;
@@ -742,22 +876,105 @@ static NTSTATUS unix_release_render_buffer(void *args)
 static NTSTATUS unix_get_capture_buffer(void *args)
 {
     struct get_capture_buffer_params *params = args;
-    params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    struct haiku_stream *stream = handle_get_stream(params->stream);
+    UINT32 chunk_bytes, chunk_frames;
+    LARGE_INTEGER stamp, freq;
+    SIZE_T size;
+
+    pthread_mutex_lock(&stream->lock);
+
+    if (stream->getbuf_last)
+    {
+        params->result = AUDCLNT_E_OUT_OF_ORDER;
+        goto end;
+    }
+
+    *params->frames = 0;
+
+    if (stream->held_frames < stream->period_frames)
+    {
+        params->result = AUDCLNT_S_BUFFER_EMPTY;
+        goto end;
+    }
+
+    *params->flags = 0;
+    chunk_frames = stream->bufsize_frames - stream->lcl_offs_frames;
+    if (chunk_frames < stream->period_frames)
+    {
+        chunk_bytes = chunk_frames * stream->fmt->nBlockAlign;
+        if (!stream->tmp_buffer)
+        {
+            size = stream->period_frames * stream->fmt->nBlockAlign;
+            if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, zero_bits,
+                                        &size, MEM_COMMIT, PAGE_READWRITE))
+            {
+                params->result = E_OUTOFMEMORY;
+                goto end;
+            }
+        }
+        *params->data = stream->tmp_buffer;
+        memcpy(*params->data, stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign, chunk_bytes);
+        memcpy(*params->data + chunk_bytes, stream->local_buffer,
+               stream->period_frames * stream->fmt->nBlockAlign - chunk_bytes);
+    }
+    else
+        *params->data = stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign;
+
+    stream->getbuf_last = *params->frames = stream->period_frames;
+
+    if (params->devpos)
+        *params->devpos = stream->written_frames;
+    if (params->qpcpos)
+    {
+        NtQueryPerformanceCounter(&stamp, &freq);
+        *params->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+    }
+    params->result = S_OK;
+
+end:
+    pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS unix_release_capture_buffer(void *args)
 {
     struct release_capture_buffer_params *params = args;
-    params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    struct haiku_stream *stream = handle_get_stream(params->stream);
+
+    pthread_mutex_lock(&stream->lock);
+
+    if (!params->done)
+    {
+        stream->getbuf_last = 0;
+        params->result = S_OK;
+    }
+    else if (!stream->getbuf_last)
+        params->result = AUDCLNT_E_OUT_OF_ORDER;
+    else if (stream->getbuf_last != params->done)
+        params->result = AUDCLNT_E_INVALID_SIZE;
+    else
+    {
+        stream->written_frames += params->done;
+        stream->held_frames -= params->done;
+        stream->lcl_offs_frames += params->done;
+        stream->lcl_offs_frames %= stream->bufsize_frames;
+        stream->getbuf_last = 0;
+        params->result = S_OK;
+    }
+
+    pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS unix_get_next_packet_size(void *args)
 {
     struct get_next_packet_size_params *params = args;
-    *params->frames = 0;
-    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+    struct haiku_stream *stream = handle_get_stream(params->stream);
+
+    pthread_mutex_lock(&stream->lock);
+    *params->frames = stream->held_frames >= stream->period_frames ? stream->period_frames : 0;
+    pthread_mutex_unlock(&stream->lock);
+    params->result = S_OK;
     return STATUS_SUCCESS;
 }
 
@@ -776,7 +993,8 @@ static NTSTATUS unix_get_position(void *args)
 
     pthread_mutex_lock(&stream->lock);
 
-    *params->pos = stream->written_frames - stream->held_frames;
+    if (stream->capture) *params->pos = stream->written_frames + stream->held_frames;    /* what the hardware has recorded */
+    else *params->pos = stream->written_frames - stream->held_frames;
 
     if (stream->share == AUDCLNT_SHAREMODE_SHARED)
         *params->pos *= stream->fmt->nBlockAlign;
@@ -845,7 +1063,7 @@ static NTSTATUS unix_set_event_handle(void *args)
     HRESULT hr = S_OK;
 
     pthread_mutex_lock(&stream->lock);
-    if (!stream->player)
+    if (!stream->player && !stream->recorder)
         hr = AUDCLNT_E_DEVICE_INVALIDATED;
     else if (!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
         hr = AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;
