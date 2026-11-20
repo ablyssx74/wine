@@ -1494,7 +1494,14 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
         ret = stat( path, st );
         if (ret == -1) return ret;
         /* is a symbolic link and a directory, consider these "reparse points" */
+#ifdef __HAIKU__
+        /* ... but not on Haiku: the handle of a link is opened through it, so FSCTL_GET_REPARSE_POINT answers "not a reparse point" for
+         * what the attributes call one, and GLib (GTK file choosers: Ardour, Inkscape) turns that into "Error when getting information
+         * for file C:\users\user\Documents: Input/output error" for the folders of the prefix that link to the home folder. */
+        if (FALSE)
+#else
         if (S_ISDIR( st->st_mode ))
+#endif
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
