@@ -762,6 +762,77 @@ static BOOL addrinfo_in_list( const struct WS_addrinfo *list, const struct WS_ad
     return FALSE;
 }
 
+#ifdef __HAIKU__
+/* Windows sorts what getaddrinfo() finds (RFC 6724): an address that cannot be reached comes last. Haiku's resolver does not sort, and a
+ * host name with both kinds of address (ciscobinary.openh264.org, most of the web) lists the IPv6 ones first. On a machine with no IPv6
+ * route every connect() to them fails with WSAENETUNREACH, and a program that tries only the first address, or gives up after the
+ * first failure (TeamSpeak's download of the OpenH264 codec: "http code: 0"), never reaches the server that is there on IPv4. A UDP
+ * connect() sends nothing; with a route the socket is given a source address, without one it keeps :: . */
+# include <netinet/in.h>
+# include <string.h>
+
+static BOOL haiku_ipv6_has_route(void)
+{
+    struct sockaddr_in6 dest, local;
+    socklen_t len = sizeof(local);
+    BOOL ret = FALSE;
+    int fd;
+
+    if ((fd = socket( AF_INET6, SOCK_DGRAM, 0 )) < 0) return FALSE;
+    memset( &dest, 0, sizeof(dest) );
+    dest.sin6_family = AF_INET6;
+    dest.sin6_port = htons( 53 );
+    dest.sin6_addr.s6_addr[0] = 0x20;    /* 2001:4860:4860::8888 */
+    dest.sin6_addr.s6_addr[1] = 0x01;
+    dest.sin6_addr.s6_addr[2] = 0x48;
+    dest.sin6_addr.s6_addr[3] = 0x60;
+    dest.sin6_addr.s6_addr[4] = 0x48;
+    dest.sin6_addr.s6_addr[5] = 0x60;
+    dest.sin6_addr.s6_addr[15] = 0x88;
+    dest.sin6_addr.s6_addr[14] = 0x88;
+    if (!connect( fd, (struct sockaddr *)&dest, sizeof(dest) ) && !getsockname( fd, (struct sockaddr *)&local, &len )
+            && local.sin6_family == AF_INET6)
+        ret = !IN6_IS_ADDR_UNSPECIFIED( &local.sin6_addr );
+    close( fd );
+    return ret;
+}
+
+/* IPv6 addresses go behind the IPv4 ones (the order inside each kind stays) when there is no IPv6 route */
+static void haiku_sort_addrinfo( struct addrinfo **info )
+{
+    struct addrinfo *v4 = NULL, *v4_tail = NULL, *other = NULL, *other_tail = NULL, *cur, *next;
+    BOOL have_v4 = FALSE, have_v6 = FALSE;
+
+    for (cur = *info; cur; cur = cur->ai_next)
+    {
+        if (cur->ai_family == AF_INET) have_v4 = TRUE;
+        else if (cur->ai_family == AF_INET6) have_v6 = TRUE;
+        if (cur->ai_canonname) return;    /* the name belongs to the first entry */
+    }
+    if (!have_v4 || !have_v6 || haiku_ipv6_has_route()) return;
+
+    for (cur = *info; cur; cur = next)
+    {
+        next = cur->ai_next;
+        cur->ai_next = NULL;
+        if (cur->ai_family == AF_INET6)
+        {
+            if (other_tail) other_tail->ai_next = cur; else other = cur;
+            other_tail = cur;
+        }
+        else
+        {
+            if (v4_tail) v4_tail->ai_next = cur; else v4 = cur;
+            v4_tail = cur;
+        }
+    }
+    if (v4_tail) v4_tail->ai_next = other;
+    *info = v4 ? v4 : other;
+}
+#else
+# define haiku_sort_addrinfo(info) ((void)0)
+#endif
+
 static NTSTATUS unix_getaddrinfo( void *args )
 {
 #ifdef HAVE_GETADDRINFO
@@ -824,6 +895,7 @@ static NTSTATUS unix_getaddrinfo( void *args )
     haiku_resolver_end();
     if (ret)
         return addrinfo_err_from_unix( ret );
+    haiku_sort_addrinfo( &unix_info );
 
     for (src = unix_info; src != NULL; src = src->ai_next)
     {
