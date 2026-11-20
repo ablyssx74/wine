@@ -61,6 +61,13 @@ bool WaylandWindow::QuitRequested()
 void WaylandWindow::WindowActivated(bool isActive)
 {
 	WaylandEnv vlEnv(this);
+	// (the toplevel is gone, and the window only waits for its quit message: a resize or an activation in between used to crash
+	// the compositor, seen in Ardour when a dialog was closed)
+	if (fToplevel == NULL) {
+		if (isActive)
+			UpdateRefreshRate();
+		return;
+	}
 	if (isActive != fToplevel->fState.activated) {
 		fToplevel->fState.activated = !fToplevel->fState.activated;
 		// A configure for a minimized window tells the client that the compositor restored it (Wine then runs its restore
@@ -98,6 +105,9 @@ void WaylandWindow::WorkspacesChanged(uint32 oldWorkspace, uint32 newWorkspace)
 void WaylandWindow::FrameResized(float newWidth, float newHeight)
 {
 	WaylandEnv vlEnv(this);
+
+	if (fToplevel == NULL)	// (see WindowActivated)
+		return;
 
 	if (fToplevel->fSizeChanged) {
 		fToplevel->fSizeChanged = false;
