@@ -181,6 +181,31 @@ static bool find_input_node(BMediaRoster *roster, media_node *node)
     return found;
 }
 
+/* hrecord's mix hub (its "Offer the mix to programs that record" option): a node that hands out what is heard, the mix of everything that
+ * plays, as an input of its own. It is offered as one more input, with this value (the hardware's own are small numbers). */
+static const int kMixInputValue = 1000;
+static const char *const kMixNodeName = "hrecord Mix";
+static const char *const kMixInputName = "What you hear (hrecord mix)";
+
+static bool find_mix_node(BMediaRoster *roster, media_node *node)
+{
+    live_node_info infos[32];
+    int32 count = 32;
+
+    bool found = false;
+
+    if (roster->GetLiveNodes(infos, &count) != B_OK) return false;
+    /* the newest one: a hub that was switched off can stay as a node as long as a program holds it, and a new one is made when it is
+     * switched on again */
+    for (int32 i = 0; i < count; i++)
+    {
+        if (!(infos[i].node.kind & B_BUFFER_PRODUCER) || strcmp(infos[i].name, kMixNodeName)) continue;
+        if (!found || infos[i].node.node > node->node) *node = infos[i].node;
+        found = true;
+    }
+    return found;
+}
+
 /* the parameters of the node that choose the input */
 static int select_parameters(BMediaRoster *roster, const media_node &node, BParameterWeb **web, BDiscreteParameter **list, int max)
 {
@@ -228,8 +253,9 @@ int haiku_audio_list_inputs(char names[][64], int *values, int max, int *current
 
     *current = -1;
     if (!ensure_application()) return 0;
-    if (!(roster = BMediaRoster::Roster()) || !find_input_node(roster, &node)) return 0;
-    if (select_parameters(roster, node, &web, sel, 4) > 0)
+    if (!(roster = BMediaRoster::Roster())) return 0;
+    web = NULL;
+    if (find_input_node(roster, &node) && select_parameters(roster, node, &web, sel, 4) > 0)
     {
         BDiscreteParameter *p = sel[0];
         int32 value;
@@ -245,6 +271,12 @@ int haiku_audio_list_inputs(char names[][64], int *values, int max, int *current
         if (p->GetValue(&value, &size, &when) == B_OK && size >= sizeof(value)) *current = value;
     }
     delete web;
+    if (n < max && find_mix_node(roster, &node))
+    {
+        strncpy(names[n], kMixInputName, 63);
+        names[n][63] = 0;
+        values[n++] = kMixInputValue;
+    }
     return n;
 }
 
@@ -322,25 +354,39 @@ void *haiku_audio_record_open(int channels, int format, int input_value, hs_reco
     r->cookie = cookie;
     r->channels = channels;
     r->format = format;
-    if (!find_input_node(roster, &r->hardware)) { free(r); return NULL; }
+    r->old_input = -1;
 
-    /* the system's default audio input is where programs get their input from: with hrecord's input hub on it is the hub, which has
-     * a free output for every program (the hardware has one only, and hrecord holds it). Without a usable default, the hardware. */
+    if (input_value == kMixInputValue)
     {
-        media_node def;
-        live_node_info info;
+        /* what is heard: hrecord's mix hub, not the hardware (its input selector stays as it is; the hub is started by hrecord) */
+        media_node mix;
 
-        if (roster->GetAudioInput(&def) == B_OK && roster->GetLiveNodeInfo(def, &info) == B_OK)
-            r->node = def;
-        else if (roster->GetNodeFor(r->hardware.node, &r->node) != B_OK)
-        {
-            free(r);
-            return NULL;
-        }
+        if (!find_mix_node(roster, &mix) || roster->GetNodeFor(mix.node, &r->node) != B_OK) { free(r); return NULL; }
+        r->hardware = r->node;
+        r->starts_hardware = false;
     }
-    r->starts_hardware = r->node.node == r->hardware.node;
+    else
+    {
+        if (!find_input_node(roster, &r->hardware)) { free(r); return NULL; }
 
-    r->old_input = choose_input(roster, r->hardware, input_value);
+        /* the system's default audio input is where programs get their input from: with hrecord's input hub on it is the hub, which has
+         * a free output for every program (the hardware has one only, and hrecord holds it). Without a usable default, the hardware. */
+        {
+            media_node def;
+            live_node_info info;
+
+            if (roster->GetAudioInput(&def) == B_OK && roster->GetLiveNodeInfo(def, &info) == B_OK)
+                r->node = def;
+            else if (roster->GetNodeFor(r->hardware.node, &r->node) != B_OK)
+            {
+                free(r);
+                return NULL;
+            }
+        }
+        r->starts_hardware = r->node.node == r->hardware.node;
+
+        r->old_input = choose_input(roster, r->hardware, input_value);
+    }
 
     fmt.type = B_MEDIA_RAW_AUDIO;
     fmt.u.raw_audio = media_raw_audio_format::wildcard;
