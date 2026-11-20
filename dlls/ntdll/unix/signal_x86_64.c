@@ -2577,16 +2577,9 @@ static void WriteModuleName(addr_t address)
 {
 	HMODULE hModule = NULL;
 	PLDR_DATA_TABLE_ENTRY pmod = NULL;
-	LdrFindEntryForAddress2(
-		(void*)address,
-		&pmod
-	);
-	hModule = pmod == NULL ? NULL : pmod->DllBase;
-	printf("  hModule: %p\n", hModule);
-	if (hModule != NULL)
-	printf("  BaseDllName: %s\n", debugstr_w(pmod->BaseDllName.Buffer));
 #ifdef __HAIKU__
-	/* an address in a Unix library (the Vulkan driver, say) is not a PE module: look in the images of the team */
+	/* first, and flushed: an address in a Unix library (the Vulkan driver, the sound driver, Haiku's own libraries) is not a PE module,
+	 * and a thread that Wine does not know (a Haiku thread) may not get through the loader lock below */
 	{
 		image_info info;
 		int32 cookie = 0;
@@ -2599,8 +2592,17 @@ static void WriteModuleName(addr_t address)
 				break;
 			}
 		}
+		fflush( stdout );
 	}
 #endif
+	LdrFindEntryForAddress2(
+		(void*)address,
+		&pmod
+	);
+	hModule = pmod == NULL ? NULL : pmod->DllBase;
+	printf("  hModule: %p\n", hModule);
+	if (hModule != NULL)
+	printf("  BaseDllName: %s\n", debugstr_w(pmod->BaseDllName.Buffer));
 	printf("\n");
 }
 
