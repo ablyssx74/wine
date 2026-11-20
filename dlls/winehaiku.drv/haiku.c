@@ -36,6 +36,7 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -82,6 +83,14 @@ static struct
     int (*record_start)(void *recorder);
     void (*record_stop)(void *recorder);
     void (*record_close)(void *recorder);
+    /* MIDI; may be missing */
+    int (*midi_list)(int sources, char names[][64], int *ids, int max);
+    void *(*midi_in_open)(int producer_id, const char *name,
+                          void (*func)(void *, const unsigned char *, size_t, long long), void *cookie);
+    void (*midi_in_close)(void *handle);
+    void *(*midi_out_open)(int consumer_id, const char *name);
+    void (*midi_send)(void *handle, const unsigned char *data, size_t length);
+    void (*midi_out_close)(void *handle);
 } hs;
 
 struct haiku_stream
@@ -174,6 +183,7 @@ static BOOL load_shim(void)
 #undef LOAD
 #define LOAD(name) hs.name = dlsym(handle, "haiku_audio_" #name);
     LOAD(list_inputs) LOAD(record_open) LOAD(record_start) LOAD(record_stop) LOAD(record_close)
+    LOAD(midi_list) LOAD(midi_in_open) LOAD(midi_in_close) LOAD(midi_out_open) LOAD(midi_send) LOAD(midi_out_close)
 #undef LOAD
     hs.handle = handle;
     return TRUE;
@@ -1077,19 +1087,963 @@ static NTSTATUS unix_set_event_handle(void *args)
     return STATUS_SUCCESS;
 }
 
-/* no MIDI: failing to load makes the driver be left alone by winmm */
+/*
+ * MIDI: the endpoints of Haiku's MIDI kit (a keyboard, a soft synth) are the MIDI ports of Windows programs. Modelled on the CoreMIDI
+ * driver of Wine. A program that opens a port gets an endpoint of its own in the MIDI kit ("Wine: <port>", with the icon of Wine, see
+ * haikushim.cpp), connected to the endpoint of the port; it is gone when the port is closed. The ports are the endpoints there are
+ * when the program starts to use MIDI.
+ */
+
+#define MAX_MIDI_PORTS 64
+
+struct midi_dest
+{
+    int endpoint;              /* the id of the endpoint in the MIDI kit */
+    void *handle;              /* our producer, while the port is open */
+
+    MIDIOUTCAPSW caps;
+    MIDIOPENDESC midiDesc;
+    BYTE runningStatus;
+    WORD wFlags;
+};
+
+struct midi_src
+{
+    int endpoint;
+    void *handle;              /* our consumer, while the port is open */
+
+    WORD wDevID;
+    int state; /* 0 is no recording started, 1 in recording, bit 2 set if in sys exclusive recording */
+    MIDIINCAPSW caps;
+    MIDIOPENDESC midiDesc;
+    LPMIDIHDR lpQueueHdr;
+    WORD wFlags;
+    UINT startTime;
+};
+
+static UINT num_dests, num_srcs;
+static struct midi_dest *dests;
+static struct midi_src *srcs;
+static BOOL midi_ready;
+
+static pthread_mutex_t midi_in_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define NOTIFY_BUFFER_SIZE 64 + 1 /* + 1 for the sentinel */
+static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t notify_cond = PTHREAD_COND_INITIALIZER;
+static BOOL notify_quit;
+static struct notify_context notify_buffer[NOTIFY_BUFFER_SIZE];
+static struct notify_context *notify_read, *notify_write;
+
+static void midi_in_lock(BOOL lock)
+{
+    if (lock) pthread_mutex_lock(&midi_in_mutex);
+    else pthread_mutex_unlock(&midi_in_mutex);
+}
+
+static void set_in_notify(struct notify_context *notify, struct midi_src *src, WORD dev_id, WORD msg,
+                          UINT_PTR param_1, UINT_PTR param_2)
+{
+    notify->send_notify = TRUE;
+    notify->dev_id = dev_id;
+    notify->msg = msg;
+    notify->param_1 = param_1;
+    notify->param_2 = param_2;
+    notify->callback = src->midiDesc.dwCallback;
+    notify->flags = src->wFlags;
+    notify->device = src->midiDesc.hMidi;
+    notify->instance = src->midiDesc.dwInstance;
+}
+
+/*
+ * notify buffer: The notification ring buffer is implemented so that
+ * there is always at least one unused sentinel before the current
+ * read position in order to allow detection of the full vs empty
+ * state.
+ */
+static struct notify_context *notify_buffer_next(struct notify_context *notify)
+{
+    if (++notify >= notify_buffer + ARRAY_SIZE(notify_buffer))
+        notify = notify_buffer;
+
+    return notify;
+}
+
+static void notify_buffer_add(struct notify_context *notify)
+{
+    struct notify_context *next = notify_buffer_next(notify_write);
+
+    if (next == notify_read) /* buffer is full - we can't issue a WARN() in a non-Win32 thread */
+        notify_read = notify_buffer_next(notify_read); /* drop the oldest notification */
+    *notify_write = *notify;
+    notify_write = next;
+}
+
+static BOOL notify_buffer_empty(void)
+{
+    return notify_read == notify_write;
+}
+
+static BOOL notify_buffer_remove(struct notify_context *notify)
+{
+    if (notify_buffer_empty()) return FALSE;
+
+    *notify = *notify_read;
+    notify_read = notify_buffer_next(notify_read);
+    return TRUE;
+}
+
+static void notify_post(struct notify_context *notify)
+{
+    pthread_mutex_lock(&notify_mutex);
+
+    if (notify) notify_buffer_add(notify);
+    else notify_quit = TRUE;
+    pthread_cond_signal(&notify_cond);
+
+    pthread_mutex_unlock(&notify_mutex);
+}
+
+/* the thread of the MIDI kit that calls the functions below knows nothing of Wine: no debug channels, no critical sections */
+static UINT get_time_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (UINT)(ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000);
+}
+
+static void process_sysex_packet(struct midi_src *src, const unsigned char *data, unsigned int len)
+{
+    unsigned int pos = 0, copy_len;
+    UINT current_time = get_time_ms() - src->startTime;
+    struct notify_context notify;
+
+    src->state |= 2;
+
+    midi_in_lock(TRUE);
+
+    while (len)
+    {
+        MIDIHDR *hdr = src->lpQueueHdr;
+        if (!hdr) break;
+
+        copy_len = min(len, hdr->dwBufferLength - hdr->dwBytesRecorded);
+        memcpy(hdr->lpData + hdr->dwBytesRecorded, data + pos, copy_len);
+        hdr->dwBytesRecorded += copy_len;
+        len -= copy_len;
+        pos += copy_len;
+
+        if ((hdr->dwBytesRecorded == hdr->dwBufferLength) ||
+            (*(BYTE*)(hdr->lpData + hdr->dwBytesRecorded - 1) == 0xf7))
+        { /* buffer full or end of sysex message */
+            src->lpQueueHdr = hdr->lpNext;
+            hdr->dwFlags &= ~MHDR_INQUEUE;
+            hdr->dwFlags |= MHDR_DONE;
+            set_in_notify(&notify, src, src->wDevID, MIM_LONGDATA, (UINT_PTR)hdr, current_time);
+            notify_post(&notify);
+            src->state &= ~2;
+        }
+    }
+
+    midi_in_lock(FALSE);
+}
+
+static void process_small_packet(struct midi_src *src, const unsigned char *data, unsigned int length)
+{
+    UINT current_time = get_time_ms() - src->startTime, value;
+    struct notify_context notify;
+    unsigned int pos = 0;
+
+    while (pos < length)
+    {
+        value = 0;
+        switch (data[pos] & 0xf0)
+        {
+        case 0xf0:
+            value = data[pos];
+            pos++;
+            break;
+        case 0xc0:
+        case 0xd0:
+            value = ((pos + 1 < length ? data[pos + 1] : 0) << 8) | data[pos];
+            pos += 2;
+            break;
+        default:
+            value = ((pos + 2 < length ? data[pos + 2] : 0) << 16) | ((pos + 1 < length ? data[pos + 1] : 0) << 8) | data[pos];
+            pos += 3;
+            break;
+        }
+        set_in_notify(&notify, src, src->wDevID, MIM_DATA, value, current_time);
+        notify_post(&notify);
+    }
+}
+
+/* data from the endpoint of a port that is open (MIDI kit's thread) */
+static void midi_in_read_proc(void *cookie, const unsigned char *data, size_t length, long long time)
+{
+    struct midi_src *src = cookie;
+
+    if (src->state < 1 || !length) /* input not started */
+        return;
+
+    if (data[0] == 0xf0 || src->state & 2)
+        process_sysex_packet(src, data, length);
+    else
+        process_small_packet(src, data, length);
+}
+
+static void fill_caps_name(WCHAR *dst, unsigned int size, const char *name)
+{
+    unsigned int i;
+
+    for (i = 0; i + 1 < size && name[i]; i++) dst[i] = (unsigned char)name[i];
+    dst[i] = 0;
+}
+
+static BOOL name_has_synth(const char *name)
+{
+    char lower[64];
+    unsigned int i;
+
+    for (i = 0; i < sizeof(lower) - 1 && name[i]; i++) lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
+    lower[i] = 0;
+    return strstr(lower, "synth") != NULL;
+}
+
 static NTSTATUS unix_midi_init(void *args)
 {
     struct midi_init_params *params = args;
-    *params->err = DRV_FAILURE;
+    char names[MAX_MIDI_PORTS][64];
+    int ids[MAX_MIDI_PORTS];
+    UINT i;
+    int count;
+
+    pthread_mutex_lock(&notify_mutex);
+    notify_quit = FALSE;
+    notify_read = notify_write = notify_buffer;
+    pthread_mutex_unlock(&notify_mutex);
+
+    /* without the MIDI kit (or without the bridge) the driver is left alone by winmm */
+    if (!load_shim() || !hs.midi_list || !hs.midi_in_open || !hs.midi_out_open)
+    {
+        *params->err = DRV_FAILURE;
+        return STATUS_SUCCESS;
+    }
+
+    count = hs.midi_list(1, names, ids, MAX_MIDI_PORTS);
+    num_srcs = count > 0 ? count : 0;
+    srcs = calloc(num_srcs ? num_srcs : 1, sizeof(*srcs));
+    for (i = 0; i < num_srcs; i++)
+    {
+        srcs[i].wDevID = i;
+        srcs[i].endpoint = ids[i];
+        fill_caps_name(srcs[i].caps.szPname, ARRAY_SIZE(srcs[i].caps.szPname), names[i]);
+        srcs[i].state = 0;
+        srcs[i].caps.wMid = 0x00FF;     /* Manufac ID */
+        srcs[i].caps.wPid = 0x0001;     /* Product ID */
+        srcs[i].caps.vDriverVersion = 0x0001;
+        srcs[i].caps.dwSupport = 0;
+    }
+
+    count = hs.midi_list(0, names, ids, MAX_MIDI_PORTS);
+    num_dests = count > 0 ? count : 0;
+    dests = calloc(num_dests ? num_dests : 1, sizeof(*dests));
+    for (i = 0; i < num_dests; i++)
+    {
+        dests[i].endpoint = ids[i];
+        fill_caps_name(dests[i].caps.szPname, ARRAY_SIZE(dests[i].caps.szPname), names[i]);
+        dests[i].caps.wTechnology = name_has_synth(names[i]) ? MOD_SWSYNTH : MOD_MIDIPORT;
+        dests[i].caps.wChannelMask = 0xFFFF;
+        dests[i].caps.wMid = 0x00FF;
+        dests[i].caps.wPid = 0x0001;
+        dests[i].caps.vDriverVersion = 0x0001;
+        dests[i].caps.dwSupport = 0;
+        dests[i].caps.wVoices = 0;
+        dests[i].caps.wNotes = 0;
+    }
+
+    TRACE("num_dests %d num_srcs %d\n", num_dests, num_srcs);
+
+    midi_ready = TRUE;
+    *params->err = DRV_SUCCESS;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_midi_release(void *args)
+{
+    UINT i;
+
+    /* stop the notify_wait thread */
+    notify_post(NULL);
+
+    if (!midi_ready) return STATUS_SUCCESS;
+    midi_ready = FALSE;
+
+    for (i = 0; i < num_srcs; i++)
+    {
+        if (srcs[i].handle) hs.midi_in_close(srcs[i].handle);
+        srcs[i].handle = NULL;
+    }
+    for (i = 0; i < num_dests; i++)
+    {
+        if (dests[i].handle) hs.midi_out_close(dests[i].handle);
+        dests[i].handle = NULL;
+    }
+    free(srcs);
+    free(dests);
+    srcs = NULL;
+    dests = NULL;
+    num_srcs = num_dests = 0;
+
+    return STATUS_SUCCESS;
+}
+
+static void set_out_notify(struct notify_context *notify, struct midi_dest *dest, WORD dev_id, WORD msg,
+                           UINT_PTR param_1, UINT_PTR param_2)
+{
+    notify->send_notify = TRUE;
+    notify->dev_id = dev_id;
+    notify->msg = msg;
+    notify->param_1 = param_1;
+    notify->param_2 = param_2;
+    notify->callback = dest->midiDesc.dwCallback;
+    notify->flags = dest->wFlags;
+    notify->device = dest->midiDesc.hMidi;
+    notify->instance = dest->midiDesc.dwInstance;
+}
+
+static void port_name(char *buffer, size_t size, const WCHAR *name)
+{
+    size_t i;
+
+    strcpy(buffer, "Wine: ");
+    for (i = 0; i + 6 < size - 1 && name[i]; i++) buffer[6 + i] = name[i] < 128 ? (char)name[i] : '?';
+    buffer[6 + i] = 0;
+}
+
+static UINT midi_out_open(WORD dev_id, MIDIOPENDESC *midi_desc, UINT flags, struct notify_context *notify)
+{
+    struct midi_dest *dest;
+    char name[64];
+
+    TRACE("dev_id = %d desc = %p flags = %08x\n", dev_id, midi_desc, flags);
+
+    if (!midi_desc) return MMSYSERR_INVALPARAM;
+
+    if (dev_id >= num_dests)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    if (dests[dev_id].midiDesc.hMidi != 0)
+    {
+        WARN("device already open!\n");
+        return MMSYSERR_ALLOCATED;
+    }
+    if ((flags & ~CALLBACK_TYPEMASK) != 0)
+    {
+        WARN("bad flags\n");
+        return MMSYSERR_INVALFLAG;
+    }
+
+    dest = dests + dev_id;
+    port_name(name, sizeof(name), dest->caps.szPname);
+    if (!(dest->handle = hs.midi_out_open(dest->endpoint, name)))
+    {
+        WARN("The MIDI endpoint could not be opened\n");
+        return MMSYSERR_ERROR;
+    }
+    dest->runningStatus = 0;
+    dest->wFlags = HIWORD(flags & CALLBACK_TYPEMASK);
+    dest->midiDesc = *midi_desc;
+
+    set_out_notify(notify, dest, dev_id, MOM_OPEN, 0, 0);
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_close(WORD dev_id, struct notify_context *notify)
+{
+    struct midi_dest *dest;
+
+    TRACE("dev_id = %d\n", dev_id);
+
+    if (dev_id >= num_dests)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+
+    dest = dests + dev_id;
+
+    if (dest->handle) hs.midi_out_close(dest->handle);
+    dest->handle = NULL;
+
+    set_out_notify(notify, dest, dev_id, MOM_CLOSE, 0, 0);
+
+    dest->midiDesc.hMidi = 0;
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_data(WORD dev_id, UINT data)
+{
+    struct midi_dest *dest;
+    unsigned char bytes[3];
+    size_t count = sizeof(bytes);
+
+    TRACE("dev_id = %d data = %08x\n", dev_id, data);
+
+    if (dev_id >= num_dests)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    dest = dests + dev_id;
+
+    bytes[0] = data & 0xff;
+    if (bytes[0] & 0x80)
+    {
+        bytes[1] = (data >> 8) & 0xff;
+        bytes[2] = (data >> 16) & 0xff;
+        if (bytes[0] < 0xF0)
+            dest->runningStatus = bytes[0];
+        else if (bytes[0] <= 0xF7)
+            dest->runningStatus = 0;
+    }
+    else if (dest->runningStatus)
+    {
+        bytes[0] = dest->runningStatus;
+        bytes[1] = data & 0xff;
+        bytes[2] = (data >> 8) & 0xff;
+    }
+    else
+    {
+        FIXME("ooch %x\n", data);
+        return MMSYSERR_NOERROR;
+    }
+
+    /* MODM_DATA always includes 3 bytes, but some message types are only 1 or 2 bytes long */
+    switch (bytes[0] & 0xF0)
+    {
+    case 0xC0:  /* Program Change */
+    case 0xD0:  /* Channel Pressure (After-touch) */
+        count = 2;
+        break;
+    case 0xF0:  /* system messages: the 1 byte ones (the real-time ones, tune request); song position (2 data bytes), song select (1) */
+        if (bytes[0] == 0xF1 || bytes[0] == 0xF3) count = 2;
+        else if (bytes[0] != 0xF2) count = 1;
+        break;
+    }
+
+    if (dest->handle) hs.midi_send(dest->handle, bytes, count);
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_long_data(WORD dev_id, MIDIHDR *hdr, UINT hdr_size, struct notify_context *notify)
+{
+    struct midi_dest *dest;
+
+    TRACE("dev_id = %d midi_hdr = %p hdr_size = %d\n", dev_id, hdr, hdr_size);
+
+    if (dev_id >= num_dests)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    if (!hdr)
+    {
+        WARN("Invalid Parameter\n");
+        return MMSYSERR_INVALPARAM;
+    }
+    if (!hdr->lpData || !(hdr->dwFlags & MHDR_PREPARED))
+        return MIDIERR_UNPREPARED;
+
+    if (hdr->dwFlags & MHDR_INQUEUE)
+        return MIDIERR_STILLPLAYING;
+
+    hdr->dwFlags &= ~MHDR_DONE;
+    hdr->dwFlags |= MHDR_INQUEUE;
+
+    if ((unsigned char)hdr->lpData[0] != 0xf0)
+        /* System Exclusive */
+        ERR("Add missing 0xf0 marker at the beginning of system exclusive byte stream\n");
+
+    if ((unsigned char)hdr->lpData[hdr->dwBufferLength - 1] != 0xF7)
+        /* Send end of System Exclusive */
+        ERR("Add missing 0xf7 marker at the end of system exclusive byte stream\n");
+
+    dest = dests + dev_id;
+
+    if (dest->handle) hs.midi_send(dest->handle, (const unsigned char *)hdr->lpData, hdr->dwBufferLength);
+
+    dest->runningStatus = 0;
+    hdr->dwFlags &= ~MHDR_INQUEUE;
+    hdr->dwFlags |= MHDR_DONE;
+
+    set_out_notify(notify, dest, dev_id, MOM_DONE, (UINT_PTR)hdr, 0);
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_prepare(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
+{
+    TRACE("dev_id = %d midi_hdr = %p hdr_size = %d\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(MIDIHDR, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (hdr->dwFlags & MHDR_PREPARED)
+        return MMSYSERR_NOERROR;
+
+    hdr->lpNext = 0;
+    hdr->dwFlags |= MHDR_PREPARED;
+    hdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_unprepare(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
+{
+    TRACE("dev_id = %d midi_hdr = %p hdr_size = %d\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(MIDIHDR, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (!(hdr->dwFlags & MHDR_PREPARED))
+        return MMSYSERR_NOERROR;
+    if (hdr->dwFlags & MHDR_INQUEUE)
+        return MIDIERR_STILLPLAYING;
+
+    hdr->dwFlags &= ~MHDR_PREPARED;
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_get_devcaps(WORD dev_id, MIDIOUTCAPSW *caps, UINT size)
+{
+    TRACE("dev_id = %d caps = %p size = %d\n", dev_id, caps, size);
+
+    if (!caps)
+    {
+        WARN("Invalid Parameter\n");
+        return MMSYSERR_INVALPARAM;
+    }
+
+    if (dev_id >= num_dests)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    memcpy(caps, &dests[dev_id].caps, min(size, sizeof(*caps)));
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_out_get_num_devs(void)
+{
+    TRACE("\n");
+    return num_dests;
+}
+
+static UINT midi_out_reset(WORD dev_id)
+{
+    unsigned chn;
+
+    TRACE("%d\n", dev_id);
+
+    if (dev_id >= num_dests)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    if (dests[dev_id].handle)
+    {
+        for (chn = 0; chn < 16; chn++)
+        {
+            unsigned char off[3] = { 0xB0 | chn, 0x7B, 0 };    /* all notes off */
+            unsigned char reset[3] = { 0xB0 | chn, 0x79, 0 };  /* resets controller settings */
+
+            hs.midi_send(dests[dev_id].handle, off, 3);
+            hs.midi_send(dests[dev_id].handle, reset, 3);
+        }
+    }
+
+    dests[dev_id].runningStatus = 0;
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_open(WORD dev_id, MIDIOPENDESC *midi_desc, UINT flags, struct notify_context *notify)
+{
+    struct midi_src *src;
+    char name[64];
+
+    TRACE("dev_id = %d desc = %p flags = %08x\n", dev_id, midi_desc, flags);
+
+    if (!midi_desc)
+    {
+        WARN("Invalid Parameter\n");
+        return MMSYSERR_INVALPARAM;
+    }
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    src = srcs + dev_id;
+
+    if (src->midiDesc.hMidi)
+    {
+        WARN("device already open !\n");
+        return MMSYSERR_ALLOCATED;
+    }
+    if (flags & MIDI_IO_STATUS)
+    {
+        FIXME("No support for MIDI_IO_STATUS in flags yet, ignoring it\n");
+        flags &= ~MIDI_IO_STATUS;
+    }
+    if (flags & ~CALLBACK_TYPEMASK)
+    {
+        FIXME("Bad flags\n");
+        return MMSYSERR_INVALFLAG;
+    }
+
+    src->wFlags = HIWORD(flags & CALLBACK_TYPEMASK);
+    src->lpQueueHdr = NULL;
+    src->midiDesc = *midi_desc;
+    src->startTime = 0;
+    src->state = 0;
+
+    port_name(name, sizeof(name), src->caps.szPname);
+    if (!(src->handle = hs.midi_in_open(src->endpoint, name, midi_in_read_proc, src)))
+    {
+        WARN("The MIDI endpoint could not be opened\n");
+        src->midiDesc.hMidi = 0;
+        return MMSYSERR_ERROR;
+    }
+
+    set_in_notify(notify, src, dev_id, MIM_OPEN, 0, 0);
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_close(WORD dev_id, struct notify_context *notify)
+{
+    struct midi_src *src;
+
+    TRACE("dev_id = %d\n", dev_id);
+
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    src = srcs + dev_id;
+
+    if (!src->midiDesc.hMidi)
+    {
+        WARN("device not opened !\n");
+        return MMSYSERR_ERROR;
+    }
+    if (src->lpQueueHdr) return MIDIERR_STILLPLAYING;
+
+    src->state = 0;
+    if (src->handle) hs.midi_in_close(src->handle);    /* waits for the data function to be over */
+    src->handle = NULL;
+
+    set_in_notify(notify, src, dev_id, MIM_CLOSE, 0, 0);
+    src->midiDesc.hMidi = 0;
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_add_buffer(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
+{
+    MIDIHDR **next;
+
+    TRACE("dev_id = %d hdr = %p hdr_size = %d\n", dev_id, hdr, hdr_size);
+
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    if (!hdr || hdr_size < offsetof(MIDIHDR, dwOffset) || !hdr->dwBufferLength)
+    {
+        WARN("Invalid Parameter\n");
+        return MMSYSERR_INVALPARAM;
+    }
+    if (hdr->dwFlags & MHDR_INQUEUE)
+    {
+        WARN("Still playing\n");
+        return MIDIERR_STILLPLAYING;
+    }
+    if (!(hdr->dwFlags & MHDR_PREPARED))
+    {
+        WARN("Unprepared\n");
+        return MIDIERR_UNPREPARED;
+    }
+
+    hdr->dwFlags &= ~WHDR_DONE;
+    hdr->dwFlags |= MHDR_INQUEUE;
+    hdr->dwBytesRecorded = 0;
+    hdr->lpNext = NULL;
+
+    midi_in_lock(TRUE);
+
+    next = &srcs[dev_id].lpQueueHdr;
+    while (*next) next = &(*next)->lpNext;
+    *next = hdr;
+
+    midi_in_lock(FALSE);
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_prepare(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
+{
+    TRACE("dev_id = %d hdr = %p hdr_size = %d\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(MIDIHDR, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (hdr->dwFlags & MHDR_PREPARED)
+        return MMSYSERR_NOERROR;
+
+    hdr->lpNext = NULL;
+    hdr->dwFlags |= MHDR_PREPARED;
+    hdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_unprepare(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
+{
+    TRACE("dev_id = %d hdr = %p hdr_size = %d\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(MIDIHDR, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (!(hdr->dwFlags & MHDR_PREPARED))
+        return MMSYSERR_NOERROR;
+    if (hdr->dwFlags & MHDR_INQUEUE)
+        return MIDIERR_STILLPLAYING;
+
+    hdr->dwFlags &= ~MHDR_PREPARED;
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_get_devcaps(WORD dev_id, MIDIINCAPSW *caps, UINT size)
+{
+    TRACE("dev_id = %d caps = %p size = %d\n", dev_id, caps, size);
+
+    if (!caps)
+    {
+        WARN("Invalid Parameter\n");
+        return MMSYSERR_INVALPARAM;
+    }
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+
+    memcpy(caps, &srcs[dev_id].caps, min(size, sizeof(*caps)));
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_get_num_devs(void)
+{
+    TRACE("\n");
+    return num_srcs;
+}
+
+static UINT midi_in_start(WORD dev_id)
+{
+    TRACE("%d\n", dev_id);
+
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    srcs[dev_id].startTime = get_time_ms();
+    srcs[dev_id].state = 1;
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_stop(WORD dev_id)
+{
+    TRACE("%d\n", dev_id);
+
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    srcs[dev_id].state = 0;
+    return MMSYSERR_NOERROR;
+}
+
+static UINT midi_in_reset(WORD dev_id, struct notify_context *notify)
+{
+    UINT cur_time = get_time_ms();
+    UINT err = MMSYSERR_NOERROR;
+    struct midi_src *src;
+    MIDIHDR *hdr;
+
+    TRACE("%d\n", dev_id);
+
+    if (dev_id >= num_srcs)
+    {
+        WARN("bad device ID : %d\n", dev_id);
+        return MMSYSERR_BADDEVICEID;
+    }
+    src = srcs + dev_id;
+
+    midi_in_lock(TRUE);
+
+    if (src->lpQueueHdr)
+    {
+        hdr = src->lpQueueHdr;
+        src->lpQueueHdr = hdr->lpNext;
+        hdr->dwFlags &= ~MHDR_INQUEUE;
+        hdr->dwFlags |= MHDR_DONE;
+        set_in_notify(notify, src, dev_id, MIM_LONGDATA, (UINT_PTR)hdr, cur_time - src->startTime);
+        if (src->lpQueueHdr) err = ERROR_RETRY; /* ask the client to call again */
+    }
+
+    midi_in_lock(FALSE);
+
+    return err;
+}
+
+static NTSTATUS unix_midi_out_message(void *args)
+{
+    struct midi_out_message_params *params = args;
+
+    params->notify->send_notify = FALSE;
+
+    if (!midi_ready)
+    {
+        *params->err = params->msg == MODM_GETNUMDEVS ? 0 : MMSYSERR_NOTSUPPORTED;
+        return STATUS_SUCCESS;
+    }
+
+    switch (params->msg)
+    {
+    case DRVM_INIT:
+    case DRVM_EXIT:
+    case DRVM_ENABLE:
+    case DRVM_DISABLE:
+        *params->err = MMSYSERR_NOERROR;
+        break;
+    case MODM_OPEN:
+        *params->err = midi_out_open(params->dev_id, (MIDIOPENDESC *)params->param_1, params->param_2, params->notify);
+        break;
+    case MODM_CLOSE:
+        *params->err = midi_out_close(params->dev_id, params->notify);
+        break;
+    case MODM_DATA:
+        *params->err = midi_out_data(params->dev_id, params->param_1);
+        break;
+    case MODM_LONGDATA:
+        *params->err = midi_out_long_data(params->dev_id, (MIDIHDR *)params->param_1, params->param_2, params->notify);
+        break;
+    case MODM_PREPARE:
+        *params->err = midi_out_prepare(params->dev_id, (MIDIHDR *)params->param_1, params->param_2);
+        break;
+    case MODM_UNPREPARE:
+        *params->err = midi_out_unprepare(params->dev_id, (MIDIHDR *)params->param_1, params->param_2);
+        break;
+    case MODM_GETDEVCAPS:
+        *params->err = midi_out_get_devcaps(params->dev_id, (MIDIOUTCAPSW *)params->param_1, params->param_2);
+        break;
+    case MODM_GETNUMDEVS:
+        *params->err = midi_out_get_num_devs();
+        break;
+    case MODM_GETVOLUME:
+    case MODM_SETVOLUME:
+        *params->err = MMSYSERR_NOTSUPPORTED;
+        break;
+    case MODM_RESET:
+        *params->err = midi_out_reset(params->dev_id);
+        break;
+    default:
+        TRACE("Unsupported message\n");
+        *params->err = MMSYSERR_NOTSUPPORTED;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_midi_in_message(void *args)
+{
+    struct midi_in_message_params *params = args;
+
+    params->notify->send_notify = FALSE;
+
+    if (!midi_ready)
+    {
+        *params->err = params->msg == MIDM_GETNUMDEVS ? 0 : MMSYSERR_NOTSUPPORTED;
+        return STATUS_SUCCESS;
+    }
+
+    switch (params->msg)
+    {
+    case DRVM_INIT:
+    case DRVM_EXIT:
+    case DRVM_ENABLE:
+    case DRVM_DISABLE:
+        *params->err = MMSYSERR_NOERROR;
+        break;
+    case MIDM_OPEN:
+        *params->err = midi_in_open(params->dev_id, (MIDIOPENDESC *)params->param_1, params->param_2, params->notify);
+        break;
+    case MIDM_CLOSE:
+        *params->err = midi_in_close(params->dev_id, params->notify);
+        break;
+    case MIDM_ADDBUFFER:
+        *params->err = midi_in_add_buffer(params->dev_id, (MIDIHDR *)params->param_1, params->param_2);
+        break;
+    case MIDM_PREPARE:
+        *params->err = midi_in_prepare(params->dev_id, (MIDIHDR *)params->param_1, params->param_2);
+        break;
+    case MIDM_UNPREPARE:
+        *params->err = midi_in_unprepare(params->dev_id, (MIDIHDR *)params->param_1, params->param_2);
+        break;
+    case MIDM_GETDEVCAPS:
+        *params->err = midi_in_get_devcaps(params->dev_id, (MIDIINCAPSW *)params->param_1, params->param_2);
+        break;
+    case MIDM_GETNUMDEVS:
+        *params->err = midi_in_get_num_devs();
+        break;
+    case MIDM_START:
+        *params->err = midi_in_start(params->dev_id);
+        break;
+    case MIDM_STOP:
+        *params->err = midi_in_stop(params->dev_id);
+        break;
+    case MIDM_RESET:
+        *params->err = midi_in_reset(params->dev_id, params->notify);
+        break;
+    default:
+        TRACE("Unsupported message\n");
+        *params->err = MMSYSERR_NOTSUPPORTED;
+    }
+
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS unix_midi_notify_wait(void *args)
 {
     struct midi_notify_wait_params *params = args;
-    *params->quit = TRUE;
-    params->notify->send_notify = FALSE;
+
+    pthread_mutex_lock(&notify_mutex);
+
+    while (!notify_quit && notify_buffer_empty())
+        pthread_cond_wait(&notify_cond, &notify_mutex);
+
+    *params->quit = notify_quit;
+    if (!notify_quit) notify_buffer_remove(params->notify);
+
+    pthread_mutex_unlock(&notify_mutex);
+
     return STATUS_SUCCESS;
 }
 
@@ -1127,9 +2081,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     unix_get_prop_value,
     unix_not_implemented,
     unix_midi_init,
-    unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
+    unix_midi_release,
+    unix_midi_out_message,
+    unix_midi_in_message,
     unix_midi_notify_wait,
     unix_not_implemented,
 };
@@ -1155,6 +2109,355 @@ static NTSTATUS unix_wow64_midi_init(void *args)
     struct midi_init_params params = { .err = ULongToPtr(params32->err) };
     return unix_midi_init(&params);
 }
+
+struct notify_context32
+{
+    BOOL send_notify;
+    WORD dev_id;
+    WORD msg;
+    UINT param_1;
+    UINT param_2;
+    UINT callback;
+    UINT flags;
+    PTR32 device;
+    UINT instance;
+};
+
+static void notify_to_notify32(struct notify_context32 *notify32,
+                               const struct notify_context *notify)
+{
+    notify32->send_notify = notify->send_notify;
+    notify32->dev_id = notify->dev_id;
+    notify32->msg = notify->msg;
+    notify32->param_1 = notify->param_1;
+    notify32->param_2 = notify->param_2;
+    notify32->callback = notify->callback;
+    notify32->flags = notify->flags;
+    notify32->device = PtrToUlong(notify->device);
+    notify32->instance = notify->instance;
+}
+
+struct midi_open_desc32
+{
+    PTR32 hMidi;
+    UINT dwCallback;
+    UINT dwInstance;
+    UINT dnDevNode;
+    UINT cIds;
+    MIDIOPENSTRMID rgIds;
+};
+
+struct midi_hdr32
+{
+    PTR32 lpData;
+    UINT dwBufferLength;
+    UINT dwBytesRecorded;
+    UINT dwUser;
+    UINT dwFlags;
+    PTR32 lpNext;
+    UINT reserved;
+    UINT dwOffset;
+    UINT dwReserved[8];
+};
+
+static UINT wow64_midi_out_prepare(WORD dev_id, struct midi_hdr32 *hdr, UINT hdr_size)
+{
+    TRACE("(%04X, %p, %d);\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(struct midi_hdr32, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (hdr->dwFlags & MHDR_PREPARED)
+        return MMSYSERR_NOERROR;
+
+    hdr->lpNext = 0;
+    hdr->dwFlags |= MHDR_PREPARED;
+    hdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
+    return MMSYSERR_NOERROR;
+}
+
+static UINT wow64_midi_out_unprepare(WORD dev_id, struct midi_hdr32 *hdr, UINT hdr_size)
+{
+    TRACE("(%04X, %p, %d);\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(struct midi_hdr32, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (!(hdr->dwFlags & MHDR_PREPARED))
+        return MMSYSERR_NOERROR;
+    if (hdr->dwFlags & MHDR_INQUEUE)
+        return MIDIERR_STILLPLAYING;
+
+    hdr->dwFlags &= ~MHDR_PREPARED;
+    return MMSYSERR_NOERROR;
+}
+
+static NTSTATUS unix_wow64_midi_out_message(void *args)
+{
+    struct
+    {
+        UINT dev_id;
+        UINT msg;
+        UINT user;
+        UINT param_1;
+        UINT param_2;
+        PTR32 err;
+        PTR32 notify;
+    } *params32 = args;
+    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct midi_open_desc32 *desc32;
+    struct midi_hdr32 *hdr32;
+    struct notify_context notify;
+    MIDIOPENDESC open_desc;
+    MIDIHDR hdr;
+    struct midi_out_message_params params =
+    {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ULongToPtr(params32->err),
+        .notify = &notify
+    };
+    notify32->send_notify = FALSE;
+
+    switch (params32->msg)
+    {
+    case MODM_OPEN:
+        desc32 = ULongToPtr(params32->param_1);
+
+        open_desc.hMidi = ULongToPtr(desc32->hMidi);
+        open_desc.dwCallback = desc32->dwCallback;
+        open_desc.dwInstance = desc32->dwInstance;
+        open_desc.dnDevNode = desc32->dnDevNode;
+        open_desc.cIds = desc32->cIds;
+        open_desc.rgIds.dwStreamID = desc32->rgIds.dwStreamID;
+        open_desc.rgIds.wDeviceID = desc32->rgIds.wDeviceID;
+
+        params.param_1 = (UINT_PTR)&open_desc;
+        break;
+
+    case MODM_LONGDATA:
+        hdr32 = ULongToPtr(params32->param_1);
+
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.lpData = ULongToPtr(hdr32->lpData);
+        hdr.dwBufferLength = hdr32->dwBufferLength;
+        hdr.dwFlags = hdr32->dwFlags;
+
+        params.param_1 = (UINT_PTR)&hdr;
+        params.param_2 = sizeof(hdr);
+        break;
+
+    case MODM_PREPARE: /* prepare and unprepare are easier to handle explicitly */
+        hdr32 = ULongToPtr(params32->param_1);
+
+        *params.err = wow64_midi_out_prepare(params32->dev_id, hdr32, params32->param_2);
+        return STATUS_SUCCESS;
+
+    case MODM_UNPREPARE:
+        hdr32 = ULongToPtr(params32->param_1);
+
+        *params.err = wow64_midi_out_unprepare(params32->dev_id, hdr32, params32->param_2);
+        return STATUS_SUCCESS;
+    }
+
+    unix_midi_out_message(&params);
+
+    switch (params32->msg)
+    {
+    case MODM_LONGDATA:
+        hdr32 = ULongToPtr(params32->param_1);
+
+        hdr32->dwFlags = hdr.dwFlags;
+        break;
+    }
+
+    if (notify.send_notify)
+    {
+        notify_to_notify32(notify32, &notify);
+
+        if (notify.msg == MOM_DONE)
+            notify32->param_1 = params32->param_1; /* restore the 32-bit hdr */
+    }
+    return STATUS_SUCCESS;
+}
+
+static UINT wow64_midi_in_prepare(WORD dev_id, struct midi_hdr32 *hdr, UINT hdr_size)
+{
+    TRACE("(%04X, %p, %d);\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(struct midi_hdr32, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (hdr->dwFlags & MHDR_PREPARED)
+        return MMSYSERR_NOERROR;
+
+    hdr->lpNext = 0;
+    hdr->dwFlags |= MHDR_PREPARED;
+    hdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
+
+    return MMSYSERR_NOERROR;
+}
+
+static UINT wow64_midi_in_unprepare(WORD dev_id, struct midi_hdr32 *hdr, UINT hdr_size)
+{
+    TRACE("(%04X, %p, %d);\n", dev_id, hdr, hdr_size);
+
+    if (hdr_size < offsetof(struct midi_hdr32, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (!(hdr->dwFlags & MHDR_PREPARED))
+        return MMSYSERR_NOERROR;
+    if (hdr->dwFlags & MHDR_INQUEUE)
+        return MIDIERR_STILLPLAYING;
+
+    hdr->dwFlags &= ~MHDR_PREPARED;
+
+    return MMSYSERR_NOERROR;
+}
+
+static NTSTATUS unix_wow64_midi_in_message(void *args)
+{
+    struct
+    {
+        UINT dev_id;
+        UINT msg;
+        UINT user;
+        UINT param_1;
+        UINT param_2;
+        PTR32 err;
+        PTR32 notify;
+    } *params32 = args;
+    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct midi_open_desc32 *desc32;
+    struct midi_hdr32 *hdr32;
+    struct notify_context notify;
+    MIDIOPENDESC open_desc;
+    MIDIHDR *hdr = NULL;
+    struct midi_in_message_params params =
+    {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ULongToPtr(params32->err),
+        .notify = &notify
+    };
+    notify32->send_notify = FALSE;
+
+    switch (params32->msg)
+    {
+    case MIDM_OPEN:
+        desc32 = ULongToPtr(params32->param_1);
+
+        open_desc.hMidi = ULongToPtr(desc32->hMidi);
+        open_desc.dwCallback = desc32->dwCallback;
+        open_desc.dwInstance = desc32->dwInstance;
+        open_desc.dnDevNode = desc32->dnDevNode;
+        open_desc.cIds = desc32->cIds;
+        open_desc.rgIds.dwStreamID = desc32->rgIds.dwStreamID;
+        open_desc.rgIds.wDeviceID = desc32->rgIds.wDeviceID;
+
+        params.param_1 = (UINT_PTR)&open_desc;
+        break;
+
+    case MIDM_ADDBUFFER:
+        hdr32 = ULongToPtr(params32->param_1);
+
+        hdr = calloc(1, sizeof(*hdr));
+        hdr->lpData = ULongToPtr(hdr32->lpData);
+        hdr->dwBufferLength = hdr32->dwBufferLength;
+        hdr->dwFlags = hdr32->dwFlags;
+        hdr->dwReserved[7] = params32->param_1; /* keep hdr32 for MIM_LONGDATA notification */
+
+        params.param_1 = (UINT_PTR)hdr;
+        params.param_2 = sizeof(*hdr);
+        break;
+
+    case MIDM_PREPARE: /* prepare and unprepare are easier to handle explicitly */
+        hdr32 = ULongToPtr(params32->param_1);
+
+        *params.err = wow64_midi_in_prepare(params32->dev_id, hdr32, params32->param_2);
+        return STATUS_SUCCESS;
+
+    case MIDM_UNPREPARE:
+        hdr32 = ULongToPtr(params32->param_1);
+
+        *params.err = wow64_midi_in_unprepare(params32->dev_id, hdr32, params32->param_2);
+        return STATUS_SUCCESS;
+    }
+
+    unix_midi_in_message(&params);
+
+    switch (params32->msg)
+    {
+    case MIDM_ADDBUFFER:
+        hdr32 = ULongToPtr(params32->param_1);
+
+        if (!*params.err)
+        {
+            hdr32->dwFlags = hdr->dwFlags;
+            hdr32->dwBytesRecorded = hdr->dwBytesRecorded;
+            hdr32->lpNext = 0;
+        }
+        else
+            free(hdr);
+        break;
+    }
+
+    if (notify.send_notify)
+    {
+        notify_to_notify32(notify32, &notify);
+
+        if (notify.msg == MIM_LONGDATA)
+        {
+            hdr = (MIDIHDR *)notify.param_1;
+            notify32->param_1 = hdr->dwReserved[7];
+            hdr32 = ULongToPtr(notify32->param_1);
+            hdr32->dwBytesRecorded = hdr->dwBytesRecorded;
+            hdr32->dwFlags = hdr->dwFlags;
+            free(hdr);
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_wow64_midi_notify_wait(void *args)
+{
+    struct
+    {
+        PTR32 quit;
+        PTR32 notify;
+    } *params32 = args;
+    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct midi_hdr32 *hdr32;
+    struct notify_context notify;
+    MIDIHDR *hdr;
+    struct midi_notify_wait_params params =
+    {
+        .quit = ULongToPtr(params32->quit),
+        .notify = &notify
+    };
+    notify32->send_notify = FALSE;
+
+    unix_midi_notify_wait(&params);
+
+    if (!*params.quit && notify.send_notify)
+    {
+        notify_to_notify32(notify32, &notify);
+
+        if (notify.msg == MIM_LONGDATA)
+        {
+            hdr = (MIDIHDR *)notify.param_1;
+            notify32->param_1 = hdr->dwReserved[7];
+            hdr32 = ULongToPtr(notify32->param_1);
+            hdr32->dwBytesRecorded = hdr->dwBytesRecorded;
+            hdr32->dwFlags = hdr->dwFlags;
+            free(hdr);
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 
 static NTSTATUS unix_wow64_get_endpoint_ids(void *args)
 {
@@ -1584,10 +2887,10 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     unix_wow64_get_prop_value,
     unix_not_implemented,
     unix_wow64_midi_init,
-    unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
+    unix_midi_release,
+    unix_wow64_midi_out_message,
+    unix_wow64_midi_in_message,
+    unix_wow64_midi_notify_wait,
     unix_not_implemented,
 };
 

@@ -16,12 +16,17 @@
 #include <Application.h>
 #include <OS.h>
 #include <MediaRecorder.h>
+#include <MidiConsumer.h>
+#include <MidiProducer.h>
+#include <MidiRoster.h>
 #include <MediaRoster.h>
 #include <ParameterWeb.h>
 #include <SoundPlayer.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdlib.h>
+
+#include "wine_icon.inc"
 
 typedef void (*hs_fill_func)(void *cookie, void *buffer, size_t bytes);
 
@@ -441,6 +446,154 @@ void haiku_audio_record_close(void *handle)
     if (r->old_input >= 0) choose_input(BMediaRoster::Roster(), r->hardware, r->old_input);
     BMediaRoster::Roster()->ReleaseNode(r->node);
     free(r);
+}
+
+/* ---- MIDI: the endpoints of Haiku's MIDI kit (a keyboard, a soft synth) as the MIDI ports of Windows programs ---- */
+
+typedef void (*hs_midi_func)(void *cookie, const unsigned char *data, size_t length, long long time);
+
+/* the icon of Wine, so that PatchBay (and other programs that show endpoints) draw it next to ours, as for the programs that
+ * set the "icon" property of their endpoints (rakarrack, Guitarix, LMMS) */
+static void set_midi_icon(BMidiEndpoint *endpoint)
+{
+    BMessage properties;
+
+    if (endpoint->GetProperties(&properties) != B_OK) return;
+    properties.RemoveName("icon");
+    properties.AddData("icon", B_VECTOR_ICON_TYPE, wine_icon, sizeof(wine_icon));
+    endpoint->SetProperties(&properties);
+}
+
+class WineMidiIn : public BMidiLocalConsumer
+{
+public:
+    WineMidiIn(const char *name, hs_midi_func func, void *cookie) : BMidiLocalConsumer(name), fFunc(func), fCookie(cookie) {}
+
+    /* runs in a thread of the MIDI kit, which knows nothing of Wine: nothing of Wine may be called */
+    virtual void Data(uchar *data, size_t length, bool atomic, bigtime_t time)
+    {
+        fFunc(fCookie, data, length, time);
+    }
+
+private:
+    hs_midi_func fFunc;
+    void *fCookie;
+};
+
+struct hs_midi_in
+{
+    WineMidiIn *consumer;
+    BMidiProducer *producer;
+};
+
+struct hs_midi_out
+{
+    BMidiLocalProducer *producer;
+    BMidiConsumer *consumer;
+};
+
+/* the endpoints other programs offer: with sources set the ones that produce MIDI (a keyboard), else the ones that take it (a synth) */
+int haiku_audio_midi_list(int sources, char names[][64], int *ids, int max)
+{
+    BMidiEndpoint *endpoint;
+    int32 id = 0;
+    int n = 0;
+
+    if (!ensure_application()) return 0;
+    while ((endpoint = BMidiRoster::NextEndpoint(&id)) != NULL && n < max)
+    {
+        if (endpoint->IsRemote() && (sources ? endpoint->IsProducer() : endpoint->IsConsumer()))
+        {
+            strncpy(names[n], endpoint->Name(), 63);
+            names[n][63] = 0;
+            ids[n++] = (int)endpoint->ID();
+        }
+        endpoint->Release();
+    }
+    return n;
+}
+
+void *haiku_audio_midi_in_open(int producer_id, const char *name, hs_midi_func func, void *cookie)
+{
+    BMidiEndpoint *endpoint;
+    hs_midi_in *m;
+
+    if (!ensure_application()) return NULL;
+    if (!(endpoint = BMidiRoster::FindEndpoint(producer_id)) || !endpoint->IsProducer() || !endpoint->IsRemote())
+    {
+        if (endpoint) endpoint->Release();
+        return NULL;
+    }
+    m = (hs_midi_in *)calloc(1, sizeof(*m));
+    m->producer = static_cast<BMidiProducer *>(endpoint);
+    m->consumer = new WineMidiIn(name, func, cookie);
+    if (m->consumer->Register() != B_OK) goto fail;
+    set_midi_icon(m->consumer);
+    if (m->producer->Connect(m->consumer) != B_OK) goto fail;
+    return m;
+
+fail:
+    m->consumer->Unregister();
+    m->consumer->Release();
+    m->producer->Release();
+    free(m);
+    return NULL;
+}
+
+void haiku_audio_midi_in_close(void *handle)
+{
+    hs_midi_in *m = (hs_midi_in *)handle;
+
+    m->producer->Disconnect(m->consumer);
+    m->consumer->Unregister();
+    m->consumer->Release();
+    m->producer->Release();
+    free(m);
+}
+
+void *haiku_audio_midi_out_open(int consumer_id, const char *name)
+{
+    BMidiEndpoint *endpoint;
+    hs_midi_out *m;
+
+    if (!ensure_application()) return NULL;
+    if (!(endpoint = BMidiRoster::FindEndpoint(consumer_id)) || !endpoint->IsConsumer() || !endpoint->IsRemote())
+    {
+        if (endpoint) endpoint->Release();
+        return NULL;
+    }
+    m = (hs_midi_out *)calloc(1, sizeof(*m));
+    m->consumer = static_cast<BMidiConsumer *>(endpoint);
+    m->producer = new BMidiLocalProducer(name);
+    if (m->producer->Register() != B_OK) goto fail;
+    set_midi_icon(m->producer);
+    if (m->producer->Connect(m->consumer) != B_OK) goto fail;
+    return m;
+
+fail:
+    m->producer->Unregister();
+    m->producer->Release();
+    m->consumer->Release();
+    free(m);
+    return NULL;
+}
+
+void haiku_audio_midi_send(void *handle, const unsigned char *data, size_t length)
+{
+    hs_midi_out *m = (hs_midi_out *)handle;
+
+    m->producer->SprayData((void *)data, length, true, 0);
+}
+
+void haiku_audio_midi_out_close(void *handle)
+{
+    hs_midi_out *m = (hs_midi_out *)handle;
+
+    m->producer->Disconnect(m->consumer);
+    m->producer->Unregister();
+    m->producer->Release();
+    m->consumer->Release();
+    free(m);
 }
 
 }
