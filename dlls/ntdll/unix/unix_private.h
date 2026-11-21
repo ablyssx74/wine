@@ -132,9 +132,18 @@ struct thread_data
 };
 
 extern pthread_key_t thread_data_key;
+#ifdef __HAIKU__
+extern int thread_data_key_ready;
+#endif
 
 static inline struct thread_data *get_thread_data(void)
 {
+#ifdef __HAIKU__
+    /* Until virtual_init() has made the key, thread_data_key is 0, and key 0 is somebody else's: mimalloc's (LD_PRELOAD) uses it for its
+     * thread data. A debug message printed that early (set_max_limit's WARN with WINEDEBUG=+module) took that for a thread_data, and
+     * wrote the message into the allocator's memory (the program crashed in malloc at start-up). Before the key there is no thread data. */
+    if (!thread_data_key_ready) return NULL;
+#endif
     return pthread_getspecific( thread_data_key );
 }
 
