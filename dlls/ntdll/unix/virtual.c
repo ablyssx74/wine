@@ -4685,6 +4685,30 @@ BOOL virtual_is_valid_code_address( const void *addr, SIZE_T size )
 
 
 /***********************************************************************
+ *           virtual_register_foreign_range
+ *
+ * Tell the memory manager about memory that somebody else (mimalloc, behind the process heap) mapped, as committed read-write private
+ * memory, so that VirtualQuery and the buffer checks of the server calls see the blocks of the heap like any others. Nothing is
+ * mapped here, and a range that overlaps a view we have already is left as it is.
+ */
+NTSTATUS virtual_register_foreign_range( void *base, SIZE_T size )
+{
+    struct file_view *view;
+    sigset_t sigset;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (((UINT_PTR)base & host_page_mask) || (size & page_mask)) return STATUS_INVALID_PARAMETER;
+    if ((char *)base + size > (char *)user_space_limit) return STATUS_INVALID_PARAMETER;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!find_view_range( base, size ))
+        status = create_view( &view, base, size, VPROT_COMMITTED | VPROT_READ | VPROT_WRITE );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return status;
+}
+
+
+/***********************************************************************
  *           virtual_check_buffer_for_read
  *
  * Check if a memory buffer can be read, triggering page faults if needed for DIB section access.

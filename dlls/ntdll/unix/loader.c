@@ -1119,6 +1119,79 @@ static NTSTATUS unwind_builtin_dll( void *args )
 #endif /* SO_DLLS_SUPPORTED */
 
 
+#ifdef __HAIKU__
+/* Haiku: the blocks of the process heap (heap.c) come from mimalloc, which the programs of Wine run with (LD_PRELOAD). A call for
+ * every allocation and free; WINE_HAIKU_HEAP_MI=0 turns it off (the probe fails and heap.c keeps its own heap). */
+static void *(*p_mi_malloc)( size_t );
+static void *(*p_mi_zalloc)( size_t );
+static void (*p_mi_free)( void * );
+
+static NTSTATUS mi_probe( void *args )
+{
+    const char *want = getenv( "WINE_HAIKU_HEAP_MI" );
+
+    if (want && !strcmp( want, "0" )) return STATUS_NOT_SUPPORTED;
+    if (!p_mi_malloc) p_mi_malloc = dlsym( RTLD_DEFAULT, "mi_malloc" );
+    if (!p_mi_zalloc) p_mi_zalloc = dlsym( RTLD_DEFAULT, "mi_zalloc" );
+    if (!p_mi_free) p_mi_free = dlsym( RTLD_DEFAULT, "mi_free" );
+    return p_mi_malloc && p_mi_zalloc && p_mi_free ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+}
+
+/* mimalloc cuts its memory into segments of 32 MiB, aligned to 32 MiB (blocks up to a few MiB live in them). The first time a block of
+ * a segment goes to a Windows program, the segment is registered with the memory manager as committed read-write memory (the pages
+ * mimalloc has not committed yet are not touched by anybody). A segment mimalloc gives back keeps its entry: harmless. */
+#define MI_SEGMENT_SIZE   ((ULONG_PTR)32 << 20)
+static ULONG_PTR mi_segments[8192];                    /* open addressing table of the segment bases (0 = free slot) */
+static pthread_mutex_t mi_segments_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void mi_register_segment( void *ptr )
+{
+    ULONG_PTR seg = (ULONG_PTR)ptr & ~(MI_SEGMENT_SIZE - 1), v;
+    unsigned int mask = ARRAY_SIZE(mi_segments) - 1, i = (unsigned int)((seg >> 25) * 2654435761u) & mask, n;
+
+    for (n = 0; n <= mask; n++)
+    {
+        v = __atomic_load_n( &mi_segments[(i + n) & mask], __ATOMIC_ACQUIRE );
+        if (v == seg) return;
+        if (!v) break;
+    }
+    if (n > mask) return;                              /* table full: the rest stays unknown to the memory manager */
+
+    pthread_mutex_lock( &mi_segments_mutex );
+    for (n = 0; n <= mask; n++)
+    {
+        v = mi_segments[(i + n) & mask];
+        if (v == seg) break;
+        if (!v)
+        {
+            virtual_register_foreign_range( (void *)seg, MI_SEGMENT_SIZE );
+            __atomic_store_n( &mi_segments[(i + n) & mask], seg, __ATOMIC_RELEASE );
+            break;
+        }
+    }
+    pthread_mutex_unlock( &mi_segments_mutex );
+}
+
+static NTSTATUS mi_alloc( void *args )
+{
+    struct mi_call *c = args;
+    c->ptr = c->zero ? p_mi_zalloc( c->size ) : p_mi_malloc( c->size );
+    if (c->ptr) mi_register_segment( c->ptr );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mi_free( void *args )
+{
+    p_mi_free( ((struct mi_call *)args)->ptr );
+    return STATUS_SUCCESS;
+}
+#else
+static NTSTATUS mi_probe( void *args ) { return STATUS_NOT_SUPPORTED; }
+static NTSTATUS mi_alloc( void *args ) { return STATUS_NOT_SUPPORTED; }
+static NTSTATUS mi_free( void *args ) { return STATUS_NOT_SUPPORTED; }
+#endif
+
+
 static const unixlib_entry_t unix_call_funcs[] =
 {
     load_so_dll,
@@ -1129,12 +1202,16 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
     system_time_precise,
+    mi_probe,
+    mi_alloc,
+    mi_free,
 };
 
 
 #ifdef _WIN64
 
 static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
+static NTSTATUS mi_not_supported( void *args ) { return STATUS_NOT_SUPPORTED; }
 static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
 
 const unixlib_entry_t unix_call_wow64_funcs[] =
@@ -1147,6 +1224,9 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
+    mi_not_supported,
+    mi_not_supported,
+    mi_not_supported,
 };
 
 #endif  /* _WIN64 */

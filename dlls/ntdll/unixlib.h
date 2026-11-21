@@ -76,6 +76,17 @@ enum ntdll_unix_funcs
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
     unix_system_time_precise,
+    unix_mi_probe,
+    unix_mi_alloc,
+    unix_mi_free,
+};
+
+/* Haiku: the process heap on mimalloc, see heap.c */
+struct mi_call
+{
+    void   *ptr;
+    SIZE_T  size;
+    ULONG   zero;
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

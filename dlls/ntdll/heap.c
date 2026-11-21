@@ -32,6 +32,8 @@
 #include "winnt.h"
 #include "winternl.h"
 #include "ntdll_misc.h"
+#include "wine/unixlib.h"
+#include "unixlib.h"
 #include "wine/list.h"
 #include "wine/debug.h"
 
@@ -138,6 +140,76 @@ C_ASSERT( sizeof(ARENA_LARGE) == 4 * BLOCK_ALIGN );
 #define BLOCK_TYPE_DEAD        'D'
 #define BLOCK_TYPE_FREE        'F'
 #define BLOCK_TYPE_LARGE       'L'
+
+#ifdef _WIN64
+/* Haiku: the blocks of the PROCESS heap (what the C library's malloc and the GlobalAlloc/LocalAlloc family use) come from
+ * mimalloc, through a call into ntdll.so for every allocation and free. Wine's heap has one lock for the heap and the benchmark
+ * (4 threads on the process heap) did 1.0 million operations a second, 16 threads 0.8; mimalloc 75 and 99. A mimalloc block has a 32 byte
+ * header before the user data: [user value][size][unused][struct block] where the struct block is the usual 8 bytes right before the
+ * data, with the type MI, so that every function here can see what a block is without asking anybody. 32 bit programs (a 32 bit
+ * address space) and the other heaps (HeapDestroy would have to find their blocks) keep Wine's heap, and so do sizes over MI_MAX_SIZE
+ * and heaps that are checked (HEAP_VALIDATE and the checking flags). WINE_HAIKU_HEAP_MI=0 turns it off. */
+#define BLOCK_TYPE_MI         'M'
+#define MI_HDR_SIZE           32
+#define MI_MAX_SIZE           0x100000
+#define MI_CHECK_FLAGS        (HEAP_VALIDATE | HEAP_VALIDATE_ALL | HEAP_VALIDATE_PARAMS | HEAP_TAIL_CHECKING_ENABLED | HEAP_FREE_CHECKING_ENABLED)
+
+static LONG mi_state;   /* 0 not asked yet, 1 on, -1 off */
+
+static BOOL mi_enabled(void)
+{
+    LONG state = ReadNoFence( &mi_state );
+
+    if (state) return state > 0;
+    if (!__wine_unixlib_handle) return FALSE;    /* too early to ask: try again later */
+    state = WINE_UNIX_CALL( unix_mi_probe, NULL ) ? -1 : 1;
+    InterlockedExchange( &mi_state, state );
+    return state > 0;
+}
+
+static inline BOOL mi_is_block( const void *ptr )
+{
+    const struct block *block = (const struct block *)ptr - 1;
+    return !((ULONG_PTR)ptr % BLOCK_ALIGN) && block->block_type == BLOCK_TYPE_MI;
+}
+
+static inline void **mi_user_value( const void *ptr ) { return (void **)((char *)ptr - MI_HDR_SIZE); }
+static inline SIZE_T *mi_size( const void *ptr ) { return (SIZE_T *)((char *)ptr - MI_HDR_SIZE + sizeof(void *)); }
+
+static void *mi_block_alloc( ULONG heap_flags, SIZE_T size )
+{
+    struct mi_call call;
+    struct block *block;
+    char *ptr;
+
+    call.ptr = NULL;
+    call.size = size + MI_HDR_SIZE;
+    call.zero = !!(heap_flags & HEAP_ZERO_MEMORY);
+    if (WINE_UNIX_CALL( unix_mi_alloc, &call ) || !call.ptr) return NULL;
+
+    ptr = (char *)call.ptr + MI_HDR_SIZE;
+    *mi_user_value( ptr ) = NULL;
+    *mi_size( ptr ) = size;
+    block = (struct block *)ptr - 1;
+    block->block_size = 0;
+    block->tail_size = 0;
+    block->base_offset = 0;
+    block->block_type = BLOCK_TYPE_MI;
+    block->block_flags = BLOCK_USER_FLAGS( heap_flags );
+    return ptr;
+}
+
+static void mi_block_free( void *ptr )
+{
+    struct mi_call call;
+
+    ((struct block *)ptr - 1)->block_type = BLOCK_TYPE_DEAD;    /* a second free of it is not taken for a block */
+    call.ptr = (char *)ptr - MI_HDR_SIZE;
+    call.size = 0;
+    call.zero = 0;
+    WINE_UNIX_CALL( unix_mi_free, &call );
+}
+#endif
 
 #define BLOCK_FILL_USED        0xbaadf00d
 #define BLOCK_FILL_TAIL        0xab
@@ -2046,6 +2118,11 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
     heap = unsafe_heap_from_handle( handle, flags, &heap_flags );
     if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
         status = STATUS_NO_MEMORY;
+#ifdef _WIN64
+    else if (heap == process_heap && size <= MI_MAX_SIZE && !(heap_flags & MI_CHECK_FLAGS) && mi_enabled() &&
+             (ptr = mi_block_alloc( heap_flags, size )))
+        status = STATUS_SUCCESS;
+#endif
     else if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
         status = heap_allocate_large( heap, heap_flags, block_size, size, &ptr );
     else if (heap->bins && !heap_allocate_block_lfh( heap, heap_flags, block_size, size, &ptr ))
@@ -2083,6 +2160,14 @@ BOOLEAN WINAPI DECLSPEC_HOTPATCH RtlFreeHeap( HANDLE handle, ULONG flags, void *
     NTSTATUS status;
 
     if (!ptr) return TRUE;
+
+#ifdef _WIN64
+    if (mi_is_block( ptr ))
+    {
+        mi_block_free( ptr );
+        return TRUE;
+    }
+#endif
 
     valgrind_notify_free( ptr );
 
@@ -2237,6 +2322,24 @@ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T si
 
     if (!ptr) return NULL;
 
+#ifdef _WIN64
+    if (mi_is_block( ptr ))
+    {
+        SIZE_T old = *mi_size( ptr );
+
+        if (size <= old)    /* shrinking, or the same size: in place */
+        {
+            *mi_size( ptr ) = size;
+            return ptr;
+        }
+        if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return NULL;
+        if (!(ret = RtlAllocateHeap( handle, flags, size ))) return NULL;
+        memcpy( ret, ptr, old );
+        RtlFreeHeap( handle, flags, ptr );
+        return ret;
+    }
+#endif
+
     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
         status = STATUS_INVALID_HANDLE;
     else if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
@@ -2354,6 +2457,10 @@ SIZE_T WINAPI RtlSizeHeap( HANDLE handle, ULONG flags, const void *ptr )
     ULONG heap_flags;
     NTSTATUS status;
 
+#ifdef _WIN64
+    if (ptr && mi_is_block( ptr )) return *mi_size( ptr );
+#endif
+
     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
         status = STATUS_INVALID_PARAMETER;
     else if (!(block = unsafe_block_from_ptr( heap, heap_flags, ptr )))
@@ -2379,6 +2486,10 @@ BOOLEAN WINAPI RtlValidateHeap( HANDLE handle, ULONG flags, const void *ptr )
     struct heap *heap;
     ULONG heap_flags;
     BOOLEAN ret;
+
+#ifdef _WIN64
+    if (ptr && mi_is_block( ptr )) return TRUE;
+#endif
 
     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
         ret = FALSE;
@@ -2641,6 +2752,19 @@ BOOLEAN WINAPI RtlGetUserInfoHeap( HANDLE handle, ULONG flags, void *ptr, void *
 
     *user_flags = 0;
 
+#ifdef _WIN64
+    if (ptr && mi_is_block( ptr ))
+    {
+        ULONG f = HEAP_USER_FLAGS( ((struct block *)ptr - 1)->block_flags );
+        if (f)
+        {
+            *user_flags = f & ~HEAP_ADD_USER_INFO;
+            *user_value = *mi_user_value( ptr );
+        }
+        return TRUE;
+    }
+#endif
+
     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
         status = STATUS_SUCCESS;
     else if (!(block = unsafe_block_from_ptr( heap, heap_flags, ptr )))
@@ -2684,6 +2808,15 @@ BOOLEAN WINAPI RtlSetUserValueHeap( HANDLE handle, ULONG flags, void *ptr, void 
     char *tmp;
 
     TRACE( "handle %p, flags %#lx, ptr %p, user_value %p.\n", handle, flags, ptr, user_value );
+
+#ifdef _WIN64
+    if (ptr && mi_is_block( ptr ))
+    {
+        if (!(((struct block *)ptr - 1)->block_flags & BLOCK_FLAG_USER_INFO)) return FALSE;
+        *mi_user_value( ptr ) = user_value;
+        return TRUE;
+    }
+#endif
 
     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
         ret = TRUE;
@@ -2729,6 +2862,16 @@ BOOLEAN WINAPI RtlSetUserFlagsHeap( HANDLE handle, ULONG flags, void *ptr, ULONG
         SetLastError( ERROR_INVALID_PARAMETER );
         return FALSE;
     }
+
+#ifdef _WIN64
+    if (ptr && mi_is_block( ptr ))
+    {
+        block = (struct block *)ptr - 1;
+        if (!(block_get_flags( block ) & BLOCK_FLAG_USER_INFO)) return FALSE;
+        block_set_flags( block, BLOCK_USER_FLAGS( clear ), BLOCK_USER_FLAGS( set ) );
+        return TRUE;
+    }
+#endif
 
     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
         ret = TRUE;
