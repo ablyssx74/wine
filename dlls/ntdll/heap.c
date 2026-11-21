@@ -1549,12 +1549,12 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
         heap->cs.RecursionCount = 0;
         heap->cs.OwningThread   = 0;
         heap->cs.LockSemaphore  = 0;
-        heap->cs.SpinCount      = 0;
+        heap->cs.SpinCount      = 40000;  /* a heap spins before it sleeps (Windows does, with 4000): a sleep and wake-up is slow on Haiku */
         process_heap_cs_debug.CriticalSection = &heap->cs;
     }
     else
     {
-        RtlInitializeCriticalSectionEx( &heap->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
+        RtlInitializeCriticalSectionEx( &heap->cs, 40000, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
         heap->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": heap.cs");
     }
 
