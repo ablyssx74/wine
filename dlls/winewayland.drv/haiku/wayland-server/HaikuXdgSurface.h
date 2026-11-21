@@ -52,6 +52,8 @@ public:
 
 	uint32_t NextSerial();
 	bool SetConfigurePending() {if (fConfigurePending) return false; else fConfigurePending = true; return true;}
+	bool ConfigurePending() const {return fConfigurePending;}
+	void ClearConfigurePending() {fConfigurePending = false;}
 	struct GeometryInfo Geometry() {return fGeometry;}
 	HaikuSurface *Surface() {return fSurface;}
 	HaikuXdgToplevel *Toplevel() {return fToplevel;}

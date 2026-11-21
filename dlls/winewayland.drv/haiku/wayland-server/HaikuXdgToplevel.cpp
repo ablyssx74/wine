@@ -208,6 +208,19 @@ void HaikuXdgToplevel::DoSendConfigure()
 	SendConfigure(fWidth, fHeight, &state);
 }
 
+// The interactive resize is over (the button was let go): a configure without the "resizing" state, at the size it ended on. Wine
+// is in its size/move loop (WM_ENTERSIZEMOVE) from the first configure that says "resizing" and leaves it (WM_EXITSIZEMOVE) with the
+// first that does not; without this one it stayed in it, and a GTK program (Ardour's Add Existing Media dialog) that pauses its drawing
+// while the loop is on kept being asked to paint and never did: a busy loop of WM_PAINT, the program frozen.
+void HaikuXdgToplevel::EndInteractiveResize(int32_t width, int32_t height)
+{
+	fWidth = width;
+	fHeight = height;
+	XdgSurface()->ClearConfigurePending();
+	DoSendConfigure();
+	XdgSurface()->SendConfigure(XdgSurface()->NextSerial());
+}
+
 void HaikuXdgToplevel::HandleSetParent(struct wl_resource *_parent)
 {
 	// TODO: update root window when parent window is closed

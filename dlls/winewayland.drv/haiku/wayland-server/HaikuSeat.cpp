@@ -413,6 +413,7 @@ void HaikuSeatGlobal::DoTrack(TrackId id, const TrackInfo &info)
 			fTrack.lastMoveTo = fTrack.moveStartWin;
 			fTrack.lastResizeW = fTrack.wndWidth;
 			fTrack.lastResizeH = fTrack.wndHeight;
+			fPointerFocus->XdgSurface()->ClearConfigurePending();
 			break;
 		}
 	}
@@ -596,6 +597,12 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					(long long)(fTrack.statMoveUs / std::max<uint32_t>(1, fTrack.statEvents - fTrack.statSkipped)),
 					(long long)((system_time() - fTrack.statStart) / 1000));
 			}
+			if (fTrack.id == trackResize && fTrack.haveScreen) {
+				// the interactive resize ends: the client is told with a configure that no longer says "resizing"
+				HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();
+				if (xdgSurface != NULL && xdgSurface->Toplevel() != NULL)
+					xdgSurface->Toplevel()->EndInteractiveResize(fTrack.lastResizeW, fTrack.lastResizeH);
+			}
 			switch (fTrack.id) {
 				case trackNone:
 				case trackClient: {
@@ -691,7 +698,11 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 						bool top = edge == XdgToplevel::resizeEdgeTop || edge == XdgToplevel::resizeEdgeTopLeft || edge == XdgToplevel::resizeEdgeTopRight;
 						bool bottom = edge == XdgToplevel::resizeEdgeBottom || edge == XdgToplevel::resizeEdgeBottomLeft || edge == XdgToplevel::resizeEdgeBottomRight;
 						if (!(left || right || top || bottom)) break;
-						if (!xdgSurface->SetConfigurePending()) true;
+						// One configure at a time: the next one waits until the client has answered the one before (ack_configure). Every
+						// move of the pointer used to send one, the client could not keep up (Ardour's file dialog is a big GTK window),
+						// and after a few seconds of dragging it was stuck in a busy loop of WM_PAINT. The size of the latest move is sent
+						// with the next move, and with the end of the drag (EndInteractiveResize).
+						if (xdgSurface->ConfigurePending()) break;
 
 						int32_t minWidth, minHeight, maxWidth, maxHeight;
 						xdgSurface->Toplevel()->MinSize(minWidth, minHeight);
@@ -723,6 +734,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 								.alloc = sizeof(arrayData),
 								.data = &arrayData
 							};
+							xdgSurface->SetConfigurePending();	// (until the client answers it)
 							xdgSurface->Toplevel()->SendConfigure(newWidth, newHeight, &array);
 							xdgSurface->SendConfigure(xdgSurface->NextSerial());
 							fTrack.lastResizeW = newWidth;

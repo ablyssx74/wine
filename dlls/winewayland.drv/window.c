@@ -667,6 +667,9 @@ static void wayland_configure_window(HWND hwnd)
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
 }
 
+static __thread int configure_nesting;
+static __thread HWND configure_deferred_hwnd;
+
 /**********************************************************************
  *           WAYLAND_WindowMessage
  */
@@ -678,7 +681,29 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
         return 0;
     case WM_WAYLAND_CONFIGURE:
+        /* Applying a configure resizes the window, and some applications (GTK on Windows: Ardour) run their message
+         * loop from inside the window procedure that handles that resize, to repaint faster. The next configure of
+         * a fast drag is then picked up by that nested loop and applied from inside the previous one, and so on:
+         * the window procedure calls nest until Wine's limit (MAX_WINPROC_RECURSION) is reached, after which no
+         * window procedure is called any more (nothing is repainted, the thread spins on the same WM_PAINT for
+         * ever). Do not apply a configure from inside another one: remember it and apply it when the outer one
+         * has finished. */
+        if (configure_nesting)
+        {
+            TRACE("hwnd=%p configure arrived inside another one, deferring it\n", hwnd);
+            if (!configure_deferred_hwnd || configure_deferred_hwnd == hwnd) configure_deferred_hwnd = hwnd;
+            else NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
+            return 0;
+        }
+        configure_nesting++;
         wayland_configure_window(hwnd);
+        while (configure_deferred_hwnd)
+        {
+            HWND deferred = configure_deferred_hwnd;
+            configure_deferred_hwnd = NULL;
+            wayland_configure_window(deferred);
+        }
+        configure_nesting--;
         return 0;
     case WM_WAYLAND_SET_FOREGROUND:
         NtUserSetForegroundWindowInternal(hwnd);

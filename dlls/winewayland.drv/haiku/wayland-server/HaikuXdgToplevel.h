@@ -45,6 +45,7 @@ public:
 	void MinSize(int32_t &width, int32_t &height) {width = fMinWidth; height = fMinHeight;}
 	void MaxSize(int32_t &width, int32_t &height) {width = fMaxWidth; height = fMaxHeight;}
 	void DoSendConfigure();
+	void EndInteractiveResize(int32_t width, int32_t height);
 
 	void HandleSetParent(struct wl_resource *parent) override;
 	void HandleSetTitle(const char *title) override;
