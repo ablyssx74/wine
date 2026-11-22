@@ -48,6 +48,14 @@ struct thunk_opcodes
 
 static BYTE DECLSPEC_ALIGN(4096) code_buffer[0x1000];
 
+/* The far jump to 32-bit code loads CS only. On AMD processors the attributes of SS (the 32-bit stack, its size and limit) are not reloaded
+ * when the kernel returns to user mode with SYSRET, so SS can still hold what the last 64-bit code left in it: the first stack access in
+ * 32-bit code, the "ret" of the system call stub, then faults with a stack-segment fault (#SS, seen as an access violation at the address
+ * of the instruction). Linux works around it in its kernel (X86_BUG_SYSRET_SS_ATTRS); Haiku does not, so SS is loaded here, right before
+ * the jump. The selector is the one SS has already, so this changes nothing on a processor that does not need it. */
+#define RELOAD_SS_ASM "movl ss32_sel(%rip),%edx\n\t" \
+                      "movw %dx,%ss\n\t"
+
 UINT cs32_sel = 0;
 UINT ss32_sel = 0;
 
@@ -208,6 +216,7 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movl %edx,(%rsp)\n\t"
                    "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
                    "movl %edx,4(%rsp)\n\t"
+                   RELOAD_SS_ASM
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
                    "ljmp *(%r14)\n"
@@ -272,6 +281,7 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
                    "movl %edx,(%rsp)\n\t"
                    "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
                    "movl %edx,4(%rsp)\n\t"
+                   RELOAD_SS_ASM
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
                    "ljmp *(%r14)" )
