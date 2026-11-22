@@ -991,8 +991,41 @@ void HaikuSurface::HandleCommit()
 			if (fState.buffer == NULL && !viewLocked->IsHidden(viewLocked)) viewLocked->Hide();
 			else if (fState.buffer != NULL && viewLocked->IsHidden(viewLocked)) viewLocked->Show();
 		}
+		// A buffer without an alpha channel covers its whole rectangle, so the view does not need B_TRANSPARENT_BACKGROUND, which
+		// makes app_server draw the parent behind it on every draw (for a Wine window: the whole mostly white toplevel before each
+		// frame of the content). Off unless HAIWAY_OPAQUE_VIEWS is set: tested with Telegram, Steam, Splitgate and a Vulkan test
+		// program; menus and popups have an alpha channel and keep the parent.
+		static const bool opaqueViews = getenv("HAIWAY_OPAQUE_VIEWS") != NULL;
+		if (opaqueViews) {
+			BBitmap *ob = Bitmap();
+			bool alpha = true;
+			if (ob != NULL) {
+				switch (ob->ColorSpace()) {
+					case B_RGBA64: case B_RGBA32: case B_RGBA15: case B_RGBA64_BIG: case B_RGBA32_BIG: case B_RGBA15_BIG:
+						break;
+					default:
+						alpha = false;
+						break;
+				}
+			}
+			uint32 flags = viewLocked->Flags();
+			uint32 want = alpha ? (flags | B_TRANSPARENT_BACKGROUND) : (flags & ~B_TRANSPARENT_BACKGROUND);
+			if (want != flags) {
+				viewLocked->SetFlags(want);
+			}
+		}
 		BSize size = Size();
 		viewLocked->ResizeTo(size.width, size.height);
+		if (opaqueViews && (size.width != fLastCommitSize.width || size.height != fLastCommitSize.height)) {
+			// The surface changed its size: what is around it (the parent) has to be drawn again as well, since nobody else
+			// invalidates the part that is new
+			BView *parent = viewLocked->Parent();
+			if (parent != NULL) {
+				parent->Invalidate();
+			}
+			viewLocked->Invalidate();
+		}
+		fLastCommitSize = size;
 		Invalidate();
 	}
 	DumpSurfaceIfRequested(this, Bitmap(), fSubsurface != NULL);

@@ -104,6 +104,7 @@ private:
 	uint32 fPendingFields{};
 	BRegion fDirty;
 	WaylandView *fView{};
+	BSize fLastCommitSize{-1, -1};   // size at the last commit, to see a resize (HAIWAY_OPAQUE_VIEWS, see HandleCommit())
 	volatile bool fVSyncActive{};   // drawn in step with the vertical retrace (see Invalidate()): its frame callbacks come after the draw
 	volatile bigtime_t fLastDrawTime{};
 	HaikuXdgSurface *fXdgSurface{};
