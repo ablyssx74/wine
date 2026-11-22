@@ -494,7 +494,11 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
     {
         HKEY keyprop;
         RegSetValueExW(key, L"DeviceState", 0, REG_DWORD, (const BYTE*)&state, sizeof(DWORD));
-        if (!RegCreateKeyExW(key, L"Properties", 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &keyprop, NULL))
+        /* a device that is not present (loaded back from the registry) keeps the properties it has: its drv_id is its old
+         * friendly name, and writing it back wrapped the name once more in "Microphone (...)" in every process that
+         * loaded the list - after a hundred starts the name was 2400 bytes and apps with a fixed buffer crashed */
+        if (state != DEVICE_STATE_NOTPRESENT &&
+            !RegCreateKeyExW(key, L"Properties", 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &keyprop, NULL))
         {
             PROPVARIANT pv;
             WCHAR *type;
