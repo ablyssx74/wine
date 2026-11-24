@@ -548,6 +548,54 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 }
 
 
+#ifdef __HAIKU__
+/* The programs of Wine run with mimalloc (LD_PRELOAD, see haiku_load_mimalloc in loader/main.c) and the environment passes it on to
+ * every program that Wine starts. A native program that gets it (the browser of winebrowser, xdg-open, ...) runs Haiku's libraries
+ * with mimalloc in front of Haiku's allocator and crashes: Firefox, started by Claude's sign-in, died in operator delete() under
+ * BResources::Unset() while it loaded a library. Returns a copy of the environment for such a program: mimalloc taken out of
+ * LD_PRELOAD, and the variables that haiku_load_mimalloc sets (WINE_HAIKU_MIMALLOC_DONE, MIMALLOC_ARENA_*) left out, so that a
+ * Wine program started this way sets mimalloc up again by itself. *ld gets the new LD_PRELOAD string; free both. NULL when the copy
+ * could not be made: the caller then uses environ as before. */
+static char **haiku_native_environ( char **ld )
+{
+    extern char **environ;
+    char **env;
+    size_t n, i, j;
+
+    *ld = NULL;
+    for (n = 0; environ[n]; n++) ;
+    if (!(env = malloc( (n + 1) * sizeof(*env) ))) return NULL;
+    for (i = j = 0; i < n; i++)
+    {
+        const char *e = environ[i];
+
+        if (!strncmp( e, "WINE_HAIKU_MIMALLOC_DONE=", 25 ) || !strncmp( e, "MIMALLOC_ARENA_EAGER_COMMIT=", 28 ) ||
+            !strncmp( e, "MIMALLOC_ARENA_RESERVE=", 23 )) continue;
+        if (!strncmp( e, "LD_PRELOAD=", 11 ) && strstr( e, "libmimalloc" ))
+        {
+            char *list = strdup( e + 11 ), *tok, *save = NULL;
+
+            if (!list || !(*ld = calloc( 1, strlen( e ) + 1 ))) { free( list ); free( *ld ); *ld = NULL; free( env ); return NULL; }
+            strcpy( *ld, "LD_PRELOAD=" );
+            for (tok = strtok_r( list, ": ", &save ); tok; tok = strtok_r( NULL, ": ", &save ))
+            {
+                if (strstr( tok, "libmimalloc" )) continue;
+                if ((*ld)[11]) strcat( *ld, ":" );
+                strcat( *ld, tok );
+            }
+            free( list );
+            if ((*ld)[11]) env[j++] = *ld;
+            else { free( *ld ); *ld = NULL; }
+            continue;
+        }
+        env[j++] = environ[i];
+    }
+    env[j] = NULL;
+    return env;
+}
+#endif
+
+
 /***********************************************************************
  *           __wine_unix_spawnvp
  */
@@ -555,6 +603,9 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 {
     pid_t pid, wret;
     int fd[2], status, err;
+#ifdef __HAIKU__
+    char *native_ld = NULL, **native_env = haiku_native_environ( &native_ld );
+#endif
 
 #ifdef __HAIKU__
     if (!getenv( "WINE_HAIKU_FORK_SPAWN" ))
@@ -569,8 +620,10 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
         sigaddset( &sigdef, SIGPIPE );
         posix_spawnattr_setsigdefault( &attr, &sigdef );
         posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETSIGDEF );
-        err = posix_spawnp( &pid, argv[0], NULL, &attr, argv, environ );
+        err = posix_spawnp( &pid, argv[0], NULL, &attr, argv, native_env ? native_env : environ );
         posix_spawnattr_destroy( &attr );
+        free( native_env );
+        free( native_ld );
         if (err) return errno_to_status( err );
         if (!wait)
         {
@@ -608,6 +661,9 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
         /* in child */
         close( fd[0] );
         signal( SIGPIPE, SIG_DFL );
+#ifdef __HAIKU__
+        if (native_env) { extern char **environ; environ = native_env; }
+#endif
         if (!wait)
         {
             if (!(pid = fork())) execvp( argv[0], argv ); /* in grandchild */
@@ -620,6 +676,10 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
         _exit(1);
     }
     close( fd[1] );
+#ifdef __HAIKU__
+    free( native_env );
+    free( native_ld );
+#endif
 
     if (pid != -1)
     {
