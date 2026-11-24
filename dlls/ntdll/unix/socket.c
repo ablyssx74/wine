@@ -819,6 +819,16 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
     }
     hdr.msg_iov = async->iov;
     hdr.msg_iovlen = async->count;
+#ifdef __HAIKU__
+    /* Haiku's recvmsg fails with EFAULT for an iovec with a NULL base, even when its length is 0; libuv does a
+     * zero-length receive like that on a socket that is still connecting. */
+    {
+        static char haiku_dummy_byte;
+        unsigned int i;
+        for (i = 0; i < async->count; i++)
+            if (!async->iov[i].iov_base) async->iov[i].iov_base = &haiku_dummy_byte;
+    }
+#endif
 #if 0
     hdr.msg_control = control_buffer;
     hdr.msg_controllen = sizeof(control_buffer);
