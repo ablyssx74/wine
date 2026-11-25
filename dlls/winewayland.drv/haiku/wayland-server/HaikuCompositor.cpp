@@ -1,3 +1,4 @@
+#include "HaikuTransparentWindow.h"
 #include "HaikuPointerExtras.h"
 #include "HaikuCompositor.h"
 #include "HaikuPointerExtras.h"
@@ -1028,6 +1029,33 @@ void HaikuSurface::HandleCommit()
 			uint32 want = alpha ? (flags | B_TRANSPARENT_BACKGROUND) : (flags & ~B_TRANSPARENT_BACKGROUND);
 			if (want != flags) {
 				viewLocked->SetFlags(want);
+			}
+		}
+		// A borderless window whose own surface has an alpha channel (a menu of Telegram, with rounded corners and a shadow) is
+		// shown through app_server's compositor by that alpha: B_TRANSPARENT_WINDOW. Without it the clear pixels around the shape
+		// show as a white box. Only on a composited desktop (RenkuOS); a window with a frame, or one that covers the screen, is never
+		// made see-through. HAIWAY_TRANSPARENT_POPUPS=0 or =1 decides it either way.
+		if (fSubsurface == NULL && HaiwayTransparentWindowFlag() != 0) {
+			BWindow *window = viewLocked->Window();
+			BBitmap *tb = Bitmap();
+			if (window != NULL && tb != NULL) {
+				bool alpha = false;
+				switch (tb->ColorSpace()) {
+					case B_RGBA64: case B_RGBA32: case B_RGBA15: case B_RGBA64_BIG: case B_RGBA32_BIG: case B_RGBA15_BIG:
+						alpha = true;
+						break;
+					default:
+						break;
+				}
+				BScreen screen(window);
+				bool coversScreen = screen.IsValid() && window->Frame().Width() >= screen.Frame().Width()
+					&& window->Frame().Height() >= screen.Frame().Height();
+				bool want = alpha && window->Look() == B_NO_BORDER_WINDOW_LOOK && !coversScreen;
+				uint32 flags = window->Flags();
+				uint32 wanted = want ? (flags | kHaiwayTransparentWindow) : (flags & ~kHaiwayTransparentWindow);
+				if (wanted != flags) {
+					window->SetFlags(wanted);
+				}
 			}
 		}
 		BSize size = Size();
