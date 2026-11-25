@@ -3245,6 +3245,41 @@ static BOOL get_system_config_tz_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi, i
     return get_tz_info_from_zoneinfo_name( tzi, path + len + 1, year );
 }
 
+#ifdef __HAIKU__
+/* Haiku has no TZ, no /etc/localtime and no zoneinfo directory, so get_system_config_tz_info() never finds the zone, and find_reg_tz_info()
+ * searched every zone of the registry (about 1000 requests to the server, 12 for each of 82 zones) in every process that asked for the
+ * time zone. The prefix already names its current zone (TimeZoneKeyName, which wineboot and RtlSetTimeZoneInformation keep): try that one
+ * first. The caller accepts it only if it matches what the system says, and searches the registry as before if not. */
+static BOOL get_hint_tz_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi, int year )
+{
+    static const WCHAR tz_info_keyW[] = { '\\','R','e','g','i','s','t','r','y','\\','M','a','c','h','i','n','e','\\',
+        'S','y','s','t','e','m','\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t','\\',
+        'C','o','n','t','r','o','l','\\','T','i','m','e','Z','o','n','e','I','n','f','o','r','m','a','t','i','o','n',0 };
+    static const WCHAR key_nameW[] = { 'T','i','m','e','Z','o','n','e','K','e','y','N','a','m','e',0 };
+    UNICODE_STRING key_name, win_name;
+    OBJECT_ATTRIBUTES attr;
+    WCHAR win_nameW[120];
+    HANDLE key;
+    BOOL ret;
+
+    init_unicode_string( &key_name, tz_info_keyW );
+    InitializeObjectAttributes( &attr, &key_name, 0, NULL, NULL );
+    if (NtOpenKey( &key, KEY_READ, &attr )) return FALSE;
+    memset( win_nameW, 0, sizeof(win_nameW) );
+    ret = reg_query_value( key, key_nameW, REG_SZ, win_nameW, sizeof(win_nameW) - sizeof(WCHAR) );
+    NtClose( key );
+    if (!ret || !win_nameW[0]) return FALSE;
+
+    init_unicode_string( &key_name, Time_ZonesW );
+    if (NtOpenKey( &key, KEY_READ, &attr )) return FALSE;
+    init_unicode_string( &win_name, win_nameW );
+    ret = read_reg_tz_info( key, &win_name, year, tzi );
+    NtClose( key );
+    if (ret) TRACE( "the hint zone %s: bias %d\n", debugstr_w(win_nameW), tzi->Bias );
+    return ret;
+}
+#endif
+
 static LONG64 get_current_tz_bias(void)
 {
     ULONG high, low;
@@ -3389,6 +3424,19 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
         }
         WARN( "System config TZ info didn't match guessed parameters, falling back to search.\n" );
     }
+#ifdef __HAIKU__
+    if (get_hint_tz_info( &reg_tzi, current_year + 1900 ))
+    {
+        if (match_tz_info( tzi, &reg_tzi ))
+        {
+            TRACE( "the hint zone matches\n" );
+            cached_tzi = *tzi = reg_tzi;
+            mutex_unlock( &timezone_mutex );
+            return;
+        }
+        TRACE( "the hint zone does not match, searching the registry\n" );
+    }
+#endif
     find_reg_tz_info(tzi, current_year + 1900);
     cached_tzi = *tzi;
     mutex_unlock( &timezone_mutex );
