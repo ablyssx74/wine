@@ -379,7 +379,22 @@ static inline HWND get_active_window(void)
  *
  * Check if a given window should be managed
  */
-static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+/* Whether a window of this process that has a Wayland surface is the owner hint of a window. */
+static BOOL owner_hint_has_surface(HWND owner_hint)
+{
+    struct wayland_win_data *data;
+    BOOL ret = FALSE;
+
+    if (!owner_hint) return FALSE;
+    if ((data = wayland_win_data_get(owner_hint)))
+    {
+        ret = data->wayland_surface != NULL;
+        wayland_win_data_release(data);
+    }
+    return ret;
+}
+
+static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen, HWND owner_hint)
 {
     DWORD style, ex_style;
 
@@ -391,7 +406,15 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
      * thinks it is where it asked for it. The pointer position that Wine works out for it is then wrong and Steam's menus
      * closed as the mouse entered them. As a subsurface of its owner it is placed where it was asked to be. */
     if ((style & WS_POPUP) && !(style & (WS_CAPTION|WS_THICKFRAME|WS_SYSMENU)) && !fullscreen &&
-        NtUserGetWindowRelative(hwnd, GW_OWNER) &&
+        (NtUserGetWindowRelative(hwnd, GW_OWNER) ||
+#ifdef __HAIKU__
+         /* Qt's menus have no owner: the window under the corner of the menu (the owner hint) is the one it opens from. Active, such
+          * a menu was managed, a top-level that the compositor put in the middle of the screen until it was no longer active. */
+         owner_hint_has_surface(owner_hint)
+#else
+         FALSE
+#endif
+         ) &&
         !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW)) return FALSE;
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
@@ -462,7 +485,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* Get the managed state with win_data unlocked, as is_window_managed
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
-    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen, owner_hint)) && surface) owner = owner_hint;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
