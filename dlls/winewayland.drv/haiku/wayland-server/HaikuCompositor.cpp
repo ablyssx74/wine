@@ -17,6 +17,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <map>
+#include <dlfcn.h>
+#include <string.h>
 
 #include "AppKitPtrs.h"
 #include <Application.h>
@@ -47,6 +49,19 @@ static void Assert(bool cond) {if (!cond) abort();}
 // global Wayland lock that the windows' input handling needs too (waiting there made the games lag and stopped the mouse look short).
 // The frame callbacks of such a surface are sent after it was drawn, not by the pulse timer. It needs a display driver with a retrace
 // semaphore (BScreen::WaitForRetrace() works) and turns itself off with a message otherwise.
+// HAIWAY_OPAQUE_VIEWS: "0" never, anything else always; not set: only on a composited desktop (RenkuOS: is_composited_desktop() is looked
+// up by name, Haiku does not have it).
+static bool
+OpaqueViewsWanted()
+{
+	const char *env = getenv("HAIWAY_OPAQUE_VIEWS");
+	if (env != NULL)
+		return strcmp(env, "0") != 0;
+	bool (*isComposited)() = (bool (*)())dlsym(RTLD_DEFAULT, "is_composited_desktop");
+	return isComposited != NULL && isComposited();
+}
+
+
 // HAIWAY_VSYNC: "off" (never), "all" (every surface that requested a frame callback), anything else or not set (on): the ones that cover
 // at least 60 percent of the screen.
 static const uint32 kVSyncMessage = 'HVsy';
@@ -993,9 +1008,10 @@ void HaikuSurface::HandleCommit()
 		}
 		// A buffer without an alpha channel covers its whole rectangle, so the view does not need B_TRANSPARENT_BACKGROUND, which
 		// makes app_server draw the parent behind it on every draw (for a Wine window: the whole mostly white toplevel before each
-		// frame of the content). Off unless HAIWAY_OPAQUE_VIEWS is set: tested with Telegram, Steam, Splitgate and a Vulkan test
-		// program; menus and popups have an alpha channel and keep the parent.
-		static const bool opaqueViews = getenv("HAIWAY_OPAQUE_VIEWS") != NULL;
+		// frame of the content). On when the desktop is composited (RenkuOS) and off on Haiku, where nothing shows a frame built
+		// between the two draws; HAIWAY_OPAQUE_VIEWS=1 or =0 decides it either way. Tested with Telegram, Steam, Splitgate and a
+		// Vulkan test program on RenkuOS; menus and popups have an alpha channel and keep the parent.
+		static const bool opaqueViews = OpaqueViewsWanted();
 		if (opaqueViews) {
 			BBitmap *ob = Bitmap();
 			bool alpha = true;
