@@ -93,11 +93,15 @@ void XdgSurfaceHook::HandleCommit()
 
 	// initial window show
 	if (!fXdgSurface->fSurfaceInitalized && fXdgSurface->Surface()->Bitmap() != NULL) {
-		if (fXdgSurface->Surface()->ServerDecoration() != NULL) {
+		if (fXdgSurface->Surface()->ServerDecoration() != NULL
+			&& (fXdgSurface->fToplevel == NULL || !fXdgSurface->fToplevel->AtPoint())) {
 			fXdgSurface->Window()->SetLook(fXdgSurface->Surface()->ServerDecoration()->Look());
 		}
 		if (fXdgSurface->fToplevel != NULL) {
-			fXdgSurface->Window()->CenterOnScreen();
+			if (fXdgSurface->fToplevel->AtPoint())
+				fXdgSurface->fToplevel->MoveToPoint();
+			else
+				fXdgSurface->Window()->CenterOnScreen();
 		}
 		fXdgSurface->Window()->Show();
 		fXdgSurface->fSurfaceInitalized = true;

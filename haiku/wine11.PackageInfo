@@ -1,12 +1,13 @@
 name			wine11
-version		11.20-83
+version		11.20-84
 architecture	x86_64
 summary		"Run Windows programs on Haiku and RenkuOS (Wine 11.20, experimental)"
 description		"Wine 11.20 with a Haiku port, for running Windows programs on 64-bit Haiku and RenkuOS. This is an
 experimental port: some programs do not work, and programs that use the graphics card have hung or frozen the whole
 system. It is offered as it is.
 
-What works: 64-bit programs, windows and menus, sound playing and recording, MIDI, OpenGL, and Direct3D through DXVK.
+What works: 64-bit programs, windows and menus, tray icons (in the Deskbar), sound playing and recording, MIDI,
+OpenGL, and Direct3D through DXVK.
 
 Before the first use, run `wineboot -u` and then `wineserver -w` to make a prefix. Programs open with a double-click
 through Wine Launcher.

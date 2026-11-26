@@ -387,15 +387,28 @@ void HaikuSeatGlobal::SetKeyboardFocus(HaikuSurface *surface, bool setFocus)
 	}
 }
 
-void HaikuSeatGlobal::DoTrack(TrackId id, const TrackInfo &info)
+// A click outside a popup of the client (HaikuPopupWatch.cpp): a "leave" with serial 0, which only Wine's driver reads so.
+void HaikuSeatGlobal::DismissPopup(HaikuSurface *surface)
+{
+	for (HaikuKeyboard *keyboard = fKeyboardIfaces.First(); keyboard != NULL; keyboard = fKeyboardIfaces.GetNext(keyboard)) {
+		if (keyboard->Client() != surface->Client()) continue;
+		keyboard->SendLeave(0, surface->ToResource());
+	}
+}
+
+void HaikuSeatGlobal::DoTrack(TrackId id, const TrackInfo &info, HaikuSurface *target)
 {
 	if (fTrack.id != trackClient || fOldMouseBtns == 0 || fPointerFocus == NULL) return;
+	if (target == NULL)
+		target = fPointerFocus;
+	if (target->View() == NULL || target->XdgSurface() == NULL || target->Client() != fPointerFocus->Client()) return;
+	fTrack.target = target;
 	SetPointerFocus(fPointerFocus, BMessage(), id);
 	fTrack.info = info;
 	switch (id) {
 		case trackMove: {
 			fTrack.moveStartScreen = fTrack.lastScreen;
-			fTrack.moveStartWin = fPointerFocus->View()->Window()->Frame().LeftTop();
+			fTrack.moveStartWin = fTrack.target->View()->Window()->Frame().LeftTop();
 			fTrack.statEvents = fTrack.statSkipped = 0;
 			fTrack.statMoveUs = 0;
 			fTrack.statStart = system_time();
@@ -404,16 +417,16 @@ void HaikuSeatGlobal::DoTrack(TrackId id, const TrackInfo &info)
 			break;
 		}
 		case trackResize: {
-			auto geometry = fPointerFocus->XdgSurface()->Geometry();
+			auto geometry = fTrack.target->XdgSurface()->Geometry();
 			fTrack.wndWidth = geometry.width;
 			fTrack.wndHeight = geometry.height;
 			// the resize works from where the pointer is on the screen, and from the window as it was when it began
 			fTrack.moveStartScreen = fTrack.lastScreen;
-			fTrack.moveStartWin = fPointerFocus->View()->Window()->Frame().LeftTop();
+			fTrack.moveStartWin = fTrack.target->View()->Window()->Frame().LeftTop();
 			fTrack.lastMoveTo = fTrack.moveStartWin;
 			fTrack.lastResizeW = fTrack.wndWidth;
 			fTrack.lastResizeH = fTrack.wndHeight;
-			fPointerFocus->XdgSurface()->ClearConfigurePending();
+			fTrack.target->XdgSurface()->ClearConfigurePending();
 			break;
 		}
 	}
@@ -589,7 +602,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 			if (fTrack.id == trackMove && fTrack.haveScreen) {
 				BPoint target(fTrack.moveStartWin.x + (fTrack.lastScreen.x - fTrack.moveStartScreen.x),
 					fTrack.moveStartWin.y + (fTrack.lastScreen.y - fTrack.moveStartScreen.y));
-				if (target != fTrack.lastMoveTo) fPointerFocus->View()->Window()->MoveTo(target);
+				if (target != fTrack.lastMoveTo) fTrack.target->View()->Window()->MoveTo(target);
 			}
 			if (fTrack.id == trackMove && getenv("WINE_HAIKU_MOVE_STATS") != NULL) {
 				fprintf(stderr, "wayland move: %u events, %u coalesced, %u MoveTo avg %lld us, drag %lld ms\n",
@@ -599,7 +612,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 			}
 			if (fTrack.id == trackResize && fTrack.haveScreen) {
 				// the interactive resize ends: the client is told with a configure that no longer says "resizing"
-				HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();
+				HaikuXdgSurface *xdgSurface = fTrack.target->XdgSurface();
 				if (xdgSurface != NULL && xdgSurface->Toplevel() != NULL)
 					xdgSurface->Toplevel()->EndInteractiveResize(fTrack.lastResizeW, fTrack.lastResizeH);
 			}
@@ -661,7 +674,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					break;
 				}
 				case trackMove: {
-					BWindow *window = fPointerFocus->View()->Window();
+					BWindow *window = fTrack.target->View()->Window();
 					fTrack.statEvents++;
 					if (fTrack.haveScreen) {
 						// Newer pointer events already queued: the window only needs to
@@ -691,7 +704,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					if (fTrack.haveScreen) {
 						// Every edge and corner: the size follows the pointer (as far as the screen position tells) and for the left and
 						// top edges the window also moves, so that the opposite edge stays where it was.
-						HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();
+						HaikuXdgSurface *xdgSurface = fTrack.target->XdgSurface();
 						XdgToplevel::ResizeEdge edge = fTrack.info.resizeEdge;
 						bool left = edge == XdgToplevel::resizeEdgeLeft || edge == XdgToplevel::resizeEdgeTopLeft || edge == XdgToplevel::resizeEdgeBottomLeft;
 						bool right = edge == XdgToplevel::resizeEdgeRight || edge == XdgToplevel::resizeEdgeTopRight || edge == XdgToplevel::resizeEdgeBottomRight;
@@ -723,7 +736,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 							BPoint target(fTrack.moveStartWin.x + (left ? fTrack.wndWidth - newWidth : 0),
 								fTrack.moveStartWin.y + (top ? fTrack.wndHeight - newHeight : 0));
 							if (target != fTrack.lastMoveTo) {
-								fPointerFocus->View()->Window()->MoveTo(target);
+								fTrack.target->View()->Window()->MoveTo(target);
 								fTrack.lastMoveTo = target;
 							}
 						}
@@ -744,11 +757,11 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 					}
 					switch (fTrack.info.resizeEdge) {
 						case XdgToplevel::resizeEdgeTopLeft: {
-							HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();
+							HaikuXdgSurface *xdgSurface = fTrack.target->XdgSurface();
 							HaikuXdgSurface::GeometryInfo oldGeometry = xdgSurface->Geometry();
 							if (!xdgSurface->SetConfigurePending()) true;
 
-							fPointerFocus->View()->Window()->MoveBy(where.x - fTrack.origin.x, where.y - fTrack.origin.y);
+							fTrack.target->View()->Window()->MoveBy(where.x - fTrack.origin.x, where.y - fTrack.origin.y);
 
 							uint32_t arrayData[] = {XdgToplevel::stateResizing};
 							struct wl_array array {
@@ -764,7 +777,7 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 							break;
 						}
 						case XdgToplevel::resizeEdgeBottomRight: {
-							HaikuXdgSurface *xdgSurface = fPointerFocus->XdgSurface();
+							HaikuXdgSurface *xdgSurface = fTrack.target->XdgSurface();
 							HaikuXdgSurface::GeometryInfo oldGeometry = xdgSurface->Geometry();
 							if (!xdgSurface->SetConfigurePending()) true;
 

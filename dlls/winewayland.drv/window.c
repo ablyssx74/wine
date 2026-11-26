@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -180,6 +181,17 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
+#ifdef __HAIKU__
+/* An undecorated popup that is not managed: a menu or a tooltip. */
+static BOOL is_unmanaged_popup(struct wayland_win_data *data)
+{
+    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+
+    return !data->managed && !data->is_fullscreen && (style & WS_POPUP) &&
+           !(style & (WS_CAPTION|WS_THICKFRAME|WS_SYSMENU));
+}
+#endif
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
 {
     struct wayland_surface *surface;
@@ -192,6 +204,12 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
+
+#ifdef __HAIKU__
+    /* The menu of a tray icon belongs to a window that is not shown: as its subsurface it was never drawn. */
+    if (owner_surface && owner_surface->role == WAYLAND_SURFACE_ROLE_NONE && is_unmanaged_popup(data))
+        owner_surface = NULL;
+#endif
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
@@ -228,6 +246,16 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         wayland_surface_make_toplevel(surface);
+#ifdef __HAIKU__
+        /* A top-level is put in the middle of the screen by the compositor; a popup says where it belongs. */
+        if (surface->xdg_toplevel && is_unmanaged_popup(data))
+        {
+            char app_id[64];
+            snprintf(app_id, sizeof(app_id), "wine-popup@%d,%d", (int)data->rects.visible.left,
+                     (int)data->rects.visible.top);
+            xdg_toplevel_set_app_id(surface->xdg_toplevel, app_id);
+        }
+#endif
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, owner_surface);
@@ -479,6 +507,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct wayland_win_data *data, *owner_data;
     HWND stack_owner;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL had_subsurface = FALSE;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
 
@@ -520,12 +549,25 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             data->wayland_surface = NULL;
         }
     }
-    else if (wayland_win_data_create_wayland_surface(data, owner_surface))
+    else if ((had_subsurface = data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE),
+             wayland_win_data_create_wayland_surface(data, owner_surface))
     {
         /* (only a subsurface has the field: it shares its memory with the pointers of a toplevel) */
         if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
             data->wayland_surface->stack_hwnd = stack_owner != owner ? stack_owner : 0;
         wayland_win_data_update_wayland_state(data);
+#ifdef __HAIKU__
+        /* A window that was drawn before it became a subsurface and is not drawn again would stay empty: the strips around
+         * Telegram's window, drawn once with UpdateLayeredWindow, were never shown. Attach what it has again. */
+        if (!had_subsurface && data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+            data->window_contents && wayland_surface_reconfigure(data->wayland_surface))
+        {
+            HRGN all = NtGdiCreateRectRgn(0, 0, data->window_contents->width, data->window_contents->height);
+            wayland_surface_attach_shm(data->wayland_surface, data->window_contents, all);
+            wl_surface_commit(data->wayland_surface->wl_surface);
+            NtGdiDeleteObjectApp(all);
+        }
+#endif
     }
 
     if (owner_data) wayland_win_data_release(owner_data);
@@ -693,6 +735,26 @@ static void wayland_configure_window(HWND hwnd)
 static __thread int configure_nesting;
 static __thread HWND configure_deferred_hwnd;
 
+#ifdef __HAIKU__
+/* The user clicked outside all of the program's windows while a popup was open: what happens on Windows when another
+ * window becomes active. Menus end, and so do the popups that close when their program is no longer in front. */
+static void wayland_dismiss_popups(HWND hwnd)
+{
+    GUITHREADINFO info = { .cbSize = sizeof(info) };
+    HWND foreground = NtUserGetForegroundWindow();
+    DWORD process = 0;
+
+    TRACE("hwnd=%p foreground=%p\n", hwnd, foreground);
+
+    if (NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) && info.hwndCapture)
+        NtUserMessageCall(info.hwndCapture, WM_CANCELMODE, 0, 0, 0, NtUserSendNotifyMessage, FALSE);
+    NtUserMessageCall(hwnd, WM_CANCELMODE, 0, 0, 0, NtUserSendNotifyMessage, FALSE);
+
+    if (foreground && NtUserGetWindowThread(foreground, &process) && process == GetCurrentProcessId())
+        NtUserSetForegroundWindow(NtUserGetDesktopWindow());
+}
+#endif
+
 /**********************************************************************
  *           WAYLAND_WindowMessage
  */
@@ -731,6 +793,11 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_WAYLAND_SET_FOREGROUND:
         NtUserSetForegroundWindowInternal(hwnd);
         return 0;
+#ifdef __HAIKU__
+    case WM_WAYLAND_DISMISS_POPUP:
+        wayland_dismiss_popups(hwnd);
+        return 0;
+#endif
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;
@@ -787,6 +854,14 @@ void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
     struct wayland_win_data *data;
 
     TRACE("hwnd=%p icon=%p ii=%p icon_small=%p ii_small=%p\n", hwnd, icon, ii, icon_small, ii_small);
+
+#ifdef __HAIKU__
+    /* the icon of one of the program's main windows is the program's, for a dock to show */
+    if (ii && !NtUserGetWindowRelative(hwnd, GW_OWNER) &&
+        ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION ||
+         (NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW)))
+        wayland_haiku_save_icon(ii);
+#endif
 
     if (process_wayland.xdg_toplevel_icon_manager_v1)
     {
@@ -853,6 +928,7 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
     LRESULT ret = -1;
     WPARAM command = wparam & 0xfff0;
     uint32_t button_serial;
+    HWND focus;
     struct wl_seat *wl_seat;
     struct wayland_surface *surface;
     struct wayland_win_data *data;
@@ -861,11 +937,17 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
           (long)command, hwnd, (long)wparam, lparam);
 
     pthread_mutex_lock(&process_wayland.pointer.mutex);
-    if (process_wayland.pointer.focused_hwnd == hwnd)
-        button_serial = process_wayland.pointer.button_serial;
-    else
-        button_serial = 0;
+    focus = process_wayland.pointer.focused_hwnd;
+    button_serial = process_wayland.pointer.button_serial;
     pthread_mutex_unlock(&process_wayland.pointer.mutex);
+    if (focus != hwnd)
+    {
+#ifdef __HAIKU__
+        /* a program that draws its own frame resizes its window from thin windows around it that it owns (Telegram) */
+        if (!focus || NtUserGetWindowRelative(focus, GW_OWNER) != hwnd)
+#endif
+        button_serial = 0;
+    }
 
     if (command == SC_MOVE || command == SC_SIZE)
     {

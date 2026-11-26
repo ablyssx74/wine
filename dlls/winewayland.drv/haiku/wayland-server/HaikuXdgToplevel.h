@@ -1,5 +1,6 @@
 #pragma once
 #include "XdgShell.h"
+#include <Point.h>
 #include <Rect.h>
 
 
@@ -16,6 +17,11 @@ private:
 
 	HaikuXdgSurface *fXdgSurface{};
 	WaylandWindow *fWindow{};
+
+	// a popup that Wine could not attach to a window of the program (a tray icon's menu: its owner is hidden), to be shown
+	// at the point of the screen that Wine asked for; set by the app id "wine-popup@x,y"
+	bool fAtPoint = false;
+	BPoint fPoint;
 
 	bool fSizeLimitsDirty = false;
 	int32_t fMinWidth = 0, fMinHeight = 0;
@@ -46,6 +52,8 @@ public:
 	void MaxSize(int32_t &width, int32_t &height) {width = fMaxWidth; height = fMaxHeight;}
 	void DoSendConfigure();
 	void EndInteractiveResize(int32_t width, int32_t height);
+	bool AtPoint() const {return fAtPoint;}
+	void MoveToPoint();
 
 	void HandleSetParent(struct wl_resource *parent) override;
 	void HandleSetTitle(const char *title) override;

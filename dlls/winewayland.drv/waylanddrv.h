@@ -71,6 +71,7 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    WM_WAYLAND_DISMISS_POPUP,
 };
 
 enum wayland_surface_config_state
@@ -406,6 +407,16 @@ void wayland_win_data_release(struct wayland_win_data *data);
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+#ifdef __HAIKU__
+#include "shellapi.h"
+/* tray icons (systray_haiku.c) */
+LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data);
+void WAYLAND_CleanupIcons(HWND hwnd);
+int wayland_haiku_tray_fd(void);
+void wayland_haiku_tray_dispatch(void);
+void wayland_haiku_save_icon(const ICONINFO *info);
+#endif
+
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void wayland_window_init(void);
 

@@ -81,6 +81,7 @@ private:
 		int32_t wndWidth, wndHeight;
 		int32_t lastResizeW, lastResizeH;
 		TrackInfo info;
+		HaikuSurface *target;
 	};
 
 	uint32_t fSerial = 1;
@@ -105,7 +106,9 @@ public:
 	void SetPointerFocus(HaikuSurface *surface, const BMessage &msg, TrackId trackId);
 	void SetPointerFocus(HaikuSurface *surface, bool setFocus, const BMessage &msg, TrackId trackId = trackClient);
 	void SetKeyboardFocus(HaikuSurface *surface, bool setFocus);
-	void DoTrack(TrackId id, const TrackInfo &info = {});
+	void DismissPopup(HaikuSurface *surface);
+	// target: the top-level that a move or resize works on (the pointer may be on a subsurface of it)
+	void DoTrack(TrackId id, const TrackInfo &info = {}, HaikuSurface *target = NULL);
 	bool MessageReceived(HaikuSurface *surface, BMessage *msg);
 	void UpdateKeymap();
 };

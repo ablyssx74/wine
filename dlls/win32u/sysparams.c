@@ -5974,6 +5974,36 @@ static char *get_app_compat_flags( const WCHAR *appname )
     return compat_flags;
 }
 
+#ifdef __HAIKU__
+/* The size of a small icon that this program is told, when it is not the usual one: a program draws its tray icon at that
+ * size, and a dock shows tray icons much larger than the Windows tray does. From the registry, per program:
+ * HKCU\Software\Wine\AppDefaults\app.exe\Haiku, "SmallIconSize" (REG_DWORD); wine.inf sets it for Telegram. */
+static int haiku_small_icon_size;
+
+static void haiku_read_small_icon_size( HKEY app_defaults, const WCHAR *appname )
+{
+    static const WCHAR haikuW[] = {'\\','H','a','i','k','u',0};
+    static const WCHAR sizeW[] = {'S','m','a','l','l','I','c','o','n','S','i','z','e',0};
+    char buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(DWORD)])];
+    KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
+    WCHAR name[MAX_PATH + 8];
+    unsigned int length = lstrlenW( appname );
+    HKEY key;
+    DWORD size;
+
+    if (length >= MAX_PATH) return;
+    memcpy( name, appname, length * sizeof(WCHAR) );
+    memcpy( name + length, haikuW, sizeof(haikuW) );
+    if (!(key = reg_open_key( app_defaults, name, lstrlenW( name ) * sizeof(WCHAR) ))) return;
+    if (query_reg_value( key, sizeW, value, sizeof(buffer) ) && value->Type == REG_DWORD)
+    {
+        memcpy( &size, value->Data, sizeof(size) );
+        if (size >= 16 && size <= 256) haiku_small_icon_size = size;
+    }
+    NtClose( key );
+}
+#endif
+
 void sysparams_init(void)
 {
     WCHAR buffer[MAX_PATH+16], *p, *appname;
@@ -6066,6 +6096,9 @@ void sysparams_init(void)
         /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe\X11 Driver */
         if ((tmpkey = reg_open_hkcu_key( "Software\\Wine\\AppDefaults" )))
         {
+#ifdef __HAIKU__
+            haiku_read_small_icon_size( tmpkey, appname );     /* (before the name gets its ending) */
+#endif
             memcpy( appname + i, x11driverW, sizeof(x11driverW) );
             appkey = reg_open_key( tmpkey, appname, lstrlenW( appname ) * sizeof(WCHAR) );
             NtClose( tmpkey );
@@ -7162,6 +7195,9 @@ int get_system_metrics( int index )
         return get_system_metrics( SM_CYMINIMIZED ) + mm.iVertGap;
     case SM_CXSMICON:
     case SM_CYSMICON:
+#ifdef __HAIKU__
+        if (haiku_small_icon_size) return haiku_small_icon_size;
+#endif
         return map_to_dpi( 16, get_system_dpi() ) & ~1;
     case SM_CYSMCAPTION:
         ncm.cbSize = sizeof(ncm);
@@ -7335,6 +7371,9 @@ static int get_system_metrics_for_dpi( int index, unsigned int dpi )
         return im.iVertSpacing;
     case SM_CXSMICON:
     case SM_CYSMICON:
+#ifdef __HAIKU__
+        if (haiku_small_icon_size) return haiku_small_icon_size;
+#endif
         return map_to_dpi( 16, dpi ) & ~1;
     case SM_CYSMCAPTION:
         ncm.cbSize = sizeof(ncm);

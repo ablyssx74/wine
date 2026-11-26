@@ -6,6 +6,7 @@
 #include "HaikuCompositor.h"
 #include "HaikuSeat.h"
 #include "HaikuServerDecoration.h"
+#include "HaikuPopupWatch.h"
 #include "WaylandEnv.h"
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -40,6 +41,7 @@ public:
 	void Minimize(bool minimize) override;
 	void WorkspacesChanged(uint32 oldWorkspace, uint32 newWorkspace) final;
 	void FrameResized(float newWidth, float newHeight) final;
+	void FrameMoved(BPoint newPosition) final;
 	void DispatchMessage(BMessage *msg, BHandler *target) final;
 };
 
@@ -100,6 +102,15 @@ void WaylandWindow::Minimize(bool minimize)
 void WaylandWindow::WorkspacesChanged(uint32 oldWorkspace, uint32 newWorkspace)
 {
 	UpdateRefreshRate();
+}
+
+void WaylandWindow::FrameMoved(BPoint newPosition)
+{
+	WaylandEnv vlEnv(this);
+
+	if (fToplevel == NULL)	// (see WindowActivated)
+		return;
+	fToplevel->XdgSurface()->Surface()->FollowRoot();
 }
 
 void WaylandWindow::FrameResized(float newWidth, float newHeight)
@@ -245,6 +256,33 @@ void HaikuXdgToplevel::HandleSetTitle(const char *title)
 
 void HaikuXdgToplevel::HandleSetAppId(const char *app_id)
 {
+	int x, y;
+	if (app_id == NULL || sscanf(app_id, "wine-popup@%d,%d", &x, &y) != 2)
+		return;
+	fPoint.Set(x, y);
+	if (!fAtPoint) {
+		fAtPoint = true;
+		// a menu: above the other windows (the dock and the Deskbar too), no frame, and the focus stays where it is
+		fWindow->SetLook(B_NO_BORDER_WINDOW_LOOK);
+		fWindow->SetFeel(B_FLOATING_ALL_WINDOW_FEEL);
+		fWindow->SetFlags(fWindow->Flags() | B_AVOID_FOCUS | B_NOT_RESIZABLE | B_NOT_ZOOMABLE);
+		if (fWindow->Lock()) {
+			HaikuWatchPopup(fWindow, XdgSurface()->Surface());
+			fWindow->Unlock();
+		}
+	}
+	if (!fWindow->IsHidden())
+		MoveToPoint();
+}
+
+// Moves the window to the point Wine asked for, kept inside the screen.
+void HaikuXdgToplevel::MoveToPoint()
+{
+	BRect screen = BScreen(fWindow).Frame();
+	BPoint where = fPoint;
+	where.x = std::max(screen.left, std::min(where.x, screen.right - fWindow->Frame().Width()));
+	where.y = std::max(screen.top, std::min(where.y, screen.bottom - fWindow->Frame().Height()));
+	fWindow->MoveTo(where);
 }
 
 void HaikuXdgToplevel::HandleShowWindowMenu(struct wl_resource *seat, uint32_t serial, int32_t x, int32_t y)
@@ -254,13 +292,14 @@ void HaikuXdgToplevel::HandleShowWindowMenu(struct wl_resource *seat, uint32_t s
 void HaikuXdgToplevel::HandleMove(struct wl_resource *_seat, uint32_t serial)
 {
 	HaikuSeat *seat = HaikuSeat::FromResource(_seat);
-	seat->GetGlobal()->DoTrack(HaikuSeatGlobal::trackMove);
+	seat->GetGlobal()->DoTrack(HaikuSeatGlobal::trackMove, {}, XdgSurface()->Surface());
 }
 
 void HaikuXdgToplevel::HandleResize(struct wl_resource *_seat, uint32_t serial, uint32_t edges)
 {
 	HaikuSeat *seat = HaikuSeat::FromResource(_seat);
-	seat->GetGlobal()->DoTrack(HaikuSeatGlobal::trackResize, {.resizeEdge = (XdgToplevel::ResizeEdge)edges});
+	seat->GetGlobal()->DoTrack(HaikuSeatGlobal::trackResize, {.resizeEdge = (XdgToplevel::ResizeEdge)edges},
+		XdgSurface()->Surface());
 }
 
 void HaikuXdgToplevel::HandleSetMaxSize(int32_t width, int32_t height)
@@ -392,6 +431,8 @@ HaikuXdgToplevel *HaikuXdgToplevel::Create(HaikuXdgSurface *xdgSurface, uint32_t
 
 HaikuXdgToplevel::~HaikuXdgToplevel()
 {
+	if (fAtPoint)
+		HaikuForgetPopup(fWindow);
 	fXdgSurface->Surface()->Detach();
 
 	if (fWindow != NULL) {

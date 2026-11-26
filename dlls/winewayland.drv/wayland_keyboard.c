@@ -841,6 +841,15 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
     hwnd = wl_surface_get_user_data(wl_surface);
     TRACE("serial=%u hwnd=%p\n", serial, hwnd);
 
+#ifdef __HAIKU__
+    /* the compositor's way to say that the user clicked outside a popup, which has no focus to lose */
+    if (!serial)
+    {
+        NtUserPostMessage(hwnd, WM_WAYLAND_DISMISS_POPUP, 0, 0);
+        return;
+    }
+#endif
+
     pthread_mutex_lock(&keyboard->mutex);
     if (keyboard->focused_hwnd == hwnd)
         keyboard->focused_hwnd = NULL;

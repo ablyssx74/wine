@@ -133,6 +133,7 @@ public:
 	HaikuSubsurface *Subsurface() {return fSubsurface;}
 	HaikuServerDecoration *ServerDecoration() {return fServerDecoration;}
 	HaikuSubsurface::SurfaceList &SurfaceList() {return fSurfaceList;}
+	void FollowRoot();
 	void AttachWindow(BWindow *window);
 	void AttachView(BView *view);
 	void AttachViewsToEarlierSubsurfaces();

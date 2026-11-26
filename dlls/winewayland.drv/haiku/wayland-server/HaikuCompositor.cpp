@@ -1,6 +1,7 @@
 #include "HaikuTransparentWindow.h"
 #include "HaikuPointerExtras.h"
 #include "HaikuCompositor.h"
+#include "HaikuPopupWatch.h"
 #include "HaikuPointerExtras.h"
 #include "HaikuSubcompositor.h"
 #include "HaikuShm.h"
@@ -544,6 +545,11 @@ void WaylandView::Draw(BRect dirty)
 			remaining.Exclude(&fSurface->fState.opaqueRgn.value());
 			viewLocked->ConstrainClippingRegion(&remaining);
 		}
+		// a see-through window of its own: the surface's alpha is the window's, so it is copied, not laid over what is there
+		if (mode == B_OP_ALPHA && fSurface->fSubWindow != NULL && Parent() == NULL && fSurface->fBackdrop == NULL
+			&& (Window()->Flags() & HaiwayTransparentWindowFlag()) != 0) {
+			mode = B_OP_COPY;
+		}
 		viewLocked->SetDrawingMode(mode);
 		const auto &viewportSrc = fSurface->fState.viewportSrc;
 		const auto &viewportDst = fSurface->fState.viewportDst;
@@ -657,7 +663,9 @@ bool HaikuSurface::NeedsOwnWindow()
 	if (size.width >= 0.9f * rootWidth && size.height >= 0.9f * rootHeight) {
 		return false;
 	}
-	if (ox + size.width < 0 || oy + size.height < 0 || ox > rootWidth || oy > rootHeight) {
+	// (it may also lie right beside it: a program that draws its own frame, like Telegram, resizes its window by thin
+	// strips around it, whose width and height here are one less than their size in pixels, like the root's)
+	if (ox + size.width < -1 || oy + size.height < -1 || ox > rootWidth + 1 || oy > rootHeight + 1) {
 		return false;
 	}
 	return ox < -slack || oy < -slack || ox + size.width > rootWidth + slack || oy + size.height > rootHeight + slack;
@@ -693,7 +701,8 @@ void HaikuSurface::MoveToOwnWindow()
 
 	// the transparent pixels of the surface (the soft shadow and the corners of a menu) show what is under the window: take that from the
 	// screen before the window is there
-	{
+	// (on a composited desktop the window is see-through by itself, and a backdrop would show what was there once)
+	if (HaiwayTransparentWindowFlag() == 0) {
 		BScreen screen;
 		BRect area = window->Frame();
 		if (screen.IsValid() && area.IsValid()) {
@@ -714,6 +723,17 @@ void HaikuSurface::MoveToOwnWindow()
 		window->AddToSubset(rootWindow);
 	}
 	fSubWindow = window;
+	// see-through from the start: the surface may not be committed again
+	if (HaiwayTransparentWindowFlag() != 0 && Bitmap() != NULL) {
+		switch (Bitmap()->ColorSpace()) {
+			case B_RGBA64: case B_RGBA32: case B_RGBA15: case B_RGBA64_BIG: case B_RGBA32_BIG: case B_RGBA15_BIG:
+				window->SetFlags(window->Flags() | HaiwayTransparentWindowFlag());
+				break;
+			default:
+				break;
+		}
+	}
+	HaikuWatchPopup(window, this);
 	window->Show();
 	window->Unlock();
 }
@@ -801,12 +821,32 @@ void HaikuSurface::Detach()
 	if (fSubWindow != NULL) {
 		BWindow *window = fSubWindow;
 		fSubWindow = NULL;
+		HaikuForgetPopup(window);
 		if (window->Lock()) {
 			window->Quit();
 		}
 	}
 	delete fBackdrop;
 	fBackdrop = NULL;
+}
+
+// The window of the surface moved, or the surface was committed: its subsurfaces that have windows of their own go with
+// it, and one that now needs such a window gets it. (A subsurface that is committed before its parent is shown, and then
+// never again, like the strips around Telegram's window, was judged against a parent without a size.)
+void HaikuSurface::FollowRoot()
+{
+	for (HaikuSubsurface *subsurface = SurfaceList().First(); subsurface != NULL; subsurface = SurfaceList().GetNext(subsurface)) {
+		HaikuSurface *surface = subsurface->Surface();
+		if (surface->View() != NULL) {
+			if (surface->fSubWindow != NULL)
+				surface->PlaceOwnWindow();
+			else if (surface->View()->Window() != NULL && surface->NeedsOwnWindow()) {
+				surface->MoveToOwnWindow();
+				surface->PlaceOwnWindow();
+			}
+		}
+		surface->FollowRoot();
+	}
 }
 
 void HaikuSurface::Invalidate()
@@ -1035,7 +1075,7 @@ void HaikuSurface::HandleCommit()
 		// shown through app_server's compositor by that alpha: B_TRANSPARENT_WINDOW. Without it the clear pixels around the shape
 		// show as a white box. Only on a composited desktop (RenkuOS); a window with a frame, or one that covers the screen, is never
 		// made see-through. HAIWAY_TRANSPARENT_POPUPS=0 or =1 decides it either way.
-		if (fSubsurface == NULL && HaiwayTransparentWindowFlag() != 0) {
+		if ((fSubsurface == NULL || fSubWindow != NULL) && HaiwayTransparentWindowFlag() != 0) {
 			BWindow *window = viewLocked->Window();
 			BBitmap *tb = Bitmap();
 			if (window != NULL && tb != NULL) {
@@ -1075,6 +1115,9 @@ void HaikuSurface::HandleCommit()
 	DumpSurfaceIfRequested(this, Bitmap(), fSubsurface != NULL);
 	if (fHook.IsSet()) {
 		fHook->HandleCommit();
+	}
+	if (fSubsurface == NULL) {
+		FollowRoot();
 	}
 }
 
