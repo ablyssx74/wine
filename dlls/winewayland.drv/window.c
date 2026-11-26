@@ -190,6 +190,27 @@ static BOOL is_unmanaged_popup(struct wayland_win_data *data)
     return !data->managed && !data->is_fullscreen && (style & WS_POPUP) &&
            !(style & (WS_CAPTION|WS_THICKFRAME|WS_SYSMENU));
 }
+
+/* A menu in a window of the program's own making, as Steam's tray menu (SDL): it has the styles of a window with a caption
+ * and is made active, so it is managed, but it draws no frame, is a topmost tool window and belongs to a window that is
+ * not shown. */
+static BOOL is_frameless_menu(struct wayland_win_data *data)
+{
+    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+    DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+    HWND owner = NtUserGetWindowRelative(data->hwnd, GW_OWNER);
+
+    return !data->is_fullscreen && (style & WS_POPUP) && !(style & (WS_THICKFRAME|WS_MINIMIZE)) &&
+           (exstyle & WS_EX_TOOLWINDOW) && (exstyle & WS_EX_TOPMOST) && !(exstyle & WS_EX_APPWINDOW) &&
+           EqualRect(&data->rects.client, &data->rects.window) &&
+           owner && !(NtUserGetWindowLongW(owner, GWL_STYLE) & WS_VISIBLE);
+}
+
+/* A window to show where it asks to be, and to close when the user clicks elsewhere. */
+static BOOL is_popup_menu(struct wayland_win_data *data)
+{
+    return is_unmanaged_popup(data) || is_frameless_menu(data);
+}
 #endif
 
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
@@ -207,7 +228,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
 #ifdef __HAIKU__
     /* The menu of a tray icon belongs to a window that is not shown: as its subsurface it was never drawn. */
-    if (owner_surface && owner_surface->role == WAYLAND_SURFACE_ROLE_NONE && is_unmanaged_popup(data))
+    if (owner_surface && owner_surface->role == WAYLAND_SURFACE_ROLE_NONE && is_popup_menu(data))
         owner_surface = NULL;
 #endif
 
@@ -248,7 +269,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         wayland_surface_make_toplevel(surface);
 #ifdef __HAIKU__
         /* A top-level is put in the middle of the screen by the compositor; a popup says where it belongs. */
-        if (surface->xdg_toplevel && is_unmanaged_popup(data))
+        if (surface->xdg_toplevel && is_popup_menu(data))
         {
             char app_id[64];
             snprintf(app_id, sizeof(app_id), "wine-popup@%d,%d", (int)data->rects.visible.left,
