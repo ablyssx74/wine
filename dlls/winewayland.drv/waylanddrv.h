@@ -290,6 +290,9 @@ struct wayland_surface
     struct wayland_shm_buffer *big_icon_buffer;
 
     enum wayland_surface_role role;
+    /* a number that is new whenever the surface is given a role: a subsurface notes the one of its owner, because an owner
+     * that was hidden and shown again is not the same parent to the compositor */
+    LONG role_generation;
     union
     {
         struct
@@ -304,6 +307,7 @@ struct wayland_surface
             HWND owner_hwnd;
             /* a subsurface that is the menu of a menu: the window it is stacked above (its parent menu, a sibling), 0 otherwise */
             HWND stack_hwnd;
+            LONG owner_generation;
         };
     };
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;

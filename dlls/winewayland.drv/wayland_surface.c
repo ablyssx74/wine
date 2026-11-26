@@ -266,6 +266,12 @@ static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener
     wp_fractional_scale_handle_scale
 };
 
+static LONG next_role_generation(void)
+{
+    static LONG last;
+    return InterlockedIncrement(&last);
+}
+
 /**********************************************************************
  *          wayland_surface_create
  *
@@ -425,6 +431,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
 
     wayland_surface_clear_role(surface);
     surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+    surface->role_generation = next_role_generation();
 
     surface->xdg_surface =
         xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base, surface->wl_surface);
@@ -465,7 +472,8 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *owner)
 {
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE);
-    if (surface->wl_subsurface && surface->owner_hwnd == owner->hwnd) return;
+    if (surface->wl_subsurface && surface->owner_hwnd == owner->hwnd &&
+        surface->owner_generation == owner->role_generation) return;
 
     wayland_surface_clear_role(surface);
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
@@ -485,7 +493,9 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
     wayland_surface_init_fractional_scale(surface, owner->window.scale);
 
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    surface->role_generation = next_role_generation();
     surface->owner_hwnd = owner->hwnd;
+    surface->owner_generation = owner->role_generation;
 
     /* Present contents independently of the owner surface. */
     wl_subsurface_set_desync(surface->wl_subsurface);

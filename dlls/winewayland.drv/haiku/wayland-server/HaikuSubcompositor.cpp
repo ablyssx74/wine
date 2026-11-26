@@ -87,8 +87,9 @@ HaikuSubsurface::~HaikuSubsurface()
 
 HaikuSurface *HaikuSubsurface::Root()
 {
+	// (NULL when a parent on the way is gone: a surface that was destroyed leaves its subsurfaces without one)
 	HaikuSurface *s = fParent;
-	while (s->Subsurface() != NULL) {
+	while (s != NULL && s->Subsurface() != NULL) {
 		s = s->Subsurface()->fParent;
 	}
 	return s;
@@ -98,11 +99,11 @@ void HaikuSubsurface::GetOffset(int32_t &x, int32 &y)
 {
 	x = fState.x;
 	y = fState.y;
-	HaikuSubsurface *s = fParent->Subsurface();
+	HaikuSubsurface *s = fParent != NULL ? fParent->Subsurface() : NULL;
 	while (s != NULL) {
 		x += s->fState.x;
 		y += s->fState.y;
-		s = s->fParent->Subsurface();
+		s = s->fParent != NULL ? s->fParent->Subsurface() : NULL;
 	}
 }
 

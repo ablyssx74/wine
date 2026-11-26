@@ -507,7 +507,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct wayland_win_data *data, *owner_data;
     HWND stack_owner;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
-    BOOL had_subsurface = FALSE;
+    LONG had_generation = 0;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
 
@@ -549,7 +549,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             data->wayland_surface = NULL;
         }
     }
-    else if ((had_subsurface = data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE),
+    else if ((had_generation = data->wayland_surface ? data->wayland_surface->role_generation : 0),
              wayland_win_data_create_wayland_surface(data, owner_surface))
     {
         /* (only a subsurface has the field: it shares its memory with the pointers of a toplevel) */
@@ -557,9 +557,18 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             data->wayland_surface->stack_hwnd = stack_owner != owner ? stack_owner : 0;
         wayland_win_data_update_wayland_state(data);
 #ifdef __HAIKU__
-        /* A window that was drawn before it became a subsurface and is not drawn again would stay empty: the strips around
-         * Telegram's window, drawn once with UpdateLayeredWindow, were never shown. Attach what it has again. */
-        if (!had_subsurface && data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+        /* A subsurface that is only moved is not drawn again, and its position was only sent with the next drawing: the strip
+         * to the right of Telegram's window stayed where it was when the window was made narrower. Send it now. */
+        if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+            wayland_surface_reconfigure(data->wayland_surface))
+        {
+            wl_surface_commit(data->wayland_surface->wl_surface);
+            wl_display_flush(process_wayland.wl_display);
+        }
+        /* A window that was drawn before it became a subsurface (of this parent) and is not drawn again would stay empty: the
+         * strips around Telegram's window, drawn once with UpdateLayeredWindow, were never shown. Attach what it has again. */
+        if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+            data->wayland_surface->role_generation != had_generation &&
             data->window_contents && wayland_surface_reconfigure(data->wayland_surface))
         {
             HRGN all = NtGdiCreateRectRgn(0, 0, data->window_contents->width, data->window_contents->height);

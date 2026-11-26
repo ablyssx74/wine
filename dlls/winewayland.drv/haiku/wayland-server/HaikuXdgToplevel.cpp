@@ -86,6 +86,13 @@ void WaylandWindow::WindowActivated(bool isActive)
 
 void WaylandWindow::Minimize(bool minimize)
 {
+	// (the toplevel is gone and the window is quitting: BWindow::Quit() hides it, which can end up here with the window locked
+	// several times, and WaylandEnv aborts then. Seen when a program hid a window that had windows of its own around it, the
+	// resize strips of Telegram. There is nobody to tell anyway.)
+	if (fToplevel == NULL) {
+		BWindow::Minimize(minimize);
+		return;
+	}
 	WaylandEnv vlEnv(this);
 	bool wasMinimized = IsMinimized();
 
