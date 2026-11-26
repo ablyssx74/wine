@@ -1,5 +1,5 @@
 name			wine11
-version		11.20-86
+version		11.20-87
 architecture	x86_64
 summary		"Run Windows programs on Haiku and RenkuOS (Wine 11.20, experimental)"
 description		"Wine 11.20 with a Haiku port, for running Windows programs on 64-bit Haiku and RenkuOS. This is an

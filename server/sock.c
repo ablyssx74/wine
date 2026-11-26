@@ -3371,7 +3371,8 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             ret = 0;
         else
             ret = setsockopt( unix_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse) );
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__HAIKU__)
+        /* (they share a port only between sockets that all set SO_REUSEPORT) */
         if (!ret) ret = setsockopt( unix_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse) );
 #endif
         if (ret)
