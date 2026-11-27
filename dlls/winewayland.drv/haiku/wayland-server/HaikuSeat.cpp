@@ -4,6 +4,7 @@
 #include "HaikuXdgSurface.h"
 #include "HaikuXdgToplevel.h"
 #include "HaikuDataDeviceManager.h"
+#include "HaikuTransparentWindow.h"
 #include "WaylandKeycodes.h"
 #include "XkbKeymap.h"
 #include <SupportDefs.h>
@@ -195,25 +196,87 @@ static bool IsModifierKey(uint32 haikuKey)
 	return false;
 }
 
+static BCursor *sClientCursor = NULL;	// the cursor the program set last, to go back to after one of ours
+static bool sEdgeCursor = false;		// the pointer shows a resize cursor of ours
+
+// Without a compositor, the see-through strips that a program with its own frame is resized by are not shown (see
+// HaikuSurface::NeedsOwnWindow()): the window is resized by a press just inside its edge. The edge at `where` (in
+// `surface`'s coordinates) of such a window, and the window's surface; resizeEdgeNone elsewhere.
+static uint32_t FrameEdgeAt(HaikuSurface *surface, BPoint where, HaikuSurface *&window)
+{
+	const int32 kEdge = 5, kCorner = 14;
+	window = surface;
+	if (HaiwayTransparentWindowFlag() != 0 || surface == NULL) return 0;
+	if (surface->Subsurface() != NULL) {
+		int32_t x = 0, y = 0;
+		surface->Subsurface()->GetOffset(x, y);
+		where += BPoint(x, y);
+		window = surface->Subsurface()->Root();
+	}
+	if (window == NULL || window->XdgSurface() == NULL || window->XdgSurface()->Toplevel() == NULL
+		|| !window->XdgSurface()->Toplevel()->Resizable() || !window->HasFrameStrips()) {
+		return 0;
+	}
+	const BSize size = window->Size();
+	const float x = where.x, y = where.y, w = size.width, h = size.height;
+	if (x < 0 || y < 0 || x > w || y > h) return 0;
+	bool top = y < kEdge, bottom = y > h - kEdge, left = x < kEdge, right = x > w - kEdge;
+	if (top || bottom) {
+		left = x < kCorner;
+		right = x > w - kCorner;
+	} else if (left || right) {
+		top = y < kCorner;
+		bottom = y > h - kCorner;
+	}
+	// (the bits of xdg_toplevel's resize_edge)
+	return (top ? 1 : 0) | (bottom ? 2 : 0) | (left ? 4 : 0) | (right ? 8 : 0);
+}
+
+static void ShowEdgeCursor(uint32_t edge)
+{
+	if (edge == 0) {
+		if (sEdgeCursor) {
+			sEdgeCursor = false;
+			be_app->SetCursor(sClientCursor != NULL ? sClientCursor : B_CURSOR_SYSTEM_DEFAULT, true);
+		}
+		return;
+	}
+	BCursorID id = B_CURSOR_ID_RESIZE_NORTH;
+	switch (edge) {
+		case 2: id = B_CURSOR_ID_RESIZE_SOUTH; break;
+		case 4: id = B_CURSOR_ID_RESIZE_WEST; break;
+		case 8: id = B_CURSOR_ID_RESIZE_EAST; break;
+		case 5: id = B_CURSOR_ID_RESIZE_NORTH_WEST; break;
+		case 9: id = B_CURSOR_ID_RESIZE_NORTH_EAST; break;
+		case 6: id = B_CURSOR_ID_RESIZE_SOUTH_WEST; break;
+		case 10: id = B_CURSOR_ID_RESIZE_SOUTH_EAST; break;
+	}
+	sEdgeCursor = true;
+	BCursor cursor(id);
+	be_app->SetCursor(&cursor, true);
+}
+
 class SurfaceCursorHook: public HaikuSurface::Hook {
 private:
 	BCursor *fCursor = NULL;
 
 public:
 	BPoint fHotspot;
-	virtual ~SurfaceCursorHook() { delete fCursor; }
+	virtual ~SurfaceCursorHook() { if (sClientCursor == fCursor) sClientCursor = NULL; delete fCursor; }
 	void HandleCommit() final;
 };
 
 void SurfaceCursorHook::HandleCommit()
 {
+	if (sClientCursor == fCursor) sClientCursor = NULL;
 	delete fCursor;
 	fCursor = NULL;
 	BBitmap *bitmap = Base()->Bitmap();
 	if (bitmap != NULL) {
 		fCursor = new(std::nothrow) BCursor(bitmap, fHotspot);
 		if (fCursor != NULL) {
-			AppKitPtrs::LockedPtr(be_app)->SetCursor(fCursor);
+			sClientCursor = fCursor;
+			if (!sEdgeCursor) AppKitPtrs::LockedPtr(be_app)->SetCursor(fCursor);
 		}
 	} else {
 		// a cursor surface without a picture is how a client hides the cursor
@@ -564,6 +627,18 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 				AppKitPtrs::LockedPtr(surface->View())->SetMouseEventMask(B_POINTER_EVENTS);
 			}
 			fOldMouseBtns = btns;
+			if (oldBtns == 0 && (btns & B_PRIMARY_MOUSE_BUTTON) != 0 && fTrack.id == trackClient) {
+				HaikuSurface *window;
+				const uint32_t edge = FrameEdgeAt(surface, where, window);
+				if (edge != 0) {
+					BPoint screenPoint = where;
+					AppKitPtrs::LockedPtr(surface->View())->ConvertToScreen(&screenPoint);
+					fTrack.lastScreen = screenPoint;
+					fTrack.haveScreen = true;
+					DoTrack(trackResize, {.resizeEdge = (XdgToplevel::ResizeEdge)edge}, window);
+					return true;
+				}
+			}
 			switch (fTrack.id) {
 				case trackNone:
 				case trackClient: {
@@ -659,6 +734,12 @@ bool HaikuSeatGlobal::MessageReceived(HaikuSurface *surface, BMessage *msg)
 			switch (fTrack.id) {
 				case trackNone:
 				case trackClient: {
+					if (fOldMouseBtns == 0) {
+						HaikuSurface *window;
+						const uint32_t edge = FrameEdgeAt(fPointerFocus, where, window);
+						ShowEdgeCursor(edge);
+						if (edge != 0) break;
+					}
 					// relative motion, a lock (nothing is reported as a position) and a confinement
 					if (HaikuPointerMotion(fPointerFocus, where, when)) break;
 					for (HaikuPointer *pointer = fPointerIfaces.First(); pointer != NULL; pointer = fPointerIfaces.GetNext(pointer)) {

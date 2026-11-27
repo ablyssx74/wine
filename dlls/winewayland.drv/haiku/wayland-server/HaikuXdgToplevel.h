@@ -53,6 +53,7 @@ public:
 	void DoSendConfigure();
 	void EndInteractiveResize(int32_t width, int32_t height);
 	bool AtPoint() const {return fAtPoint;}
+	bool Resizable() const {return !fState.maximized && !fState.fullscreen && !fAtPoint;}
 	void MoveToPoint();
 
 	void HandleSetParent(struct wl_resource *parent) override;

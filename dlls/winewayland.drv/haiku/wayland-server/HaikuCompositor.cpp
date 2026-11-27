@@ -506,6 +506,55 @@ void WaylandView::MessageReceived(BMessage *msg)
 	BView::MessageReceived(msg);
 }
 
+// The first solid pixel from the left, along the middle row: the ground colour of a menu inside its see-through margin.
+// False for a surface that is see-through all over. (size: of the surface, as BSize holds it, one less than in pixels; the
+// buffer may be bigger, with old pixels beyond it)
+static bool OwnSolidColor(BBitmap *bmp, BSize size, rgb_color &color)
+{
+	if (bmp == NULL || bmp->ColorSpace() != B_RGBA32) {
+		return false;
+	}
+	const int32 y = (int32)size.height / 2, width = (int32)size.width + 1;
+	if (y < 0 || y > bmp->Bounds().IntegerHeight() || width - 1 > bmp->Bounds().IntegerWidth()) {
+		return false;
+	}
+	const uint8 *row = (const uint8*)bmp->Bits() + y * bmp->BytesPerRow();
+	for (int32 x = 0; x < width; x++) {
+		if (row[x * 4 + 3] >= 250) {
+			// (a little further in, past the soft edge of the shape)
+			const int32 inner = x + 3 < width && row[(x + 3) * 4 + 3] >= 250 ? x + 3 : x;
+			color = rgb_color{row[inner * 4 + 2], row[inner * 4 + 1], row[inner * 4], 255};
+			return true;
+		}
+	}
+	return false;
+}
+
+// A see-through strip: what a program with a frame of its own places around its window for the shadow, and resizes the
+// window by (Telegram). Told by what it is, not by where it is: while the window changes size, a strip lies for a moment
+// over it.
+bool HaikuSurface::IsFrameStrip()
+{
+	if (fSubsurface == NULL || Bitmap() == NULL || Bitmap()->ColorSpace() != B_RGBA32) {
+		return false;
+	}
+	const BSize size = Size();
+	rgb_color color;
+	return (size.width < 32 || size.height < 32) && !OwnSolidColor(Bitmap(), size, color);
+}
+
+// Two or more of them: a program's own frame.
+bool HaikuSurface::HasFrameStrips()
+{
+	int32 count = 0;
+	for (HaikuSubsurface *subsurface = SurfaceList().First(); subsurface != NULL; subsurface = SurfaceList().GetNext(subsurface)) {
+		if (subsurface->Surface()->IsFrameStrip()) {
+			count++;
+		}
+	}
+	return count >= 2;
+}
+
 void WaylandView::Draw(BRect dirty)
 {
 	WaylandEnv wlEnv(this, &fActiveWlEnv);
@@ -518,6 +567,20 @@ void WaylandView::Draw(BRect dirty)
 	}
 	if (bmp != NULL) {
 		auto viewLocked = AppKitPtrs::LockedPtr(this);
+		// Without a compositor a window cannot be see-through, and the clear margin around a menu in a window of its own
+		// (a tray icon's) came out white: it gets the menu's ground colour.
+		rgb_color ground;
+		if (HaiwayTransparentWindowFlag() == 0 && fSurface->Subsurface() == NULL && Window() != NULL
+			&& Window()->Feel() == B_FLOATING_ALL_WINDOW_FEEL && Window()->Look() == B_NO_BORDER_WINDOW_LOOK
+			&& OwnSolidColor(bmp, fSurface->Size(), ground)) {
+			if (viewLocked->ViewColor() != ground) {
+				viewLocked->SetFlags(viewLocked->Flags() & ~B_TRANSPARENT_BACKGROUND);
+				viewLocked->SetViewColor(ground);
+			}
+			viewLocked->SetDrawingMode(B_OP_COPY);
+			viewLocked->SetHighColor(ground);
+			viewLocked->FillRect(viewLocked->Bounds());
+		}
 		if (fSurface->fBackdrop != NULL) {
 			// a surface in a window of its own (a menu that sticks out of its owner): what was under the window first
 			viewLocked->SetDrawingMode(B_OP_COPY);
@@ -654,6 +717,14 @@ bool HaikuSurface::NeedsOwnWindow()
 	if (size.width < 8 || size.height < 8) {
 		return false;
 	}
+	// Without a compositor the strips of a program's own frame are not shown: a window cannot be see-through there, and
+	// windows that follow another one trail behind it. The window is resized by a press just inside its edge instead
+	// (HaikuSeat.cpp).
+	// (anything this thin is such a strip, whatever it holds at the moment: no menu is. The top and bottom ones of Telegram
+	// were judged on a first picture that was not see-through yet, got windows, and smeared the wallpaper along the edges.)
+	if (HaiwayTransparentWindowFlag() == 0 && (size.width < 32 || size.height < 32)) {
+		return false;
+	}
 	auto rootLocked = AppKitPtrs::LockedPtr(root->View());
 	const BRect bounds = root->View()->Bounds();
 	const float slack = 4;
@@ -760,6 +831,9 @@ void HaikuSurface::PlaceOwnWindow()
 		if (fView != NULL) {
 			fView->MoveTo(0, 0);
 			fView->ResizeTo(size.width, size.height);
+			// (a view that was hidden while it had no buffer, still in the window of its parent, would stay hidden here and
+			// never be drawn: its window then showed whatever had been on the screen)
+			if (Bitmap() != NULL && fView->IsHidden(fView)) fView->Show();
 		}
 		if (Bitmap() == NULL) {
 			if (!fSubWindow->IsHidden()) fSubWindow->Hide();
@@ -1044,8 +1118,11 @@ void HaikuSurface::HandleCommit()
 			// A subsurface without a buffer is unmapped: hide its view so that the parent is redrawn where it was (an
 			// invalidated transparent view leaves the old pixels on the screen, and Steam's pages that were switched
 			// away from showed through).
-			if (fState.buffer == NULL && !viewLocked->IsHidden(viewLocked)) viewLocked->Hide();
-			else if (fState.buffer != NULL && viewLocked->IsHidden(viewLocked)) viewLocked->Show();
+			// (nor is a strip of a program's own frame shown here without a compositor: it lies outside the window, but for
+			// the moment in which the window has grown over it)
+			const bool unmapped = fState.buffer == NULL || (HaiwayTransparentWindowFlag() == 0 && IsFrameStrip());
+			if (unmapped && !viewLocked->IsHidden(viewLocked)) viewLocked->Hide();
+			else if (!unmapped && viewLocked->IsHidden(viewLocked)) viewLocked->Show();
 		}
 		// A buffer without an alpha channel covers its whole rectangle, so the view does not need B_TRANSPARENT_BACKGROUND, which
 		// makes app_server draw the parent behind it on every draw (for a Wine window: the whole mostly white toplevel before each

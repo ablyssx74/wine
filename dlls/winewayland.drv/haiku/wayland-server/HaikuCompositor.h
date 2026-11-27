@@ -125,6 +125,8 @@ public:
 	virtual ~HaikuSurface();
 
 	BView *View() const {return (BView*)fView;}
+	bool IsFrameStrip();     // a see-through strip beside the window, of a program that draws its own frame
+	bool HasFrameStrips();
 	BBitmap *Bitmap() const {return fState.buffer == NULL ? NULL : &fState.buffer->Bitmap();}
 	bool InputRgnContains(BPoint p) {return !fState.inputRgn ? true : fState.inputRgn->Contains(p);}
 	void GetOffset(int32_t &x, int32_t &y) const {x = fState.dx; y = fState.dy;}
